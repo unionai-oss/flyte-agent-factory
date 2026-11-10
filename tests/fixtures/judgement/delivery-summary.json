@@ -1,0 +1,11 @@
+{
+ "name": "delivery-summary",
+ "question": "Review passed (round 2). Delivered: the CSV export endpoint with streaming, tests and docs, PR #42 on factory/csv-export. Anything you want changed before I wrap up? Default if no answer in 30 min: the project is released.",
+ "kind": "text",
+ "brief": "Add CSV export of the orders table.",
+ "directions": [],
+ "context": "",
+ "expect": {
+  "class": "owner"
+ }
+}

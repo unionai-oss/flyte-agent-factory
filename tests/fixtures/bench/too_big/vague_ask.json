@@ -1,0 +1,14 @@
+{
+  "conditions": [
+    {
+      "name": "ask-a1",
+      "opened_at": 10,
+      "text": "Can we reduce the scope?",
+      "blocking": true
+    }
+  ],
+  "commits": [],
+  "outcome": "escalated",
+  "text": "",
+  "success": false
+}

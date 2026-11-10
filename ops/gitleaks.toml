@@ -1,0 +1,13 @@
+# gitleaks configuration for ops/scan_public.py: the default rules, plus the few values in this tree that look
+# like secrets and are not. A test fixture or a public value is better marked on its own line with
+# `gitleaks:allow`; this file is for lines that cannot carry the marker.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Values that look like secrets and are not"
+regexes = [
+  # The sha256 of the shortlinks benchmark's tests/test_api.py, inside a hidden check in _bench_suite.py: the
+  # check's text is hashed into the suite digest, so a marker comment there would change every case's digest.
+  '''^75e9fd038e5e7dbd076486df5acafbdc79518bd891ec722d06a1b7a0dfd5d207$''',
+]

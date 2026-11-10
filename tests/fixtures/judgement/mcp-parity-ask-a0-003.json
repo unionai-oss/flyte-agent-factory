@@ -1,0 +1,14 @@
+{
+ "name": "mcp-parity-ask-a0-003",
+ "question": "flyte-mcp-parity is BLOCKED on the pre-review gate. It cannot pass in this pod whatever the patches contain. 4 bounces in a row (message-0001..0004) list the same failures, and each one also fails on UNPATCHED flyte-sdk 8a013c2 in the gate's env:\n- _U_*/FLYTE_* pod vars: 89 upstream unit-test failures, identical set with and without the patches.\n- USER_LOG_LEVEL=20: breaks flyte's CLI, so check-import-profile and cli-docs-gen fail.\n- No rustup/cargo: rs_controller fmt/lint fail.\n- $GITHUB_OUTPUT missing: plugin discovery fails.\n- module-size: flags upstream's own large files in the nested checkout.\n- ACME-012: no command configured for the browser rule. I did run a real-browser verification: 8/8 pass, flyte-mcp-parity/smoke/browser/.\nIn a clean env (checks.sh, as on GitHub runners) everything passes: 1334 tests on 3.10/3.12, all lint/type/docs gates, 520/520 changed lines covered. Evidence: flyte-mcp-parity/TESTING.md.\nPlease add owner waivers for this project's factory:target-ci, factory:target-coverage, factory:module-size and ACME-012, or fix the gate env (scrub the pod vars, add Rust). Waivers are yours: I won't edit waivers.toml.\nDefault if no answer: I make no change, leave DONE declared, and stop re-declaring until the gate or a waiver changes.",
+ "kind": "text",
+ "brief": "Work issue the factory issue #89: full MCP CLI compatibility for flyte-sdk's MCP server. Deliverable: 3 upstream patches to flyteorg/flyte-sdk (base 8a013c2) -- 01 secrets (a secret value never passes through the model; one-time form/URL elicitation), 02 diagnose and recover, 03 launch and operate -- plus PARITY.md and PR descriptions. Delivers to flyteorg/flyte-sdk: the factory's delivery bar applies (target repo CI green locally, coverage of changed lines). Each patch must promote to its own branch off upstream main.",
+ "directions": [
+  "Union: Operator: your pre-review failed. You're idle, so fix and re-declare DONE."
+ ],
+ "context": "Upstream src/flyte/ai/mcp/_tools.py is 1310 lines at base; the factory's module-size rule (factory:module-size) limits modules to 1500 lines. The patches as written grow _tools.py to 2092 lines. src/flyte/ai/mcp/ is a package that can hold sibling modules; tools are registered from _tools.py. The gate's environment leaks pod variables (_U_*, FLYTE_*, USER_LOG_LEVEL=20) into target CI jobs, lacks rustup/cargo and $GITHUB_OUTPUT, its module-size check walks the nested .flyte-sdk checkout (flagging upstream files like _type_engine.py at 3472 lines), and ACME-012 is 'Enforced: tool' with no command configured. Those gate defects live in flyte-agent-factory (the factory's own code), not in this project's patches. In a clean env checks.sh passes everything: 1334 tests on 3.10/3.12.",
+ "expect": {
+  "class": "engineering",
+  "no_waiver": true
+ }
+}

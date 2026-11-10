@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+ops/.watch.log
+ops/.watch.pid
+ops/.watch.kick
+ops/.watch.ready
+ops/.watch.lock
+ops/.watch.state.json
+ops/.watch.state.*.tmp
+
+# Real deployment profiles are private: keep them in a private repo or a local file.
+profiles/*.toml
+!profiles/example.toml
+!profiles/example-claude-personal.toml
+!profiles/example-codex-personal.toml
+
+profiles/.default

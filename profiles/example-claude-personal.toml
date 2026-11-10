@@ -1,0 +1,32 @@
+# Minimal profile for one person on a personal Claude Pro or Max plan. Copy it to profiles/<name>.toml,
+# replace every value that says example, my or you, and select it with AGENT_FACTORY_PROFILE=<name>.
+# Walk-through: docs/quickstart.md. Every Flyte secret named here: docs/secrets.md.
+name = "claude-personal"
+
+[backend]
+kind = "union"                            # "union" (hosted) or "oss" (open-source Flyte 2)
+endpoint = "flyte.example.com"            # your Flyte endpoint
+project = "my-agents"                     # the Flyte project the factory runs in (you create it)
+domain = "development"                    # the Flyte domain
+config = "~/.flyte/config.yaml"           # the Flyte config file the CLI is passed
+
+[repo]
+project = "git@github.com:you/my-workspace.git"   # your workspace repository; projects push here
+
+# One slot is one project environment.
+[[slots]]
+env = "agent-a"                           # the Flyte environment name
+subagent_env = "agent-a-sub"              # its sub-agent environment; must differ from every other name
+
+[[slots]]
+env = "agent-b"                           # a second slot, so two projects can run at once
+subagent_env = "agent-b-sub"              # its sub-agent environment
+
+[secrets]
+# Flyte secret names, created with `flyte create secret` (docs/secrets.md); the values stay in Flyte.
+claude_token = "claude_setup_token"       # the token `claude setup-token` prints (Pro or Max)
+deploy_key = "my_deploy_key"              # a write deploy key for the workspace repository
+
+# The factory MCP connector that chat uses (docs/factory-mcp-setup.md). ops/deploy_factory.py needs this table.
+[mcp]
+public_url = ""                           # empty for the first deploy; then the factory-mcp app URL (step 6)

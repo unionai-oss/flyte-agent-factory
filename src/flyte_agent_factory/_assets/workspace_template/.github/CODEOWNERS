@@ -1,0 +1,5 @@
+# Replace OWNER with your GitHub login (or a team) when you copy this template.
+# With "Require review from Code Owners" on main (docs/branch-protection.md), the factory cannot change these.
+/standards/ @OWNER
+/waivers.toml @OWNER
+/gardening.toml @OWNER

@@ -1,0 +1,9 @@
+{
+  "AGENT_FACTORY_ENV_NAME": "agent-a",
+  "CLAUDE_CREDENTIALS_SECRET": "my_login_a",
+  "AGENT_FACTORY_SUBAGENT_ENV_NAME": "agent-a-sub",
+  "AGENT_FACTORY_CREDENTIALS_SECRET": "1",
+  "AGENT_FACTORY_BROWSER": "1",
+  "AGENT_FACTORY_SECRETS": "my_deploy_key=GIT_DEPLOY_KEY,my_gateway_key=LLM_GATEWAY_KEY,my_anthropic_key=PROJECT_ANTHROPIC_API_KEY,my_github_app_private_key=GITHUB_APP_PRIVATE_KEY",
+  "AGENT_FACTORY_CODEX_SECRET": "my_codex_login_a"
+}

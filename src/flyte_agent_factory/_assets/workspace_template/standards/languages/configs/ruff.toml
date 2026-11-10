@@ -1,0 +1,15 @@
+# The formatter keeps 100 so code formatted at 100 stays stable (a wider formatter would rejoin lines and fail
+# `ruff format --check` on unchanged projects); the line-length lint allows up to 110.
+line-length = 100
+[lint]
+pycodestyle.max-line-length = 110
+select = ["E", "F", "I", "B"]
+
+[lint.pydocstyle]
+convention = "pep257"
+
+[lint.per-file-ignores]
+"**/test_*.py" = ["D"]
+"**/*_test.py" = ["D"]
+"**/tests/**" = ["D"]
+"**/conftest.py" = ["D"]

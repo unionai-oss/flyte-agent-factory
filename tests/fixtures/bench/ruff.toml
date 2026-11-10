@@ -1,0 +1,10 @@
+# The bench trees are checked by the factory's gates with standards/languages/configs/ruff.toml, which
+# formats at 100 columns. The repository formats at 110, which would rejoin their wrapped lines, so the
+# two could never both pass: here they keep the gate's widths and the repository's lint rules.
+extend = "../../../pyproject.toml"
+line-length = 100
+# The gates run from a tree's own root, so its packages sort as first-party imports; every tree here is a root.
+src = ["*"]
+
+[lint.pycodestyle]
+max-line-length = 110

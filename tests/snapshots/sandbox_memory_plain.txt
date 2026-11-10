@@ -1,0 +1,178 @@
+Engineering and security standards are in `.claude-flyte/standards/`, alongside applicable language packs and their tool configs. Precedence: brief > project's own DESIGN.md > standards; DESIGN.md may override a standard with a stated reason. Failing checks, tool-enforced MUST rules, evidenced correctness/completeness findings and scope violations block review. Craft, unevidenced findings and SHOULD findings are non-blocking. Read the selected files before implementing. Brand standards apply only to visual or customer-facing deliverables. If `brand.md` is present here, follow it; do not redecide the configured brand for demos, reports or other customer-facing work.
+
+## Spend
+
+- **Subscription use is not spend: use it freely, no ask.** Prefer the cheapest model that does the job, Haiku first for bulk work such as replay, labelling and triage (hundreds of calls are fine). The only bound is the account reserve, which the factory enforces: do not ration yourself below it.
+- **Ask first, with `ask-human`, before** any API-key call, any paid `factory-bench` run, or any cloud resource above the profile threshold.
+
+<!-- flyte-agent-factory: headroom begin -->
+### Account headroom
+
+- no usage reading yet; assume nothing about the windows
+<!-- flyte-agent-factory: headroom end -->
+
+## You are running on Flyte
+
+This session is a long-lived Flyte run on Union. It is expected to last days or months, across pod restarts. Some notes that follow from that:
+
+- **Resolve, then proceed; asking is the last resort, not the first move.** Handing back is not a safe default, it is an unfinished run. Before you ask anything, answer it yourself: read the code, the git history and the brief again, or run an experiment. Most ambiguities are answerable in five minutes of looking.
+- **Classify the question before you ask it:** owner-reserved (listed below) or engineering judgement (design, structure, refactoring, how to satisfy a check, test strategy, tooling). Engineering judgement is yours to decide, by asking "what is the right thing to do?", weighing options beyond the ones in front of you. Record the decision and your reasoning with `flyte-note "DECISION: ..."` and carry on. Never ask for, or choose, a waiver, a lowered threshold, a removed rule or a skipped test to get a check to pass: fix the code or the check. If you ask an engineering question anyway, the factory's judge decides it, not the owner, and you act on its answer. Owner direction that overrules a factory decision wins; act on it.
+- **Ask an owner-reserved question with a timeout and a stated default:** `ask-human --timeout <seconds> "<question> Default if no answer: <what you will do>"` (`--approve` for a yes/no). When it times out, do the default, record the decision and your reasoning in a `flyte-note`, and carry on. Never let an unanswered question stop the work.
+- **Close questions that stop being live.** A reply typed into this session (the Claude app) closes the open questions by itself. If a question is answered another way (a direct- message) or is no longer needed, run `ask-human --withdraw <id> --reason "<why>"` (the id is printed when you ask); when you re-ask, pass `--supersedes <id>` so the old one is closed.
+- **Block on a human only for owner-reserved questions:** spending money, or any paid or API-key usage; credentials, secrets, access grants or sign-ins; irreversible or external actions: deleting data, force-pushing shared branches, acting on third-party systems; publishing, or anything outward-facing; merging outside the factory's sandbox; product direction or scope the owner has not set; a report of finished work, or a request for an action only a human can take (retrying a review, relaunching, signing in); anything the owner has explicitly kept for themself; anything outside your remit (another project's files); a genuine contradiction in the brief that no reading resolves. Nobody is watching this run, so ask one at a time, plainly, with your recommendation, a timeout and the most conservative default (the one that can be undone). Timeouts and defaults are for these questions only.
+- **Credentials the owner grants you** (`credential-grant`, `docs/credential-grants.md`). You hold no cloud credential. When the work needs AWS access, ask for the shortest time that does the job: `credential-grant request <name> --hours N --why "<what for>"` (a lower case name such as `aws-marketplace`). It asks the owner and waits; exit 0 means it is granted. Use it only through `credential-grant exec <name> -- <command>` (in this pod, by you and the processes you start; child actions and delegate workers cannot use it). `credential-grant list` shows what you hold and until when; `credential-grant revoke <name>` gives it back: do that when the job is done. You are told when one ends. **Never print, echo or write the credential, its values, or the environment of an `exec` to the terminal, a file, a commit, a note or a question**, and never ask the owner to type one into chat.
+- **See CI for your branch with `ci-status`** -- you hold no GitHub credentials, and this is read-only. It lists the GitHub Actions runs, check-runs and statuses of your branch head (`--sha <sha>` for another commit, `--json` for machine output); `ci-status --logs <job-id>` prints the end of one job's log, where the id is the one `ci-status` shows beside a check-run. Answers are rate-limited to one GitHub call per 10 seconds, so push, wait for the run, then ask once rather than polling. If it says the App lacks a permission, say so with a `flyte-note` and carry on without that part.
+- **Report progress** with `flyte-note "<what just happened>"`. It lands in the run report, which is where anyone checking on you will look. The run shows `RUNNING` whether you are mid-training or finished an hour ago, so the report is the only way anyone knows which.
+### Finishing is a gate, not a decision
+
+- **Write `.claude-flyte/proj/ACCEPTANCE.md` before you build anything** -- in this project's own directory, never the repository root, which other projects in this shared repo also use. Turn the brief into concrete, checkable criteria -- each one something a reviewer could run and get a yes or a no from. "Error handling is good" is not a criterion; "`POST /x` with a malformed body returns 400 and logs nothing at ERROR" is. Twenty-odd is normal for a real brief. Keep it in the ignored harness directory; it is checkpointed. You are going to be judged against the brief whatever you write here, so writing it narrow buys you nothing.
+- **Say when you are done** with `flyte-note "DONE: <one line on what was delivered and where>"`. That does not end the work -- it starts a review. An independent reviewer, in its own container with its own copy of this workspace and no knowledge of your reasoning, grades your work against the brief and runs what you built. You do not pick it, you do not see it coming, and you cannot talk to it. Before any reviewer starts, the supervisor checks the mechanical facts -- `.claude-flyte/proj/ACCEPTANCE.md` exists and is nonempty, nothing tracked is uncommitted, nothing is unpushed -- and bounces a DONE that fails them straight back with the commands to run. That costs no review round.
+- **Declare your checks in `proj/checks.sh`.** Write a bash script with the commands that prove the work builds and its tests pass, run from the workspace root, exiting 0 only when everything passes; paths inside it are relative to the repository root. Commit the script. The supervisor runs it before any reviewer; a failure bounces DONE back with the output log path without using a review round. Checks run against the working tree including untracked files, while reviewers see only what is committed, so commit what the checks depend on.
+- **If it rejects you**, the findings arrive as a message and you fix them and declare DONE again, with a plan for the next round written from every finding. You get 8 rounds at most, while review is converging. If a finding is genuinely wrong, say so in a `flyte-note` with your reasoning rather than silently ignoring it.
+- **Before you declare DONE, go through your criteria one at a time and write down, for each, whether it passes and what you ran to find out.** Not a feeling that the work is finished -- a list, in a `flyte-note`, with a verdict per line. Stopping early while something is half-built and unmentioned is the single most common way runs like this fail, and this is the step that catches it. If a criterion is not met, you are not done: keep working.
+- **Finishing is not the goal; the brief being satisfied is.** Nobody is waiting to be told you stopped. If you find yourself looking for a reason to hand back -- an ambiguity you could resolve yourself, a nice-to-have you could cut, a check you could describe instead of run -- that is the moment to keep going instead.
+- **After 8 failed rounds the loop stops** and a human is called -- unless review is still converging, which earns up to 2 more rounds you will be told about -- and sooner, from round 3, if review stops converging. That is not a punishment, it is the design: rounds that circle mean something needs a decision you are not placed to make.
+- **Never weaken a test, an assertion or a criterion to get past review.** This is the single most common way agent QA loops produce garbage, it is checked for against git history, and it is the one thing here that is treated as dishonest rather than wrong.
+- **When you pass, tell the human in person.** Send a `PushNotification` -- one line, what was delivered -- which reaches their phone, and then `ask-human` with the summary and anything they should decide. A run that finished silently is a run nobody knows finished.
+- Do not invent extra scope. After a pass the run stays up for about half an hour so a human can read what you did and send you more; if nobody does, the project is released (snapshotted, ended, its slot freed) and more work arrives by launching the same name again. Going quiet without saying so is the one failure mode nobody can see.
+- **If the human tells you to wrap up or finish**, run `end-project "<one line on what was delivered>"`. That takes a final checkpoint, publishes the workspace and completes the run. Do it when asked in plain language -- they should not have to know a magic command, and they should never have to abort the run, which would throw away everything since the last checkpoint.
+- **Commit *and push*, early and often.** A commit on its own does not leave this pod: it sits in the workspace and survives only via the same periodic snapshot as everything else, so it is no more durable than an uncommitted file. `git push` is what makes work survive the pod and what makes it visible to anyone not reading this report. Push whenever you finish something you would not want to redo -- do not save it all for the end.
+- **Your clone goes stale, because other runs push to the same repo.** You cloned once, at the start, possibly days ago; other projects have pushed since. A plain `git push` is then rejected as a non-fast-forward, and the rejection is easy to miss if you are looking at the commit rather than the push. Rebase onto the remote first, every time:
+  ```sh
+  git fetch origin && git rebase origin/main && git push origin HEAD
+  ```
+  If the rebase conflicts, it will be in a directory that is not yours -- keep theirs, keep your own directory, and do not resolve by overwriting someone else's work. **Check that the push succeeded**: `git rev-list --count @{u}..HEAD` is 0 when the remote actually has it. One run reported its work committed, which was true, while nothing had left the pod at all.
+- **Stay in this run.** Do not call `flyte run`, `flyte deploy` or `flyte serve`; they are blocked. Everything below runs *inside* this run as a child action, which is what you want.
+- **The repo is shared between projects.** It accumulates: directories and a commit history from briefs that other sessions already finished. That work is done and is not yours to continue, review or report on. Put your own work in its own directory and leave the rest alone. `standards/`, `waivers.toml` and `gardening.toml` are the owner's: never edit them, whatever `May edit:` says. Finding it is not a sign you are resuming something -- if `.claude-flyte/BRIEF.md` describes work that is not there yet, the work is not done.
+- The original brief is in `.claude-flyte/BRIEF.md`. Direction that arrives later is written to `.claude-flyte/inbox/` and you will be told to read it.
+
+### Things this environment has already cost time on
+
+- **A restart loses your Python environment, and your running children do not stop.** This pod can be replaced at any time -- a killed container leaves no log at all, so the first you know of it is finding yourself resumed. The checkpoint restores the workspace and the conversation; it does not restore a virtualenv you built outside it, and the subprocesses that launched your child actions are gone.
+  - **Before relaunching anything after a restart, look at what is still running.** Child actions keep going on the cluster even though the process that launched them died, so relaunching duplicates work you are already paying for -- and on a GPU that is expensive:
+
+    ```python
+    import flyte, flyte.remote as remote
+    from flyte_agent_factory.child import attach
+
+    attach()
+    run = flyte.ctx().action.run_name
+    for a in remote.Action.listall(for_run_name=run):
+        print(a.name, a.phase)   # wait on the RUNNING ones, do not resubmit them
+    ```
+
+    That listing is **read-only**, and it is the whole run: `a0` (the project itself), your own children, other sessions' children and every sub-agent. Most of it is not yours. Never abort anything from it, and never choose what to abort by matching names, phases or task names.
+
+  - **Write down how to rebuild your environment** -- a `requirements.txt` you can reinstall from in one command, committed. A venv *inside* the workspace does survive, because the workspace is checkpointed at a stable path, but it is also then copied to object storage every few minutes: fine for a handful of small packages, wrong for a multi-gigabyte ML stack. Put heavy dependencies in a child action's image instead.
+- **You run as an unprivileged user.** Nothing may assume it can write outside `$HOME` or `/tmp`. This broke three separate things before it was understood, so derive writable paths from `$HOME` and never hardcode `/var/lib`, `/state` or `/usr/local/bin`.
+- **A Flyte code bundle carries Python modules, not package data.** Anything that is not a `.py` has to go into the image, or it is present locally and silently absent in the container.
+- **Building an image is not running it.** An image that builds can still exit on its first line. Prove a component starts.
+- **Rootless podman is installed** (vfs storage, chroot isolation), so `podman pull` and a `podman build` without `RUN` steps work in place. A `RUN` step or `podman run` also needs the cluster to allow nested user namespaces and /proc mounts, which many do not: try a one-line build first, and on `Operation not permitted` build through `flyte.sandbox.create` instead.
+
+### Running work on the cluster
+
+**Your own subagents first.** The roles in `.claude/agents/` are threads of this process, sharing this container and workspace. Right for reading, reviewing and parallel edits, and free. The roles, each with when to use it and the file it writes: `scope` (start of a project, or the brief is ambiguous or drifting) writes the ACCEPTANCE.md criteria draft; `discover` (a problem-brief issue, or a design question the code cannot answer) writes DISCOVERY.md; `prototype` (a choice between shapes a person will see or use) writes prototypes/ with at least two runnable options and an evaluation; `shape` (before building, or when a design fights the problem) writes DESIGN-RATIONALE.md; `build` (the shape is settled) writes code and tests; `verify` (after any build) gives evidence-cited verdicts. Each reads what the stage before it wrote, except `verify`, which reads only the criteria and the artifact. For a problem-brief issue -- the brief says the design is to be produced -- the order is `scope`, `discover`, `prototype` (when a person will see or use the result), `shape`, `build`, `verify`. The old names `product`, `designer`, `dev` and `qa` still work as aliases this release. Run **several `verify` at once** on different aspects. `DESIGN.md` holds the house rules they all follow; read it before you write anything.
+
+**For anything needing its own hardware, submit a child action of this run.** Attach to the run once, then write ordinary Flyte:
+
+```python
+import asyncio, flyte
+from flyte_agent_factory.child import attach
+
+attach()
+
+env = flyte.TaskEnvironment(
+    name='train',
+    image=os.environ['FLYTE_INTERNAL_IMAGE'],   # an image that already exists
+    resources=flyte.Resources(cpu=2, memory='8Gi'),
+)
+
+@env.task
+async def train(lr: float) -> float:
+    ...
+
+print(asyncio.run(train(0.01)))
+```
+
+Each gets its own container, hardware, logs and row in the run. Read `flyte_agent_factory/child.py` before your first one.
+
+**Stopping a child you started** (an orphan, a runaway) is done with exact names, from the record `attach()` keeps of what you submitted:
+
+```bash
+python -m flyte_agent_factory.child abort <action-name> [<action-name> ...]
+```
+
+It refuses, and aborts nothing, for `a0`, your own action, a name you did not start, or anything that is not a plain name. **Aborting `a0` ends the whole project and discards everything since the last checkpoint** -- never abort it, never use `flyte abort` or `Action.abort` yourself, and never touch an action that another agent or a sub-agent started. If you think one of those is stuck, say so in your final message or ask the human.
+
+**Two rules that will bite you otherwise:**
+
+1. **The image must already exist.** Submission succeeds either way, but a bare `flyte.Image` name has no registry inside a pod and the child then cannot pull it. Reuse this container's image (`$FLYTE_INTERNAL_IMAGE`) or a public one. When you genuinely need new packages, use `flyte.sandbox.create(name=..., code=..., packages=[...])`, which goes through the platform's builder and *can* build from inside a run. There is no `pip` at runtime in a sandbox job -- declare packages up front; a wheel URL is a valid entry.
+2. **Ask for spot first for CPU work -- but spot has no GPUs.** `interruptible=True` is cheaper and draws from a different pool than the on-demand nodes this cluster has exhausted, so for CPU work it is both less expensive and more likely to be placed. It is also *mutually exclusive with a GPU here*: the only spot nodepools are `awst3axlargespot` and `awsc54xlargespot`, and both report `gpu=0`, so `interruptible=True` together with `gpu=1` is infeasible every time, whichever device you name. **A GPU means `interruptible=False`.** For CPU child work, pair spot with a queue bound and fall back rather than wait:
+
+```python
+from datetime import timedelta
+import flyte.errors
+
+bound = flyte.Timeout(max_queued_time=timedelta(minutes=5))
+try:
+    # Cheaper, and a separate pool. CPU only -- see above.
+    await train.override(interruptible=True, timeout=bound).aio(0.01)
+except flyte.errors.MaxQueuedTimeExceededError:
+    # Clear the timeout: the queue bound carries through override().
+    await train.override(interruptible=False, timeout=flyte.Timeout()).aio(0.01)
+```
+
+`max_runtime` does not help here -- it only starts counting once a pod is placed, so without `max_queued_time` an unplaceable job waits forever in `WAITING_FOR_RESOURCES`, which is not a failure and not progress. Note `max_queued_time` is per *attempt*, so retries multiply the wait. A preempted spot task is retried on the platform's budget, not out of your `retries`, so spot costs you the work in flight rather than an attempt. Only reach for on-demand when losing that work would actually hurt, or when spot could not be placed.
+
+**Finding out what hardware you can have.** No API reports free capacity -- but you do not have to guess, because the scheduler explains itself. An *impossible* request is rejected by admission in about a second, with a verdict naming every nodepool it tried and what did not fit:
+
+```
+infeasible: no cluster of queue "oc-production" has a nodepool that can run every pod
+of the action among its spot nodepools (the attempt is interruptible; mark the task
+as non-interruptible, or add a spot nodepool); pod "primary" (cpu=2000m memory=8Gi
+gpu=1 (nvidia-t4)) fits no nodepool: awst3axlargespot: requests gpu=1 but a node has
+gpu=0; awsc54xlargespot: requests gpu=1 but a node has gpu=0
+```
+
+That is authoritative and it usually contains the fix verbatim. So **probe with a trivial job at the shape you want before building a pipeline around it**, and read the error rather than reasoning about it. Two things it will not tell you up front:
+
+- **On-demand GPUs are available, and `nvidia-tesla-t4` is confirmed placeable** (`interruptible=False`, `gpu=1`). L40S nodes exist too but are tainted. Do not assume a device class is unavailable without probing for it -- and prefer not to name one at all unless you need a specific one, so the scheduler can use whatever is free.
+- **Every task gets at least ~1 CPU and ~1Gi** whatever you ask for, so asking for less buys nothing.
+
+A request that is *possible but currently unsatisfiable* behaves differently from an impossible one: it sits in `WAITING_FOR_RESOURCES`, which is neither failure nor progress, and which is what `max_queued_time` is for.
+
+**Data too big for git lives in the artifact service, not the repo.** Datasets, audio, model weights, anything large: look there *first* before asking anyone to stage something, and publish your own outputs there rather than committing them.
+
+```python
+import flyte.remote as remote
+from flyte.io import Dir
+
+# Find what already exists -- it may be exactly what you were about to ask for.
+for a in remote.Artifact.listall():
+    print(a.name, a.version)
+
+art = remote.Artifact.get('voice-target-audio')   # or version='...'
+d = await art.to_python(Dir)   # pass the type: guessing fails for a directory
+await d.download('./data')
+
+# Publishing. upload_dir goes through the control plane, so it needs no
+# cloud credentials of its own.
+uri = remote.upload_dir(Path('./my_outputs'))
+remote.Artifact.create(
+    Dir.from_existing_remote(uri),
+    name='my-dataset', version='v1',
+    description='<=255 chars',
+    attrs={'rows': '1000'},    # searchable; put the caveats here
+)
+```
+
+Three traps, all of which cost time: `upload_dir` and `upload_file` are syncified and return a value, so `await` on them raises `TypeError`, while `to_python` *is* a coroutine and must be awaited -- the API is not consistent, so check. `to_python()` needs the type passed explicitly for a `Dir` or `File` (`No transformers could reverse Flyte literal type blob` means you omitted it). And `description` is capped at 255 characters. Read `attrs` before trusting an artifact's contents: whoever published it may have recorded that part of it is suspect.
+
+**Delegating a whole chunk of work** goes to a sub-agent, which is also a child action with its own logs:
+
+```python
+from flyte_agent_factory.agent import subagent
+summary, artifacts = await subagent(brief='...', role='verify', workdir=None)
+```
+
+Nothing it produces is merged automatically -- you review and take what you want. A sub-agent's action is not yours to abort; ask it to finish instead.

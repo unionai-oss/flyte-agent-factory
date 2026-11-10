@@ -1,0 +1,8 @@
+# Owner waivers: accept a failing check for a while. Only the owner edits this file; the factory cannot.
+#
+# [[waiver]]
+# check = "factory:module-size"
+# project = "my-project"
+# expires = 2030-01-31          # through the end of that day
+# link = "https://github.com/OWNER/agent-workspace/issues/1"   # where you made the decision
+# reason = "split planned"

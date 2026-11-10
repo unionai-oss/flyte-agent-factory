@@ -1,0 +1,22 @@
+{
+  "conditions": [
+    {
+      "name": "ask-a1",
+      "opened_at": 10,
+      "text": "Which customer complaint should I address?",
+      "blocking": true,
+      "answered_at": 15
+    }
+  ],
+  "commits": [
+    {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "at": 5,
+      "paths": [
+        "case/shortlinks/store.py"
+      ]
+    }
+  ],
+  "outcome": "escalated",
+  "success": false
+}

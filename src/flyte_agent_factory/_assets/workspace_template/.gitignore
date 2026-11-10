@@ -1,0 +1,5 @@
+# Local only: a real profile holds your project, domain and secret names.
+.env
+__pycache__/
+*.pyc
+.venv/

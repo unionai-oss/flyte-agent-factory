@@ -1,0 +1,11 @@
+{
+ "name": "spend-paid-bench",
+ "question": "The benchmark estimate for comparing my change against main is $38 (ceiling $41, 2 repeats). May I launch the paid factory-bench run with max_usd=41? Default if no answer: run only the free estimate and report it.",
+ "kind": "approve",
+ "brief": "Improve the planner's prompt and show it does not regress the benchmark.",
+ "directions": [],
+ "context": "",
+ "expect": {
+  "class": "owner"
+ }
+}

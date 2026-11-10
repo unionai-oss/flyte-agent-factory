@@ -1,0 +1,38 @@
+# A deployment that shares nothing with work.toml, to prove nothing is hard-coded.
+name = "other"
+cap = 2
+
+[backend]
+kind = "oss"
+endpoint = "flyte.example.org"
+project = "proj-x"
+domain = "staging"
+console_host = "console.example.org"
+
+[repo]
+project = "git@example.org:team/sandbox.git"
+factory = "git@example.org:team/factory.git"
+
+[[slots]]
+env = "agent-a"
+subagent_env = "sub-a"
+
+[[slots]]
+env = "agent-b"
+subagent_env = "sub-b"
+
+[[slots]]
+env = "agent-c"
+subagent_env = "sub-c"
+
+[secrets]
+claude_token = "claude_tok"
+deploy_key = "dk"
+
+[policy]
+AUTHOR_MODEL = "sonnet"
+JUDGE_ENGINE = "codex"
+
+[mcp]
+public_url = "https://mcp.example.org"
+repos = ["project", "factory"]

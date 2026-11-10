@@ -1,0 +1,35 @@
+# Minimal profile for one person on a personal ChatGPT Plus or Pro plan: the coordinator runs Codex on a
+# ChatGPT login. Copy it to profiles/<name>.toml, replace every value that says example, my or you, and select
+# it with AGENT_FACTORY_PROFILE=<name>. Walk-through: docs/quickstart.md. Secrets: docs/secrets.md.
+name = "codex-personal"
+
+[backend]
+kind = "union"                            # "union" (hosted) or "oss" (open-source Flyte 2)
+endpoint = "flyte.example.com"            # your Flyte endpoint
+project = "my-agents"                     # the Flyte project the factory runs in (you create it)
+domain = "development"                    # the Flyte domain
+config = "~/.flyte/config.yaml"           # the Flyte config file the CLI is passed
+
+[repo]
+project = "git@github.com:you/my-workspace.git"   # your workspace repository; projects push here
+
+[[slots]]
+env = "agent-a"                           # the Flyte environment name
+subagent_env = "agent-a-sub"              # its sub-agent environment; must differ from every other name
+# The ChatGPT login (auth.json) for this slot only; it rotates, so no other slot may share it. The name must
+# start with codex_login. Create it with codex_bootstrap_login or `codex login --device-auth` (docs/engines.md).
+codex_login = "codex_login_personal"
+
+[slots.policy]
+COORDINATOR_ENGINE = "codex"              # this slot's coordinator runs Codex, on the login above
+
+[secrets]
+# Flyte secret names, created with `flyte create secret` (docs/secrets.md); the values stay in Flyte.
+# A profile must name a Claude token (the parser requires it), and the builders and delegate workers run on
+# Claude unless pinned, so a Claude Pro or Max `setup-token` is still needed beside the ChatGPT login.
+claude_token = "claude_setup_token"       # the token `claude setup-token` prints
+deploy_key = "my_deploy_key"              # a write deploy key for the workspace repository
+
+# The factory MCP connector that chat uses (docs/factory-mcp-setup.md). ops/deploy_factory.py needs this table.
+[mcp]
+public_url = ""                           # empty for the first deploy; then the factory-mcp app URL (step 6)

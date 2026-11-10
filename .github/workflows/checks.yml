@@ -1,0 +1,306 @@
+# Checks for the factory-improvement project. `factory-improvement/checks.sh` runs the same: pytest as a
+# `not slow` and, on request, a `slow` lane, then ruff check and ruff format.
+#
+# What runs when (docs/ci.md has the reasoning, the minutes and the checks `main` requires):
+# - `Standards gate` is the factory's own gate, run on this repo with the code the DONE gate uses
+#   (`python -m flyte_agent_factory._gates standards`), against the workspace template's example set (the engine has
+#   no standards of its own). It runs for every pull request and every push to main, and a failing gate fails its
+#   check-run: the deployer skips that commit and the pull request's check is red.
+# - Its test rule covers both pytest lanes, so `Tests (not slow)` and `Tests (slow)` run on every run and leave
+#   junit files the gate reads (`--pytest-junit`) instead of running the suite a second time. The gate needs both,
+#   so it starts when they have passed; when a test job fails the gate is skipped and the failing test job is
+#   what fails the commit.
+# - The gate's ruff and shellcheck rules cover what `Lint` used to run, with the same tools and config, so `Lint`
+#   keeps only what the gate does not read: shellcheck over the tracked `.claude-flyte/` scripts. `Changes` says
+#   whether a change can affect it (`.github/ci_lanes.py`); a skipped job reports a `skipped` check-run, which the
+#   deployer and the loop's merge rule (`_github.commit_health`) count as passing. `Changes` failing fails the
+#   commit.
+# - A newer push to a pull request cancels its older run. Runs on main are never cancelled: a cancelled check-run
+#   counts as failing in `commit_health`, and the deployer would skip that commit.
+# - The weekly schedule and a manual `workflow_dispatch` run everything on main's head too.
+name: checks
+on:
+  push: {branches: [main]}
+  pull_request: {}
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch: {}
+permissions: {contents: read}
+concurrency:
+  # One group per pull request, so a newer push supersedes the older run; every other run is its own group.
+  group: checks-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      lint: ${{ steps.lanes.outputs.lint }}
+    steps:
+      # Pinned by commit, not tag: a tag can be moved to other code.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # A pull request's merge commit and its first parent; ci_lanes.py fetches a push's `before` itself.
+          fetch-depth: 2
+      - id: lanes
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) args=(--base "$(git rev-parse HEAD^1)") ;;
+            push) args=(--base "$BEFORE") ;;
+            *) args=(--all) ;;
+          esac
+          python3 .github/ci_lanes.py "${args[@]}" >> "$GITHUB_OUTPUT"
+  tests-fast:
+    name: Tests (not slow)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The scanner tests (gitleaks over the public tree, the pinned versions) fail without a scanner; nothing skips them.
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # gitleaks and tflint from actions/cache, keyed by version and sha256 (`_scanners.py`, their one pin). The
+      # installer verifies the cached archive; only a cold cache downloads, with retries, and a scanner it cannot
+      # obtain fails the job naming the tool and URL (docs/ci.md).
+      - name: Scanner cache keys
+        id: scanners
+        run: python3 src/flyte_agent_factory/_scanners.py cache-key gitleaks tflint >> "$GITHUB_OUTPUT"
+      - name: Restore gitleaks
+        id: gitleaks-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.gitleaks }}
+          key: ${{ steps.scanners.outputs.gitleaks }}
+      - name: Restore tflint
+        id: tflint-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
+          key: ${{ steps.scanners.outputs.tflint }}
+      - name: Install scanners
+        run: |
+          python3 src/flyte_agent_factory/_scanners.py install --cache ~/.cache/factory-scanners --bin "$RUNNER_TEMP/scanners" gitleaks tflint
+          echo "$RUNNER_TEMP/scanners" >> "$GITHUB_PATH"
+      # Saved now, not at the end of the job: a failing test must not leave the next run downloading again.
+      - name: Save gitleaks
+        if: steps.gitleaks-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.gitleaks }}
+          key: ${{ steps.scanners.outputs.gitleaks }}
+      - name: Save tflint
+        if: steps.tflint-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
+          key: ${{ steps.scanners.outputs.tflint }}
+      # The owner's private literal list for the personal-literal guard (ops/personal_literals.py), from the
+      # repository secret of the same name. Without it (a fork's pull request, a repository that has not set it)
+      # the guard checks the generic shapes only.
+      - name: Owner literal list, when the repository has one
+        env:
+          LITERALS: ${{ secrets.FACTORY_OWNER_LITERALS }}
+        run: |
+          if [ -n "$LITERALS" ]; then
+            printf '%s\n' "$LITERALS" > "$RUNNER_TEMP/owner-literals.txt"
+            echo "FACTORY_OWNER_LITERALS=$RUNNER_TEMP/owner-literals.txt" >> "$GITHUB_ENV"
+          fi
+      - run: uv sync --frozen
+      # The cutover's tree (ops/public_tree.py), scanned with the owner's list when there is one: the log says how
+      # many owner literals were loaded and how many files were read.
+      - name: Scan the public tree
+        run: |
+          uv run python ops/public_tree.py build "$RUNNER_TEMP/public-tree"
+          uv run python ops/scan_public.py "$RUNNER_TEMP/public-tree"
+      # The junit file and the commit it ran on are what the standards gate reads instead of running this again.
+      - name: pytest -m "not slow"
+        env:
+          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/junit/fast.xml
+        run: PYTHONPATH=src uv run python -m pytest tests -q -m "not slow"
+      - name: Keep the junit for the standards gate
+        run: git rev-parse HEAD > "$RUNNER_TEMP/junit/head"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-fast
+          path: ${{ runner.temp }}/junit/
+          if-no-files-found: error
+          retention-days: 7
+  tests-slow:
+    name: Tests (slow)
+    runs-on: ubuntu-24.04
+    # The slow lane runs real Terraform plans: accepted as slow (owner, direction 011).
+    timeout-minutes: 45
+    # The scanner tests (gitleaks over the public tree, the pinned versions) fail without a scanner; nothing skips them.
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # gitleaks and tflint from actions/cache, keyed by version and sha256 (`_scanners.py`, their one pin). The
+      # installer verifies the cached archive; only a cold cache downloads, with retries, and a scanner it cannot
+      # obtain fails the job naming the tool and URL (docs/ci.md).
+      - name: Scanner cache keys
+        id: scanners
+        run: python3 src/flyte_agent_factory/_scanners.py cache-key gitleaks tflint >> "$GITHUB_OUTPUT"
+      - name: Restore gitleaks
+        id: gitleaks-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.gitleaks }}
+          key: ${{ steps.scanners.outputs.gitleaks }}
+      - name: Restore tflint
+        id: tflint-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
+          key: ${{ steps.scanners.outputs.tflint }}
+      - name: Install scanners
+        run: |
+          python3 src/flyte_agent_factory/_scanners.py install --cache ~/.cache/factory-scanners --bin "$RUNNER_TEMP/scanners" gitleaks tflint
+          echo "$RUNNER_TEMP/scanners" >> "$GITHUB_PATH"
+      # Saved now, not at the end of the job: a failing test must not leave the next run downloading again.
+      - name: Save gitleaks
+        if: steps.gitleaks-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.gitleaks }}
+          key: ${{ steps.scanners.outputs.gitleaks }}
+      - name: Save tflint
+        if: steps.tflint-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
+          key: ${{ steps.scanners.outputs.tflint }}
+      # The slow lane's Terraform hidden-check tests skip without terraform; the same pin as the benchmark image
+      # (`_images.TERRAFORM_VERSION` / `TERRAFORM_SHA256`, kept equal by tests/test_ci_workflow.py).
+      - name: Install Terraform
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/terraform.zip" \
+            https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+          echo "186e0145f5e5f2eb97cbd785bc78f21bae4ef15119349f6ad4fa535b83b10df8  $RUNNER_TEMP/terraform.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/terraform.zip" -d "$RUNNER_TEMP/terraform"
+          sudo install "$RUNNER_TEMP/terraform/terraform" /usr/local/bin/terraform
+      # tests/test_browser_gate.py drives the real @playwright/mcp and fails without it. Mirrors
+      # src/flyte_agent_factory/_assets/browser/install.sh, at `_images.PLAYWRIGHT_MCP_VERSION` (kept equal by
+      # tests/test_ci_workflow.py). System libraries need root; the browser itself goes in the runner user's cache.
+      - name: Install Playwright MCP and Chromium
+        # An explicit browser path, exported to the later steps: the tests point XDG_CACHE_HOME at a temporary
+        # directory each (tests/conftest.py), so Playwright's default cache would be empty for them.
+        run: |
+          export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/ms-playwright"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
+          sudo npm install -g @playwright/mcp@0.0.83
+          root="$(npm root -g)"
+          for cli in "$root/@playwright/mcp/node_modules/playwright-core/cli.js" "$root/playwright-core/cli.js"; do
+            if [ -f "$cli" ]; then
+              sudo node "$cli" install-deps chromium
+              node "$cli" install chromium
+              exit 0
+            fi
+          done
+          echo "could not locate playwright-core cli.js under $root" >&2
+          exit 1
+      - run: uv sync --frozen
+      # The junit file and the commit it ran on are what the standards gate reads instead of running this again.
+      - name: pytest -m "slow"
+        env:
+          PYTEST_ADDOPTS: --junitxml=${{ runner.temp }}/junit/slow.xml
+        run: PYTHONPATH=src uv run python -m pytest tests -q -m "slow"
+      - name: Keep the junit for the standards gate
+        run: git rev-parse HEAD > "$RUNNER_TEMP/junit/head"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-slow
+          path: ${{ runner.temp }}/junit/
+          if-no-files-found: error
+          retention-days: 7
+  lint:
+    name: Lint
+    needs: changes
+    if: needs.changes.outputs.lint == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install shellcheck
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/shellcheck.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          sudo install "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" /usr/local/bin/shellcheck
+      # The standards gate runs ruff and shellcheck over everything else; its file walk skips `.claude-flyte/`.
+      - name: shellcheck the tracked .claude-flyte scripts
+        run: git ls-files -z '.claude-flyte/*.sh' | xargs -0 --no-run-if-empty shellcheck
+  standards:
+    name: Standards gate
+    # Both lanes passed: the gate reads their junit instead of running pytest again. A failing test job skips the
+    # gate (a `skipped` check-run) and fails the commit itself.
+    needs: [tests-fast, tests-slow]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # The module-size rule measures growth against the previous commit (`_gates._parent_tree`).
+          fetch-depth: 2
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # Every tool a MUST rule of the example set needs on this repo: a missing one is `tool unavailable`, which
+      # blocks. The Terraform pack applies because of the benchmark fixtures' `.tf` files. The same pins as the
+      # factory image (`_images.TERRAFORM_*` kept equal by tests/test_ci_workflow.py; tflint's from `_scanners.py`).
+      - name: Install shellcheck
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/shellcheck.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          sudo install "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" /usr/local/bin/shellcheck
+      - name: Install Terraform
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/terraform.zip" \
+            https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+          echo "186e0145f5e5f2eb97cbd785bc78f21bae4ef15119349f6ad4fa535b83b10df8  $RUNNER_TEMP/terraform.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/terraform.zip" -d "$RUNNER_TEMP/terraform"
+          sudo install "$RUNNER_TEMP/terraform/terraform" /usr/local/bin/terraform
+      # gitleaks and tflint from actions/cache, keyed by version and sha256 (`_scanners.py`, their one pin). The
+      # installer verifies the cached archive; only a cold cache downloads, with retries, and a scanner it cannot
+      # obtain fails the job naming the tool and URL (docs/ci.md).
+      - name: Scanner cache keys
+        id: scanners
+        run: python3 src/flyte_agent_factory/_scanners.py cache-key tflint >> "$GITHUB_OUTPUT"
+      - name: Restore tflint
+        id: tflint-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
+          key: ${{ steps.scanners.outputs.tflint }}
+      - name: Install scanners
+        run: |
+          python3 src/flyte_agent_factory/_scanners.py install --cache ~/.cache/factory-scanners --bin "$RUNNER_TEMP/scanners" tflint
+          echo "$RUNNER_TEMP/scanners" >> "$GITHUB_PATH"
+      # Saved now, not at the end of the job: a failing test must not leave the next run downloading again.
+      - name: Save tflint
+        if: steps.tflint-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
+          key: ${{ steps.scanners.outputs.tflint }}
+      - run: uv sync --frozen
+      # mypy's incremental cache (`_gate_tests.cache_root()/mypy`), so a run re-checks only what changed. mypy
+      # validates every cached module against its source, so a stale entry costs time, never a wrong verdict.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/factory-gate/mypy
+          key: gate-mypy-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}-${{ github.sha }}
+          restore-keys: gate-mypy-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}-
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: junit-*
+          path: ${{ runner.temp }}/junit
+          merge-multiple: true
+      - name: Full standards gate
+        run: >-
+          PYTHONPATH=src uv run python -m flyte_agent_factory._gates standards .
+          --standards src/flyte_agent_factory/_assets/workspace_template/standards
+          --pytest-junit "$RUNNER_TEMP/junit"

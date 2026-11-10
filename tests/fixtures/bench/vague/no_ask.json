@@ -1,0 +1,14 @@
+{
+  "conditions": [],
+  "commits": [
+    {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "at": 20,
+      "paths": [
+        "case/shortlinks/store.py"
+      ]
+    }
+  ],
+  "outcome": "escalated",
+  "success": false
+}

@@ -1,0 +1,42 @@
+# The profile the whole suite runs against: neutral placeholder values with the same structure
+# as a real two-slot deployment (two slots, a per-slot policy, a self agent, MCP settings).
+name = "work"
+
+[backend]
+kind = "union"
+endpoint = "union.example.org"
+org = "example"
+project = "proj-work"
+domain = "development"
+console_host = "union.example.org"
+signin_host = "signin.example.org"
+config = "~/.union/example-config.yaml"
+
+[repo]
+project = "git@example.org:team/work-sandbox.git"
+
+[[slots]]
+env = "agent-one"
+subagent_env = "sub-one"
+
+[[slots]]
+env = "agent-two"
+subagent_env = "sub-two"
+
+[slots.policy]
+ARBITER_ENGINE = "codex"
+COMPLETENESS_ENGINE = "codex"
+CONTRACT_ENGINE = "codex"
+CORRECTNESS_ENGINE = "codex"
+CRAFT_ENGINE = "codex"
+PLANNER_ENGINE = "codex"
+
+[secrets]
+claude_token = "claude_token_x"
+deploy_key = "deploy_key_x"
+gateway_key = "gateway_key_x"
+api_key = "api_key_x"
+
+[policy]
+
+[mcp]

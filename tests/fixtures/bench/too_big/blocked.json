@@ -1,0 +1,7 @@
+{
+  "conditions": [],
+  "commits": [],
+  "outcome": "blocked",
+  "text": "Please approve splitting the work:\n1. Terraform per cloud.\n2. Hosted console and customer migration.",
+  "success": true
+}

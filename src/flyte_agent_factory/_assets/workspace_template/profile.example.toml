@@ -1,0 +1,47 @@
+# Example profile for your workspace. Copy it to profile.toml and fill it in. Keep profile.toml out of any
+# public repository: it holds your project, domain, host and secret names.
+# Every key is explained in the engine's profiles/README.md.
+name = "my-workspace"
+
+cap = 2
+
+[backend]
+# "union" (hosted) or "oss" (open-source Flyte 2).
+kind = "union"
+endpoint = "flyte.example.com"
+project = "my-agents"
+domain = "development"
+
+[repo]
+# The only repository the factory writes to: this workspace. The deploy key reaches nothing else.
+project = "git@github.com:OWNER/agent-workspace.git"
+
+[[slots]]
+env = "agent-a"
+subagent_env = "agent-a-sub"
+
+[[slots]]
+env = "agent-b"
+subagent_env = "agent-b-sub"
+
+[secrets]
+# Flyte secret names, created with `flyte create secret`.
+claude_token = "my_claude_token"   # the `claude setup-token` token; the value lives only in Flyte
+deploy_key = "my_deploy_key"       # deploy key of this workspace repository, with write access
+
+[policy]
+# One token runs every role; pick the engine and model per role here.
+# AUTHOR_MODEL = "opus"
+
+# Standards come from this workspace's standards/ directory (read-only to the factory).
+[standards]
+dir = "standards"
+include = ["engineering", "security"]
+languages = "auto"
+
+# Optional: a Projects v2 board as the backlog.
+# [board]
+# owner = "OWNER"
+# owner_type = "user"
+# number = 1
+# pat_secret = "my_board_pat"

@@ -1,0 +1,9 @@
+# The repositories and paths the weekly factory-gardening project may tend. Only the owner edits this file:
+# the factory's scope gate rejects any patch that touches it. The engine itself is the default target, also
+# without this file; remove the [[target]] below (keeping the file) and the weekly gardening run is skipped.
+#
+# Add others with another [[target]]; `repo` is a key of the profile's [repo] table, or use path = "<project
+# directory>" instead.
+
+[[target]]
+repo = "factory"

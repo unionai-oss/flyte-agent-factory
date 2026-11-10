@@ -1,0 +1,86 @@
+# Rendered by start.sh: __PORT__ and __OUTPUT_DIR__ are substituted at startup.
+#
+# A Flyte AppEnvironment exposes exactly one port, so nginx multiplexes the two
+# things this container offers: the MCP endpoint the agent drives, and a noVNC
+# view so a human can watch the same browser live.
+worker_processes 1;
+daemon off;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+
+events { worker_connections 256; }
+
+http {
+    access_log off;
+    client_body_temp_path /tmp/nginx-body;
+    proxy_temp_path /tmp/nginx-proxy;
+    fastcgi_temp_path /tmp/nginx-fastcgi;
+    uwsgi_temp_path /tmp/nginx-uwsgi;
+    scgi_temp_path /tmp/nginx-scgi;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    server {
+        listen __PORT__;
+        server_name _;
+
+        location = /healthz {
+            add_header Content-Type text/plain;
+            return 200 "ok\n";
+        }
+
+        # Playwright MCP.
+        #
+        # The shared app trusts in-cluster callers. start.sh adds personal auth.
+        location /mcp {
+            proxy_pass http://127.0.0.1:8931;
+            proxy_http_version 1.1;
+            # `localhost:8931`, not $host. The MCP server validates Host and
+            # Origin as DNS-rebinding protection and answers 403 to anything
+            # else -- forwarding the external hostname made every call fail
+            # with a 403 that looked like an auth problem.
+            proxy_set_header Host localhost:8931;
+            proxy_set_header Origin http://localhost:8931;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+
+            # Streamable HTTP / SSE: buffering would hold responses back, and
+            # an MCP session idles between tool calls far longer than the
+            # 60s default.
+            proxy_buffering off;
+            proxy_cache off;
+            chunked_transfer_encoding off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+
+        # Recordings, screenshots and PDFs the agent asked for. Reachable by
+        # the same callers as /mcp, for the same reasons.
+        location /output/ {
+            alias __OUTPUT_DIR__/;
+            autoindex on;
+            autoindex_format json;
+            # A video of any length should stream rather than buffer.
+            sendfile on;
+            add_header Cache-Control "no-store";
+        }
+
+        # Live view of the browser. Left to the platform's own auth rather than
+        # the token, so it opens in a browser after a normal Union sign-in.
+        location /view/ {
+            proxy_pass http://127.0.0.1:6080/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 3600s;
+        }
+
+        location = / {
+            return 302 /view/vnc.html?autoconnect=1&resize=scale;
+        }
+    }
+}

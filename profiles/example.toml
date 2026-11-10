@@ -1,0 +1,165 @@
+# Example deployment profile. Safe to share; copy it to <name>.toml, fill it in, and select it
+# with AGENT_FACTORY_PROFILE=<name> (or --profile <name> on the ops tools).
+# Real profiles hold your project, hosts and secret names: keep them in a private repo.
+# Every key is explained in profiles/README.md.
+name = "example"
+
+# Projects launched at once. Defaults to the number of slots; never more.
+# (Keep it up here: below a slot table it would be read as that slot's key.)
+cap = 2
+
+[backend]
+# "union" (hosted) or "oss" (open-source Flyte 2). Recorded for docs and guards.
+kind = "union"
+endpoint = "flyte.example.com"
+project = "my-agents"
+domain = "development"
+# Optional.
+org = "example"
+# Console host, for links in reports and the browser's console login. Leave out if none.
+console_host = "console.example.com"
+# Where the console redirects an unauthenticated browser. Leave out if none.
+signin_host = "signin.example.com"
+# Flyte config file passed to the CLI.
+config = "~/.flyte/example-config.yaml"
+
+[repo]
+# The workspace: the repository projects are pushed to (the only one [secrets] deploy_key reaches).
+project = "git@github.com:you/my-sandbox.git"
+# factory = "git@github.com:you/factory.git"   # optional; chat may use it only if the mcp table lists it
+# factory_projects = 1   # how many projects on `factory` may run at once (needs `factory`; default 1)
+
+# One slot per project environment. Env names and sub-agent env names must each be unique. Every slot
+# runs on the one token in [secrets] claude_token.
+[[slots]]
+env = "agent-a"
+subagent_env = "agent-a-sub"
+
+[[slots]]
+env = "agent-b"
+subagent_env = "agent-b-sub"
+# Optional: this slot's own role policy, merged over the global policy below when this slot is deployed.
+# [slots.policy]
+# CRAFT_ENGINE = "codex"
+
+# A deployment can leave out every [[slots]] entry above (and `cap`): projects then share one
+# environment and this table bounds them. It is read only without [[slots]]; with slots, `cap` is the bound.
+# [concurrency]
+# max_projects = 4                      # default 4, a guess until `ops/probes/setup_token.py --max-k` measures it
+# per_engine = { claude = 3, codex = 2 }  # optional: also cap the projects whose author runs on each engine
+
+[secrets]
+# Flyte secret names, created with `flyte create secret`.
+claude_token = "claude_setup_token"        # required: the `claude setup-token` token; the value lives only in Flyte
+deploy_key = "my_deploy_key"               # required: the single-repo deploy key
+gateway_key = "my_gateway_key"             # optional, as are the next two
+api_key = "my_anthropic_key"
+# codex_token = "my_codex_token"  # optional: Codex access token, mounted as CODEX_ACCESS_TOKEN
+
+# Optional: a deploy key for each further [repo] entry (not project, which uses deploy_key above).
+# A slot mounts them all; a project holds only the key for the repo it was launched on.
+# [repo_keys]
+# factory = "my_factory_deploy_key"
+
+# Optional: earlier URLs of a [repo] entry, e.g. after a GitHub rename. Projects and queued launches
+# that still name an old URL get the entry's current URL and deploy key.
+# [repo_aliases]
+# factory = ["git@github.com:you/old-factory-name.git"]
+
+# Per-role engine settings, applied at deploy as AGENT_FACTORY_<KEY>=<value>.
+[policy]
+# AUTHOR_MODEL = "opus"
+# JUDGE_ENGINE = "codex"
+
+# Optional: the factory MCP connector (docs/factory-mcp-setup.md).
+[mcp]
+# Known only after the first deploy. FACTORY_MCP_PUBLIC_URL in the shell overrides it.
+public_url = "https://factory-mcp.example.com"
+# Which [repo] keys chat may launch projects into (default: only "project").
+# repos = ["project", "factory"]
+
+# Optional: merged factory changes deploy themselves (the `factory-deployer` task, every 5 minutes).
+# `auto = true` needs [repo] factory and [github] below.
+[deploy]
+auto = false
+
+# Optional: read this profile from a separate direction repository instead of the engine tree's
+# profiles/<name>.toml. Needs auto = true. If it cannot be read the deploy fails; it never falls back.
+# [direction]
+# repo = "git@github.com:you/direction.git"   # github.com only
+# profile = "profiles/example.toml"           # default: profiles/<name>.toml
+# ref = ""                                    # branch; default: the repo's default branch
+
+# Optional: legacy queue state. Deployer release history lives in labelled Flyte runs.
+# Any scheme flyte.storage reaches: s3://, gs://, abfs://, file://.
+[state]
+uri = "s3://my-bucket/factory-state/my-agents/development"
+
+# Optional: the GitHub App the deployer reads commit statuses and fetches source through, and the
+# identity that opens each project's pull request (branch factory/<name>; draft on DONE, ready on a pass).
+# Permissions: Contents write (deployer git-ref fallback), Pull requests write, Commit statuses write,
+# Metadata read.
+# app_id is digits; private_key_secret is the Flyte secret holding the App's PEM private key.
+[github]
+app_id = "123456"
+private_key_secret = "my_github_app_private_key"
+# The Flyte secret holding the App's webhook secret: setting it deploys factory-webhook, which starts
+# a deploy on each push and carries issue intake (docs/deploy-webhook.md). Create the secret first.
+# webhook_secret = "my_github_webhook_secret"
+# Only these GitHub logins may submit issues or direction through the webhook. Empty disables intake.
+maintainers = []
+intake_label = "factory"
+
+# Optional: defaults for the `gcp_bootstrap` task (profiles/README.md, "GCP access"). Each is
+# overridden by the task's own argument.
+[gcp]
+secret_name = "my_gcp_infra_key"      # the Flyte secret the service-account key is stored as
+roles = ["roles/owner"]                # granted to the service account on the project
+apis = ["compute", "container", "iam"] # short names or full `<name>.googleapis.com`
+
+# Relative paths resolve beside this profile, then against the repository root.
+[standards]
+# dir = "../private-standards"
+include = ["engineering", "security"]
+languages = "auto" # or ["python", "terraform", "typescript", "shell"]
+brand = "" # empty keeps inferred BRAND.md behaviour
+
+# Optional: a personal or organization Projects v2 board.
+# The classic PAT belongs to a machine user with project + repo scopes, shared board access,
+# and access only to the repositories whose issues appear on the board.
+# [board]
+# owner = "your-login"
+# owner_type = "user"                 # "user" or "org"
+# number = 1                         # the number in the board URL, not its node ID
+# pat_secret = "github_board_pat"     # Flyte secret; supervisor and factory-reconcile only
+# pat_expires = "2027-01-01"          # optional YYYY-MM-DD; otherwise read from GitHub's header
+
+# Optional: the factory benchmark (`factory-bench.benchmark`, profiles/README.md). Needs [repo] factory
+# and [github]; the App must be installed on the bench repo.
+# Bench cases run on the same claude_token as production. Results use the fixed bench-results orphan branch in [direction] repo.
+# The harness App needs Contents: read and write there; bench agents cannot access it.
+# [bench]
+# repo = "git@github.com:you/factory-bench.git"   # required; distinct from every [repo] entry
+# repo_key = "my_bench_deploy_key"     # required; distinct from production deploy keys
+# max_usd = 60                         # the most one benchmark may commit to; 0 allows estimates only
+
+# Optional: manually run factory-loop.loop_run(pr_number). Disabled until the owner enables it.
+# [loop]
+# enabled = false
+# repo = "you/factory"                 # owner/repo; must match [repo] factory
+# merge = "dry-run"                    # "on" permits merging and closing
+# daily_usd = 0                       # API-equivalent USD; 0/unset blocks autonomous iterations
+# weekly_usd = 0                      # follows each engine's weekly meter reset
+# owner_floor_pct = 30                # minimum headroom while owner projects are live
+
+# Optional: the weekly low-priority gardening project (targets are listed in gardening.toml in the workspace's
+# default branch, which only the owner edits; without it the [repo] factory engine is the only target). These defaults give it a guaranteed share of slots.
+# [gardening]
+# min_runs_per_week = 1               # fewer completed runs than this in 7 days: it takes the next free slot
+# max_days_between = 7                # no completed run for longer: it queues at normal priority
+# escalate_on_regression = true       # a target's standards gate regressed since the last clean run: same
+# max_open_issues = 10                # more open `gardening` issues than this: same
+
+[planner]
+# Change only after the single-writer deployment and live smoke gates pass.
+admission = "legacy"

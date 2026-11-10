@@ -1,0 +1,124 @@
+[project]
+name = "flyte-agent-factory"
+version = "0.1.0"
+description = "Long-lived Claude Code agents that run as Flyte tasks on Union, driveable from chat agents and the Claude app."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = [
+    # Volumes live in flyteplugins-union, whose Volume API (fork / finalize /
+    # from_locator) is the 0.15.x line, and that line pins flyte to 2.10.x.
+    # Pinned in the project rather than relying on a globally installed `flyte`
+    # tool, so the CLI, the image and the tests all agree on one version.
+    "flyte[mcp]>=2.10.7,<2.11.0",
+    # Resource-bound bearer middleware is available in this MCP SDK version.
+    "mcp>=1.30.0,<2",
+    "fastapi>=0.115,<1",
+    # PodTemplate.allow_fuse() builds real k8s objects, and it runs at
+    # environment-definition time -- i.e. on whatever machine runs
+    # `flyte deploy`, not in the container. Pure Python, installs anywhere.
+    "kubernetes>=31.0.0",
+    # Linux-x86 only (it ships a FUSE mount stack), so it cannot install on a
+    # macOS dev machine. Marked platform-conditional so `uv sync` works there,
+    # and imported lazily inside task bodies -- never at module scope, or
+    # `flyte deploy` from a Mac would fail on the import.
+    "flyteplugins-union>=0.15.5,<0.16.0 ; sys_platform == 'linux'",
+    "pyjwt[crypto]>=2.8,<3",
+    # Read by `_target_ci` to find the commands a target repo's workflows run.
+    "pyyaml>=6,<7",
+    # `_target_ci` reads a target repo's coverage data for the patch-coverage gate, in the pod.
+    "coverage>=7,<8",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.17",
+    "types-pyyaml>=6",
+]
+
+[tool.uv]
+# Not installed into its own environment: every entry point runs with `PYTHONPATH=src` (checks.sh, CI, the
+# deployer's child). An editable install would put this tree's `src` on every interpreter's path, so the
+# fail-to-pass base run would import the head package instead of the base tree's.
+package = false
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The template's dotfiles are not matched by `**/*`.
+flyte_agent_factory = [
+    "_assets/**/*",
+    "_assets/workspace_template/.gitignore",
+    "_assets/workspace_template/.github/*",
+    "_assets/workspace_template/projects/.gitkeep",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "." is for `tests.` and `ops.` imports, which `python -m pytest` gets from the cwd and plain `pytest` does not.
+pythonpath = ["src", "."]
+# In parallel by default (pytest-xdist), one worker per CPU, work-stealing so a long test does not queue others.
+# The default run leaves out `slow` (the benchmark hidden checks: real Terraform and pytest-in-pytest, about two
+# thirds of the suite's CPU), so a bare `pytest` (the standards gate's test rule) fits a 4-CPU pod. They are not
+# skipped: a `-m` on the command line replaces this one, and CI's slow job and checks.sh's benchmark lane run them.
+addopts = "-n auto --dist worksteal -m 'not slow'"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "real_factory_gates: exercise factory subprocess gates rather than isolating them in loop tests",
+    "real_push_fact: run the real `_push_fact` (git ls-remote) instead of the offline stub",
+    "real_planner: run the real `_plan_next_round` (with `_call_reviewer` stubbed) instead of no plan",
+    "real_reset: parse the usage-limit reset time instead of the 'unknown' stub",
+    "real_contract: freeze the review contract instead of skipping it",
+    "slow: terraform and benchmark hidden-check tests; checks.sh runs them as their own parallel pytest lane",
+]
+
+[tool.ruff]
+line-length = 110
+# Other projects' harness files (`.claude-flyte/<name>/`), committed with `git add -f`: not engine code. The standards
+# gate's own file walks skip the directory too (`_gate_base._SKIP_DIRS`); without this, a checkout where it is not
+# git-ignored (CI's) has the gate's `ruff check .` lint them.
+extend-exclude = [".claude-flyte"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "BLE001", "E722", "TRY002", "TRY203", "TRY400", "RUF100"]
+
+[tool.ruff.lint.pydocstyle]
+# As the template's standards/languages/configs/ruff.toml: its docstring rule checks pep257 for public names.
+convention = "pep257"
+
+[tool.ruff.lint.per-file-ignores]
+# The docstring rule exempts test files; the shipped ruff baseline ignores D for them, and a project with its
+# own ruff table must carry the same lines or the gate checks tests against a rule the standard does not set.
+"**/test_*.py" = ["D"]
+"**/*_test.py" = ["D"]
+"**/tests/**" = ["D"]
+"**/conftest.py" = ["D"]
+
+[tool.mypy]
+# The standards' strict baseline (standards/languages/configs/mypy.ini) plus where this repo's package lives:
+# without `mypy_path`, `mypy .` resolves `flyte_agent_factory` to the installed copy (no py.typed) and every import
+# of it is untyped. The bench fixtures are separate sample projects (with deliberate bugs) checked by their own
+# hidden checks, not part of this codebase.
+python_version = "3.12"
+strict = true
+explicit_package_bases = true
+warn_unreachable = true
+mypy_path = "src"
+exclude = ['^(?!(.*/)?tests/)(.*/)?(test_[^/]*|[^/]*_test)\.py$', '^tests/fixtures/']
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "conftest", "*.conftest", "*.tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
