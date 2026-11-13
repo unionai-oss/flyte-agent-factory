@@ -131,7 +131,7 @@ def test_this_repository_does_not_grow_past_the_limit_from_its_own_head():
     with _gate_start._start_tree(root, "HEAD", None) as start:
         code, output = _module_size.check(root, start, _gate_tests._is_test)
     assert code == 0, output
-    assert "over the limit but not grown: src/flyte_agent_factory/_bench_suite.py" in output
+    assert "_bench_suite.py" not in output, "the bench suite was split under the limit; it must stay there"
 
 
 def _git(root: Path, *args: str) -> None:
