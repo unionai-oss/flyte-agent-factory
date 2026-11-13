@@ -101,7 +101,7 @@ def is_workspace(checkout: Path) -> bool:
     """Return True when the default branch of `checkout` has a `projects/` directory at its root.
 
     That directory (the template commits `projects/.gitkeep`) is what makes a repo a workspace. It is
-    read from `origin/HEAD`, not the working tree: a project on the engine repo that creates a
+    read from `origin/HEAD`, not the working tree: a root-layout project that creates a
     `projects/` directory of its own on its branch must not change what layout it is judged by.
     """
     if not checkout.is_dir():

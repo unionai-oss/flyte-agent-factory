@@ -17,6 +17,7 @@ from typing import Any
 from flyte_agent_factory import (
     _gate_base,
     _gate_scope,
+    _gates,
     _git,
     _meter,
     _names,
@@ -24,6 +25,7 @@ from flyte_agent_factory import (
     _secret_env,
     _standards,
     _state,
+    _vendored,
 )
 from flyte_agent_factory._bridge import INBOX_SUBDIR
 
@@ -94,6 +96,10 @@ def _load_pass_record() -> dict[str, Any] | None:
             "pr_at": saved.get("pr_at"),
             "review_round": int(saved.get("review_round", saved["round"])),
             "review_started_at": saved.get("review_started_at"),
+            # A file from before this existed has no pending retry.
+            "review_retry_at": float(saved["review_retry_at"]) if saved.get("review_retry_at") else None,
+            "review_retry_why": str(saved.get("review_retry_why") or ""),
+            "incomplete_reruns": int(saved.get("incomplete_reruns") or 0),
         }
     except (OSError, ValueError, TypeError, KeyError, OverflowError, AttributeError):
         return None
@@ -456,7 +462,14 @@ def _standards_diagnostics() -> dict[str, bool | str | None]:
     # Snapshots precede the first gate and must not materialize files just to describe their selection.
     config = _PROFILE.standards if _PROFILE else _standards.Standards()
     try:
-        files = _standards.select(_captured_standards(), config, _project_dir(), demo=_demo_kind)
+        files = _standards.select(
+            _captured_standards(),
+            config,
+            _project_dir(),
+            demo=_demo_kind,
+            fetch=False,
+            trusted_base=_vendored_base(),
+        )
     except OSError as exc:
         return {
             "configured": None,
@@ -471,7 +484,16 @@ def _standards_diagnostics() -> dict[str, bool | str | None]:
 
 def _applicable_standards() -> dict[str, str]:
     config = _PROFILE.standards if _PROFILE else _standards.Standards()
-    files = _standards.materialize(WORKSPACE, _project_dir(), config, _captured_standards(), demo=_demo_kind)
+    # Called on the supervisor's event loop: vendored trees are read from what `warm_vendored_cache` fetched.
+    files = _standards.materialize(
+        WORKSPACE,
+        _project_dir(),
+        config,
+        _captured_standards(),
+        demo=_demo_kind,
+        fetch=False,
+        trusted_base=_vendored_base(),
+    )
     if not files:
         print(
             f"{_standards.NO_STANDARDS}: the effective standards selection is empty, "
@@ -479,6 +501,18 @@ def _applicable_standards() -> dict[str, str]:
             file=sys.stderr,
         )
     return files
+
+
+def warm_vendored_cache() -> None:
+    """Fetch the project's vendored upstream trees into the cache; blocking, so run it off the event loop."""
+    _vendored.load(_project_dir(), _gate_base._SKIP_DIRS, trusted_base=_vendored_base())
+
+
+def _vendored_base() -> str:
+    # The gate's trusted base, resolved only for a project that vendors a tree (it can run git).
+    if not (_project_dir() / _vendored.MANIFEST).is_file():
+        return ""
+    return _gates._trusted_base(WORKSPACE, _project_name)
 
 
 _demo_kind = ""

@@ -109,7 +109,6 @@ def single_engine(request, tmp_path, monkeypatch):
         (_usage, "_hard_pins", False),
         (_usage, "_author_engine", engine),
         (_usage, "_meters", _meter.MeterStore(tmp_path / "meters")),
-        (_reviewer, "_limited_reason", {}),
         (_review, "_prior_findings", {}),
         (_reviewer, "_review_ledger", []),
         (_contract, "_contract", ""),
@@ -502,7 +501,10 @@ async def test_refusal_wait_crash_recovers_on_the_same_engine(single_engine, tmp
     monkeypatch.delenv("MATRIX_AUTHOR_LIMIT", raising=False)
     author_script(tmp_path, monkeypatch, ["echo recovered > edited"])
     async with rig.running():
-        await rig.until(lambda: (rig.work / "edited").exists())
+        # `>` creates the file before echo writes it: wait for the content, not the name.
+        await rig.until(
+            lambda: (rig.work / "edited").is_file() and (rig.work / "edited").read_text() == "recovered\n"
+        )
         assert _usage._author_engine == rig.engine
         if rig.engine == "codex":
             assert rig.timeline.proc.thread_id == proc.thread_id

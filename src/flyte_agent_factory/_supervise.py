@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,6 +20,7 @@ from flyte_agent_factory import (
     _gates,
     _inbox,
     _review,
+    _review_wait,
     _reviewer,
     _session_config,
     _session_setup,
@@ -38,6 +40,10 @@ from flyte_agent_factory._delegation import (
 )
 from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._process import ClaudeProcess
+
+#: The longest wait between a finished session's capped rounds of resumes. Each round doubles it from
+#: LIMIT_RETRY_S, so an engine that keeps refusing is tried a few times a day, not every 30 minutes.
+_CAP_BACKOFF_MAX_S = 4 * 3600.0
 
 
 async def _pump(
@@ -156,8 +162,13 @@ async def _pump(
     reset_at: float | None = None  # wall time the limit resets, when the notice says
     ended_at: float | None = None
     ended_limit_text = ""  # the notice of the episode that last ended: a redraw of it is stale
-    review_retry_at: float | None = None  # wall time to re-run a review the limit stopped
+    review_wait = _review_wait.ReviewWait.restore_from(restored, workspace)  # a review that re-runs by itself
     cap_announced = False
+    # A finished session's capped rounds in this episode, which double the wait before the next one, and
+    # how many of them in a row found no known reset anywhere (#125).
+    cap_rounds = 0
+    unknown_rounds = 0
+    no_reset_asked = False  # the "keeps refusing with no reset time" question is asked once per episode
     last_noted_submission = None
     interrupted_message = ""
     ended_submission = None
@@ -176,7 +187,7 @@ async def _pump(
         return bool(
             qa_task is not None
             or compact_task is not None
-            or review_retry_at is not None
+            or review_wait.at is not None
             or in_flight
             or _supervise_support._in_flight_error
             # A pending listing means the count above may be from before it: wait for it.
@@ -195,6 +206,8 @@ async def _pump(
     try:
         while not stop.is_set():
             notes = bridge.drain_notes()
+            if isinstance(proc, AuthorSession):
+                proc.declared_done = declared_done  # the handoff's briefing says whether the work was done
             hit = getattr(proc, "limit_hit_at", None)
             if hit is not None and hit != seen_limit:
                 seen_limit = hit
@@ -233,6 +246,8 @@ async def _pump(
                     output_at_resume = getattr(proc, "output_count", 0)
                     retries = 0
                     cap_announced = False
+                    cap_rounds = unknown_rounds = 0
+                    no_reset_asked = False
                     restored = getattr(proc, "limit_restored", None)
                     from_restart = bool(restored and restored[0] == hit)
                     # A refusal saved by a previous run keeps its reset and its meters as they are.
@@ -243,7 +258,14 @@ async def _pump(
                     )
                     timeline.phase("limited", limited_until=reset_at)
                     if not from_restart:
-                        _usage._note_session_limit(reset_at, timeline, getattr(proc, "meter", None))
+                        # Only a reset still ahead is recorded: a clock time already past is stale, and
+                        # recording it would mark the engine usable at once (#125).
+                        fresh = _usage._refusal_until(
+                            getattr(proc, "limit_text", ""), getattr(proc, "limit_seen_wall", None)
+                        )
+                        _usage._note_session_limit(
+                            fresh, timeline, getattr(proc, "meter", None), getattr(proc, "limit_text", "")
+                        )
                     reset = getattr(proc, "limit_text", "") or "reset time not shown"
                     timeline.row(
                         "🚨",
@@ -295,7 +317,10 @@ async def _pump(
                         proc.restore_drained()
                     refused_reset = notice_reset
                     proc.pause()
-                    if await proc.on_limit(reset_at, interrupted_message):
+                    # This refusal's own reset, never `reset_at`: after a deferral that is the retry time,
+                    # often already past, and it overwrote the engine's known reset (#125).
+                    fresh = _usage._refusal_until(limit_text, getattr(proc, "limit_seen_wall", None))
+                    if await proc.on_limit(fresh, interrupted_message):
                         limited_since = None
                         seen_limit = None
                         ended_at = None
@@ -305,7 +330,11 @@ async def _pump(
                     else:
                         interrupted_message = ""
                         reset_at = proc.retry_at
-                        timeline.phase("limited", limited_until=reset_at)
+                        if fresh is not None:
+                            cap_rounds = unknown_rounds = 0  # a real reset to wait for: no backoff needed
+                        timeline.phase(
+                            "limited", limited_until=reset_at, paused=timeline._phase.get("paused")
+                        )
             if limited_since is not None:
                 # A small redraw after a refusal is not evidence of progress. A later
                 # unrefused submission can still receive a short, valid answer.
@@ -369,10 +398,18 @@ async def _pump(
                     if declared_done:
                         timeline.activity("done -- the usage limit has cleared")
             if limited_since is not None:
+                # Set by the author handoff when it deferred: which engine is awaited, until when, and why.
+                paused = timeline._phase.get("paused") or {}
+                awaited = (
+                    f"; waiting for {paused['engine']} until "
+                    + (_author._when(paused["until"]) if paused.get("until") else "its reset")
+                    if paused.get("engine")
+                    else ""
+                )
                 timeline.activity(
                     f"paused on the {_usage._author_engine.capitalize()} usage limit for "
                     f"{(time.monotonic() - limited_since) / 60:.0f}m "
-                    f"({getattr(proc, 'limit_text', '') or 'reset time not shown'}) -- "
+                    f"({getattr(proc, 'limit_text', '') or 'reset time not shown'}{awaited}) -- "
                     + (
                         "needs a human: two resumes did not take"
                         if cap_announced
@@ -384,32 +421,93 @@ async def _pump(
                 # Even when declared done: a limit notice only follows something we sent, so the
                 # session was mid-task. A past run had passed review,
                 # hit the limit handling a wrap-up direction, and sat paused 3+ hours past the reset.
-                # A finished session gets at most two tries per episode; past that a human looks.
+                # A finished session gets two tries at a time. Past that the router is asked again; a human
+                # is called only when no engine can run, never while one can or has a known reset (#125).
                 capped = declared_done and retries >= 2
-                if (
-                    capped
-                    and time.monotonic() - last_resume >= _session_config.LIMIT_RETRY_S
-                    and not cap_announced
-                ):
-                    cap_announced = True
-                    timeline.row("🚨", "still on the usage limit after two tries; a human needs to look")
-                due = time.monotonic() - last_resume >= _session_config.LIMIT_RETRY_S or (
-                    reset_at is not None and time.time() >= reset_at + 60 and retries == 0
+                # Set when the cap's routing call is this attempt's, so the resume below does not repeat it.
+                routed_at_cap = False
+                cap_wait = min(_session_config.LIMIT_RETRY_S * 2**cap_rounds, _CAP_BACKOFF_MAX_S)
+                # The backoff is for a reset nobody knows. One a meter learns during the wait, for an engine
+                # the coordinator may use, ends it a minute after that reset rather than hours later.
+                since_resume = time.monotonic() - last_resume
+                resumed_wall = time.time() - since_resume
+                known_resets: Callable[[], list[float]] | None = (
+                    getattr(proc, "known_resets", None) if capped else None
+                )
+                reset_passed = known_resets is not None and any(
+                    resumed_wall < at <= time.time() - 60 for at in known_resets()
+                )
+                if capped and (since_resume >= cap_wait or reset_passed):
+                    last_resume = time.monotonic()
+                    cap_rounds += 1
+                    if not isinstance(proc, AuthorSession):
+                        # No router to ask: this process has only its own engine.
+                        if not cap_announced:
+                            cap_announced = True
+                            timeline.row(
+                                "🚨", "still on the usage limit after two tries; a human needs to look"
+                            )
+                    elif await proc.on_limit(None, ""):
+                        # The other engine was open: the switch restarts the pod, so this returns only when
+                        # the handoff chose to stay after all.
+                        limited_since = None
+                        seen_limit = None
+                        timeline.phase("done" if declared_done else "building")
+                    else:
+                        deferred = (proc.retry_at or 0) > time.time()
+                        # Only a deferral records a current pause; after a decision to stay it is stale.
+                        paused = (timeline._phase.get("paused") or {}) if deferred else {}
+                        if paused.get("needs_human"):
+                            if not cap_announced:
+                                cap_announced = True
+                                timeline.row(
+                                    "🚨",
+                                    "still on the usage limit after two tries; a human needs to look: "
+                                    + paused["needs_human"],
+                                )
+                        else:
+                            # An engine can run now, or has a reset to wait for: two more tries once it does.
+                            # With no known reset anywhere, the engine may refuse for good: after three such
+                            # rounds a human is told once, and the backed-off retries go on.
+                            unknown_rounds = 0 if getattr(proc, "reset_known", True) else unknown_rounds + 1
+                            if unknown_rounds >= 3 and not no_reset_asked:
+                                no_reset_asked = True
+                                _author._ask_human(
+                                    timeline,
+                                    _author._no_reset_text(
+                                        _usage._author_engine, getattr(proc, "limit_pin", None)
+                                    ),
+                                )
+                            cap_announced = False
+                            retries = 0
+                            capped = False
+                            routed_at_cap = True
+                            if deferred:
+                                reset_at = proc.retry_at
+                                timeline.phase("limited", limited_until=reset_at, paused=paused)
+                # A direction to resume on another engine re-routes now, not at the next reset.
+                reroute = isinstance(proc, AuthorSession) and getattr(proc, "reroute_requested", False)
+                due = (
+                    reroute
+                    or routed_at_cap
+                    or time.monotonic() - last_resume >= _session_config.LIMIT_RETRY_S
+                    or (reset_at is not None and time.time() >= reset_at + 60 and retries == 0)
                 )
                 resume_now = (
                     due
                     and not notes
                     and terminal_quiet
                     and not capped
-                    and (reset_at is None or time.time() >= reset_at + 60)
+                    and (reroute or reset_at is None or time.time() >= reset_at + 60)
                 )
                 if resume_now:
-                    if isinstance(proc, AuthorSession):
+                    if isinstance(proc, AuthorSession) and not routed_at_cap:
                         # `reset_at` may be the other engine's reset, so this engine can still be limited.
                         # Re-route first: hand over if the other engine is open now, and resume this one
                         # only when its own reset has arrived.
                         last_resume = time.monotonic()  # also keeps a deferral from re-routing every tick
-                        if await proc.on_limit(reset_at, ""):
+                        proc.reroute_requested = False
+                        if await proc.on_limit(None, ""):
                             limited_since = None
                             seen_limit = None
                             ended_at = None
@@ -419,7 +517,10 @@ async def _pump(
                             resume_now = False
                         elif (proc.retry_at or 0) > time.time():
                             reset_at = proc.retry_at
-                            timeline.phase("limited", limited_until=reset_at)
+                            # Keep the pause the handoff recorded: a phase without it clears it.
+                            timeline.phase(
+                                "limited", limited_until=reset_at, paused=timeline._phase.get("paused")
+                            )
                             resume_now = False
                 if resume_now:
                     retries += 1
@@ -543,6 +644,9 @@ async def _pump(
                                 f"Write `{checks_rel}` with the bash commands "
                                 "that prove the build and tests pass, run from the workspace root."
                             )
+                        # Fetching vendored upstream blocks: it is done here, off the loop, so the standards
+                        # selection below (on the loop) only reads the cache.
+                        await asyncio.to_thread(_session_config.warm_vendored_cache)
                         gate_problem = await asyncio.to_thread(
                             _gates.run,
                             workspace,
@@ -609,7 +713,7 @@ async def _pump(
                         and qa_round < _session_config._max_rounds()
                         and not _supervise_support._escalated
                     ):
-                        review_retry_at = None  # this review supersedes one waiting on the limit
+                        review_wait = _review_wait.ReviewWait()  # this review supersedes a waiting one
                         qa_round += 1
                         passed_round = None
                         timeline.phase("review", round_=qa_round)
@@ -644,19 +748,24 @@ async def _pump(
                         declared_done = True
                         timeline.activity(f"{note.strip()} -- send direction, or `/stop` to finish")
 
-            if review_retry_at is not None and (declared_done or _supervise_support._escalated):
-                review_retry_at = None  # a later review already decided it
-            if (
-                review_retry_at is not None
-                and qa_task is None
-                and workspace
-                and time.time() >= review_retry_at
-            ):
-                review_retry_at = None
+            # Not `declared_done`: that stays true after any earlier pass, and cleared the retry of every
+            # review deferred after one. A new review launch clears it (above); escalation supersedes it.
+            if review_wait.at is not None and _supervise_support._escalated:
+                review_wait.at = None
+                review_wait.save(qa_round, timeline)
+            if review_wait.at is not None and qa_task is None and workspace and time.time() >= review_wait.at:
+                review_wait.at = None
                 qa_round += 1
                 timeline.phase("review", round_=qa_round)
                 _inbox._save_pass(
-                    qa_round, "", timeline.pr_url, True, timeline=timeline, passed=False, in_review=True
+                    qa_round,
+                    "",
+                    timeline.pr_url,
+                    True,
+                    timeline=timeline,
+                    passed=False,
+                    in_review=True,
+                    incomplete_reruns=review_wait.incomplete_reruns,
                 )
                 await _supervise_support._move_board(
                     "In review",
@@ -670,7 +779,7 @@ async def _pump(
                     if pinned_acceptance
                     else ""
                 )
-                timeline.row("🔁", "re-running the review after the usage limit")
+                timeline.row("🔁", f"re-running the review after {review_wait.why}")
                 qa_task = asyncio.create_task(
                     _review._review_round(workspace, brief, acceptance, qa_round, timeline),
                     name=f"qa-{qa_round}",
@@ -681,34 +790,28 @@ async def _pump(
                     # What `_evaluate` snapshotted; the HEAD read at launch if it never got that far.
                     review_sha = timeline.reviewed_sha or review_sha
                 except _reviewer.ReviewLimited as e:
-                    # Not a round and not a human's problem: the reviewers are on the account's
-                    # usage limit, so the review simply runs again after the reset. The session is
-                    # not told -- it is usually on the same limit (a past run asked a human).
+                    # Not a round and not a human's problem: the review runs again after the reset.
                     qa_task = None
                     qa_round -= 1
                     last_seen = time.monotonic()
-                    # At least 10 minutes: a reset already past (late reset, a weekly date the parser
-                    # ignores) must not re-run three refused reviewers on every poll (qa: 84/s).
-                    review_retry_at = max(
-                        (_usage._reset_at(e.reset_text) or time.time() + _session_config.LIMIT_RETRY_S) + 120,
-                        time.time() + _supervise_support._REVIEW_RETRY_MIN_S,
-                    )
-                    timeline.row("⏸️", f"review waiting: {e}; it re-runs automatically after the reset")
-                    timeline.phase("limited", limited_until=review_retry_at)
-                    _inbox._unpass(qa_round, timeline)
+                    review_wait.wait_for_limit(e, qa_round, timeline)
                     continue
                 except _reviewer.ReviewUnavailable as e:
-                    # Blocks and escalates, and is not a round: the author did
-                    # nothing wrong, so it must not spend one of their three.
                     qa_task = None
                     qa_round -= 1
                     last_seen = time.monotonic()
-                    timeline.row("🚨", f"nobody reviewed the work: {e}")
+                    if review_wait.schedule_incomplete_rerun(e, qa_round, timeline):
+                        continue
+                    # Blocks and escalates, and is not a round: the author did
+                    # nothing wrong, so it must not spend one of their three.
+                    why = review_wait.explain_unreviewed(e)
+                    timeline.row("🚨", why if why != str(e) else f"nobody reviewed the work: {e}")
                     timeline.phase("waiting")
-                    _inbox._unpass(qa_round, timeline)
+                    review_wait.at = None
+                    review_wait.save(qa_round, timeline)
                     timeline.activity("review unavailable -- nobody has reviewed this work; needs a human")
                     await proc.submit(
-                        f"Your DONE has NOT been reviewed: {e}. This is an infrastructure failure, not a "
+                        f"Your DONE has NOT been reviewed: {why}. This is an infrastructure failure, not a "
                         "finding, and it did not use a review round. "
                         + _supervise_support._tell_human_first("nobody has reviewed the work")
                         + ' `ask-human "Review could not run (<reason>). Please retry it or review the '
@@ -803,7 +906,7 @@ async def _pump(
                         timeline,
                         review_sha,
                         qa_round,
-                        f"review rejected round {qa_round}",
+                        _supervise_support.describe_rejection(qa_round, timeline),
                     )
                     timeline.row(
                         "🔁",
@@ -882,7 +985,7 @@ async def _pump(
                         timeline,
                         review_sha,
                         qa_round,
-                        f"review rejected round {qa_round}",
+                        _supervise_support.describe_rejection(qa_round, timeline),
                     )
                     timeline.phase("building")
                     timeline.activity(f"QA round {qa_round} failed -- back to the session")
@@ -1142,11 +1245,12 @@ async def _pump(
             # What the nudge, park and kickoff gates and the status line go by.
             waiting_on = 0 if children_unknown else in_flight
 
-            if not declared_done and limited_since is None:
-                if review_retry_at is not None and qa_task is None:
-                    timeline.activity(
-                        "review waiting on the usage limit -- re-runs automatically after the reset"
-                    )
+            review_waiting = review_wait.at is not None and qa_task is None and limited_since is None
+            if review_waiting:
+                review_wait.show(timeline)
+            if review_waiting or (not declared_done and limited_since is None):
+                if review_wait.at is not None and qa_task is None:
+                    timeline.activity(review_wait.describe_activity())
                 elif qa_task is not None:
                     # A review in flight is not idleness. The idle line used to
                     # replace "QA round 1 reviewing" within a pass, so a project
@@ -1219,7 +1323,7 @@ async def _pump(
                 and not declared_done
                 and qa_task is None
                 and not waiting_on
-                and review_retry_at is None
+                and review_wait.at is None
                 and menu_closed
                 and nudges < _session_config.MAX_NUDGES
             ):
@@ -1236,7 +1340,7 @@ async def _pump(
                 and not declared_done
                 and qa_task is None
                 and not waiting_on
-                and review_retry_at is None
+                and review_wait.at is None
                 and nudges >= _session_config.MAX_NUDGES  # not merely held back by an open menu
                 and not exhausted_announced
             ):

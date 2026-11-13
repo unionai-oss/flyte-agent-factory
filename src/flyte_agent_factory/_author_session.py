@@ -24,6 +24,16 @@ class AuthorSession:
     # (an attribute defined here would hide the engine process's own `retry_at` from `__getattr__`).
     retry_at: float | None
     _checkpointed_limit: tuple[str | None, float | None]
+    #: Whether the session had declared DONE; the pump keeps it current for the handoff's briefing.
+    declared_done: bool
+    #: Set by the handoff: whether a permitted engine has a known reset ahead (not the LIMIT_RETRY_S guess).
+    reset_known: bool
+    #: Set by the handoff: the pin its last route ran under (the allowance pin once switches are used up).
+    limit_pin: Any
+    #: Set by the handoff: the resets the meters know for the engines that pin permits, read live.
+    known_resets: Any
+    #: Set by a `resume on <engine>` direction while paused: the supervisor re-routes at once.
+    reroute_requested: bool
 
     def __init__(self, current: AuthorProcess, pending_file: Path) -> None:
         self.current = current

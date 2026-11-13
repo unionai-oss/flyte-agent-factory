@@ -1,7 +1,7 @@
 # Branch protection: require the factory's verdict before merging
 
-This page covers two repositories. The factory's verdict on a project's repository (below) and the engine's own
-CI on the factory repository ([The factory repository itself](#the-factory-repository-itself)), which applies now.
+This page covers two repositories. The factory's verdict on a project's repository (below) and the CI of the
+repository the factory deploys from ([The factory repository itself](#the-factory-repository-itself)), which applies now.
 
 **Status of the project-repo rule: deferred to v1.** Until then nothing enforces it: a project's pull request carries a `factory/verifier`
 commit status, but GitHub lets anyone merge without it.
@@ -13,8 +13,9 @@ With the rule in place, and the check restricted to the factory's App (step 5 be
 once the factory has passed its head commit. What it passed is that head, not the merge result: commits that land on
 the default branch afterwards are not re-reviewed (see step 6).
 
-The `[repo] factory` repository does not require `factory/verifier`: people also merge and push to its default
-branch directly, and a required verdict would reject those pushes. It does require its own CI, below.
+The repository the factory deploys from (`[deploy] repo`, by default `[repo] factory`) is protected like any
+target repository: its changes arrive as pull requests, promoted from a workspace project
+([Promotion](architecture-repos.md#promotion)), and its own CI is required before merge, below.
 
 ## Before you enable it
 
@@ -86,7 +87,7 @@ green.
 
 ## The factory repository itself
 
-The engine's repository requires its own CI on `main`, the standards gate included
+The deployed repository (`[deploy] repo`) requires pull requests and its own CI on `main` (the deployer also refuses a head whose CI has not passed), the standards gate included
 ([`docs/ci.md`](ci.md#what-main-requires) says what each check is). These are GitHub Actions check-runs, named
 exactly:
 
@@ -121,8 +122,8 @@ gh api -X PUT repos/<owner>/<repo>/branches/main/protection \
 JSON
 ```
 
-`enforce_admins: false` keeps an admin's direct push to `main` possible, which people do today; set it `true` to hold
-admins to the checks too.
+`enforce_admins: false` keeps an admin's direct push to `main` possible; set it `true` to hold
+admins to the checks too, so that every change goes through a pull request.
 
 In the UI instead, as classic protection (the same rule as the command): Settings → Branches → Add classic branch
 protection rule, pattern `main`, **Require status checks to pass before merging**, add the five checks above with

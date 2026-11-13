@@ -27,7 +27,6 @@ config = "~/.flyte/example-config.yaml"
 # The workspace: the repository projects are pushed to (the only one [secrets] deploy_key reaches).
 project = "git@github.com:you/my-sandbox.git"
 # factory = "git@github.com:you/factory.git"   # optional; chat may use it only if the mcp table lists it
-# factory_projects = 1   # how many projects on `factory` may run at once (needs `factory`; default 1)
 
 # One slot per project environment. Env names and sub-agent env names must each be unique. Every slot
 # runs on the one token in [secrets] claude_token.
@@ -76,12 +75,14 @@ api_key = "my_anthropic_key"
 # Known only after the first deploy. FACTORY_MCP_PUBLIC_URL in the shell overrides it.
 public_url = "https://factory-mcp.example.com"
 # Which [repo] keys chat may launch projects into (default: only "project").
-# repos = ["project", "factory"]
+# repos = ["project", "docs"]   # [repo] keys; "docs" is a further [repo] entry of yours
 
 # Optional: merged factory changes deploy themselves (the `factory-deployer` task, every 5 minutes).
-# `auto = true` needs [repo] factory and [github] below.
+# `auto = true` needs [github] below and a repository to deploy from: `repo`, default [repo] factory.
 [deploy]
 auto = false
+# repo = "https://github.com/you/factory"   # default: [repo] factory
+# webhook = false   # true only when pushes to `repo` reach the webhook (the App is installed there)
 
 # Optional: read this profile from a separate direction repository instead of the engine tree's
 # profiles/<name>.toml. Needs auto = true. If it cannot be read the deploy fails; it never falls back.
@@ -146,14 +147,15 @@ brand = "" # empty keeps inferred BRAND.md behaviour
 # Optional: manually run factory-loop.loop_run(pr_number). Disabled until the owner enables it.
 # [loop]
 # enabled = false
-# repo = "you/factory"                 # owner/repo; must match [repo] factory
+# repo = "you/factory"                 # owner/repo: [repo] factory, [deploy] repo or [direction] repo
+# path = "projects/engine"             # optional: the subtree holding the engine's src/ (default: the repo root)
 # merge = "dry-run"                    # "on" permits merging and closing
 # daily_usd = 0                       # API-equivalent USD; 0/unset blocks autonomous iterations
 # weekly_usd = 0                      # follows each engine's weekly meter reset
 # owner_floor_pct = 30                # minimum headroom while owner projects are live
 
 # Optional: the weekly low-priority gardening project (targets are listed in gardening.toml in the workspace's
-# default branch, which only the owner edits; without it the [repo] factory engine is the only target). These defaults give it a guaranteed share of slots.
+# default branch, which only the owner edits; without it there are no targets). These defaults give it a guaranteed share of slots.
 # [gardening]
 # min_runs_per_week = 1               # fewer completed runs than this in 7 days: it takes the next free slot
 # max_days_between = 7                # no completed run for longer: it queues at normal priority

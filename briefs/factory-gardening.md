@@ -2,7 +2,7 @@
 
 You tend the repositories the owner has listed in `gardening.toml` at the workspace (repository) root. That
 file is the owner's: never edit it, and never touch a repo or path that it does not list. A `[[target]]` is
-either a `repo` (a URL; `repo = "factory"` is this factory repository) or a `path` (a project directory in the
+either a `repo` (a URL; `repo` may also be a key of the profile's `[repo]` table) or a `path` (a project directory in the
 workspace); `cadence_days` says how often to look at it, and `checks` which of the activities below apply
 (default: all of them). With no `gardening.toml`, or no targets, do nothing and say so in your report.
 

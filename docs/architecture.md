@@ -5,19 +5,25 @@ How the Flyte Agent Factory works, for someone deciding whether to use it, runni
 
 ```mermaid
 flowchart LR
-    chat[Chat operator, or CLI] --> mcp[factory MCP]
-    mcp --> queue[factory queue]
+    you[You] --> chat[Chat operator]
+    chat --> mcp[Factory MCP]
+    chat --> gh[GitHub connector]
+    mcp --> queue[Factory queue]
     queue --> session
+    workspace[("Your private workspace: projects live here")] <--> session
     subgraph session[Project session: one Flyte run]
         coord[Coordinator] --> roles[Session roles]
         coord --> workers[Delegate workers]
     end
     session --> gate[Pre-review gate]
     gate --> review[Independent review]
-    review -->|fail: plan, fix, DONE again| session
-    review -->|pass| pr[PR on factory/name, with github]
-    pr --> promote[ops/promote.py]
-    promote --> target[Target repository]
+    review -->|fail| session
+    review -->|pass| pr[Draft PR in the workspace, then ready]
+    gh -->|on your word| pr
+    pr --> promote["Promotion PR from chat: ops/promote.py deliver, operator and owner"]
+    promote --> target["Target repository: any, including the public engine"]
+    target -.->|"when it is [deploy] repo"| deployer
+    deployer["Deployer: reads the default branch of [deploy] repo once CI is green"] --> factory[Deployed factory]
 ```
 
 ## How a person interacts with the factory
@@ -51,15 +57,15 @@ Three repositories are involved ([architecture-repos.md](architecture-repos.md) 
 
 | Repository | Role in the flow | Who writes it |
 |---|---|---|
-| the engine | the factory's code; deployments run a pinned release | maintainers, by pull request |
+| the engine | the factory's code; deployments run its default-branch head once its CI passes | pull requests: maintainers', and yours, promoted from a workspace project ([Promotion](architecture-repos.md#promotion)) |
 | your workspace | `standards/`, `profile.toml`, `waivers.toml`, `gardening.toml`, and `projects/<name>/` | you; the factory writes a project's own directory under `projects/` |
-| a target repository | where finished work is delivered | you, by running `ops/promote.py` |
+| a target repository | where finished work is delivered | you merge the pull request; the operator opens it by promoting the project ([Promotion](architecture-repos.md#promotion)) |
 
 1. **Launch.** A launch names a project, a brief and a repository. The factory validates it and writes it to the
    queue; it starts when a slot is free.
 2. **Work on a branch.** With `[github]` in the profile, the session works on branch `factory/<name>` and pushes
-   it with the deploy key of the repository it was launched on (the workspace, or the engine repository for a
-   factory-improvement launch, which needs a `[repo_keys]` entry). Without `[github]` it stays on the default branch
+   it with the deploy key of the repository it was launched on (the workspace, or another repository the profile
+   holds a `[repo_keys]` deploy key for). Without `[github]` it stays on the default branch
    and pushes that. Where the project's files are depends on the repository's layout: `projects/<name>/` in a
    workspace (a repository whose root has `projects/`), `<name>/` in a shared sandbox repository, the whole
    repository for any other ([architecture-repos.md](architecture-repos.md#where-a-project-works)). A `pre-push`
@@ -69,16 +75,13 @@ Three repositories are involved ([architecture-repos.md](architecture-repos.md) 
    spends no review round.
 4. **Ready on pass.** When review passes, the PR is marked ready with a verdict comment and a `factory/verifier`
    commit status on the reviewed commit. A review that fails or escalates sets that status to failure. The factory
-   does not merge, except that with `[loop] merge = "on"` the loop merges a passing pull request on the engine
-   repository. Making `factory/verifier` a required check is the owner's branch protection
+   does not merge. The one exception is opt-in: with `[loop] merge = "on"` the loop merges its own passing pull
+   requests on its `[loop] repo` repository, which needs the GitHub App installed there, so it does not apply to a
+   public engine repository the owner cannot install an App on; there the promotion pull request is merged by the
+   owner. Making `factory/verifier` a required check is the owner's branch protection
    ([branch-protection.md](branch-protection.md)).
-5. **Promote.** A project whose brief has a `Delivers to:` line leaves `projects/<name>/patches/*.patch`, made by
-   the session with `git format-patch` and checked by the gate's `factory:target-patches`.
-   `ops/promote.py <workspace> <project> <target-url> <branch>` applies them to a new branch of the target with
-   `git am --3way`, runs the target's own CI commands and the changed-line coverage check (changed Python lines;
-   those listed in the project's `SUMMARY.md` are excused, and the file is the PR body), and pushes a branch and a
-   PR with your credentials. You run it from a machine with a shell; the factory MCP has no promote task, and the
-   factory holds no credential for the target. `--dry-run` does everything but push.
+5. **Promote.** A project whose brief has a `Delivers to:` line works on an imported copy of the target and is
+   delivered to it as a pull request by the operator, with your credentials: [Promotion](architecture-repos.md#promotion).
 
 Who may change what is fixed by the gate, not by convention. `standards/` is read-only to the factory: the gate
 rejects any project change to it, and the session is told so. `waivers.toml` and `gardening.toml` are owner-only
@@ -194,8 +197,8 @@ call. In order:
    code selection, a forbidden pattern or the workspace's own script. `factory:suppressions` runs whenever a MUST
    rule selects ruff codes. Built-in checks name the rules that map them in their output (`[QA-7]`), and a waiver
    may name the check or any of those rules. With no standards configured the gate records `factory:standards`
-   (not applicable). For a project that delivers to another repository there are also `factory:target-ci`,
-   `factory:target-coverage` and `factory:target-patches`.
+   (not applicable). For a project that delivers to another repository there are also `factory:target-ci`
+   and `factory:target-coverage`.
 
    A MUST rule enforced by evidence (`Enforced: tool` with no command, such as the real-browser check for a UI)
    reports "no project command configured" until the project declares the command that satisfies it, in
@@ -220,10 +223,10 @@ call. In order:
    `cargo` (also `~/.cargo/bin`), else rustup is installed with the named toolchain and components into
    `~/.cache/flyte-agent-factory/rust`. If that cannot be done (no network), the command is reported `NOT RUN`
    with the reason: the status is `not run`, which does not block and is not a pass. When a command fails, the same
-   job is run in the same environment on the unpatched base (the checkout's merge-base with its default branch);
+   job is run in the same environment on the unmodified base (the checkout's merge-base with its default branch);
    a failure the base has too (same exit code, no failing test or finding the base lacks, or the same normalised
    output) is reported `pre-existing` and is not the project's. Changed-line coverage is still required.
-   `factory:module-size` ignores the files of the nested target checkout that the project has not changed, and
+   `factory:module-size` ignores the files of the target's tree that the project has not changed, and
    judges a changed one against upstream's version of it.
 
    The toolchains a workflow sets up are set up the same way: the uv version `astral-sh/setup-uv` names (also
@@ -233,17 +236,17 @@ call. In order:
    A failure whose output shows the environment failed before the check began (an unreadable lock file, a command
    or toolchain not found) is `NOT RUN`, never `pre-existing`. A failing command counts as pre-existing only if the
    base's own CI runs it too. For the coverage run, a finding is the project's only if both of two runs on the
-   patched tree have it and neither of two runs on the base does: upstream tests that depend on the machine
-   (timing, docker, kubectl) come and go between runs of identical code. Promotion (`ops/promote.py`) judges
+   project's tree have it and neither of two runs on the base does: upstream tests that depend on the machine
+   (timing, docker, kubectl) come and go between runs of identical code. Promotion (`ops/promote.py deliver`) judges
    strictly: what it pushes must pass outright.
 
-   Checked on unpatched `flyteorg/flyte-sdk` at `8a013c2` (2026-11-06, the case that started this): no failure
+   Checked on unmodified `flyteorg/flyte-sdk` at `8a013c2` (2026-11-06, the case that started this): no failure
    from the pod's environment (`_U_*`, `FLYTE_*`, `USER_LOG_LEVEL`, `GITHUB_OUTPUT`) and no toolchain failure.
    `factory:target-ci` PASS: every job ran, both Rust jobs (`rs_controller` check-fmt and lint) included; the two
    `make unit_test` runs fail as they do on the base (pre-existing), and `unit_test_plugins` is skipped because its
    matrix cannot be decided offline. `factory:target-coverage` PASS: upstream's suite fails about ten
    machine-dependent tests here (kubeconfig in `tests/cli/test_devbox.py`, docker image building, a checkpoint
-   mtime), a slightly different set in each run of identical code, and every failure both patched-tree runs share
+   mtime), a slightly different set in each run of identical code, and every failure both project-tree runs share
    a run of the base has too.
 
 Owner waivers (`factory:waivers`) are not a check: they turn an unexpired `FAIL` into `WAIVED`. Only a DONE that
@@ -262,6 +265,46 @@ Any one blocking finding fails the round and the findings go back to the coordin
 DONE again. From round 3 the planner's convergence call decides whether another round is worth it; a loop that
 circles escalates to a person. The limit is eight rounds. After an escalation, `/review-again [why]` grants one more
 round, at most twice. A pass marks the PR ready.
+
+#### Judge outcomes
+
+All three judges are required. Each ends a round as `PASS`, `FAIL`, `ADVISORY` (craft, when `CRAFT_BLOCKING` is
+not `true` and it returned a report), `NO_VERDICT` (it ran but gave no usable `VERDICT:` line), `DEFERRED` (the usage
+limit or the router put the call off) or `NOT_RUN` (it could not run; a timeout is `NOT_RUN` with reason `timeout`).
+A missing verdict is never a `FAIL` and never a pass:
+
+- **Verdict line.** The last `VERDICT: PASS|FAIL` line wins. Markdown around it (`**VERDICT:** PASS`, backticks, a
+  `>` quote, a heading, a `-` for the colon, trailing punctuation or a short parenthetical) is accepted; a line that
+  only mentions the words is not.
+- **No verdict.** The reason is recorded: `no output` (empty, or the sub-agent had no final message), `turn limit`,
+  `tool or limit error`, or `unparseable`. The judge is asked again, up to two more times, on the other engine when
+  there is one that is not exhausted and nothing is hard-pinned, otherwise on the same routing. Judges that did return
+  a verdict are not asked again. An advisory craft with no output, or whose reply is only a short tool or limit error,
+  counts as no verdict: craft must have run. A reply is that error only when its first line starts like one
+  (`API Error`, `HTTP 429`, `You've hit`, or the usage-limit mark); a report that mentions a rate limit is a report.
+- **The round.** Any `FAIL` fails the round, and the findings also list the judges with no verdict, as does
+  the PR's failure status (`review rejected round N; no verdict from craft`). Otherwise,
+  if every judge is `PASS` or `ADVISORY` the round passes. Otherwise it is **undecided**: `ReviewLimited` when a judge
+  is `DEFERRED` (with the router's `retry_at`, or the reset time from the limit text), else `ReviewIncomplete`
+  (`ReviewUnavailable` when no judge could run at all). An undecided round is not counted as a round, records no
+  verdict or score, and the supervisor runs it again.
+- **Carried verdicts.** The verdicts of the judges that did decide are kept for the re-run. On the same commit only
+  the missing judges run and the others show as `PASS (carried from round N, same commit)`; if the commit changed,
+  all three run again. A carried advisory craft runs again once `CRAFT_BLOCKING` is on. They are saved with the
+  timeline's metrics state, so a pod restart during the wait still re-runs only the missing judges; if they could
+  not be saved, a timeline row says a restart would re-run every judge. They are dropped when a round is decided.
+
+`factory.status` shows the latest round's `review.judges` (outcome, reason, engine, attempts, carried) and the
+cumulative `review.no_verdict` counts by judge and by engine.
+
+A round that could not finish is not a round. When a judge is deferred by a usage limit, the review waits for
+the router's retry time (its `retry_at`, or the `retry at HH:MM UTC` in its text, else the reset the account
+printed) plus two minutes, at least ten, and re-runs by itself; the status shows `limited` until that time,
+then `review` again. When a judge gave no verdict or could not run (and none was deferred and none failed),
+the missing judges are asked again after three minutes (the status stays `review` and the activity line names
+the time), at most twice per DONE; after that the session is told the work was not reviewed and a human
+decides. The wait and the count of automatic re-runs are saved with the review state, so a pod restart resumes
+the wait and does not reset the count. The session is told of neither re-run.
 
 ## What is pluggable
 
@@ -282,6 +325,7 @@ ones the code reads.
 | Policy key | Default | Meaning |
 |---|---|---|
 | `COORDINATOR_ENGINE`, `AUTHOR_ENGINE` | none | `claude` or `codex`. `AUTHOR_ENGINE` is the alias; setting both to different engines is an error. Pinning `codex` needs `[secrets] codex_token` |
+| `ENGINE_FALLBACK` | unset (wait) | `allow` lets a pinned coordinator or delegate move to the other engine while its own is at a usage limit; unset or `wait` makes the pin hard, so the run waits for the pinned engine's reset. Any other value in a profile is an error |
 | `DELEGATE_ENGINE`, `PLANNER_ENGINE`, `CONTRACT_ENGINE`, `ARBITER_ENGINE` | none | `claude` or `codex` for that role. A Codex pin runs on Claude when the profile has no `codex_token` |
 | `CORRECTNESS_ENGINE`, `COMPLETENESS_ENGINE`, `CRAFT_ENGINE` | none | the same, per judge |
 | `QA_DIFFERENT_ENGINE` | `true` | the judges prefer an engine other than the coordinator's when the profile has both a `claude_token` and a `codex_token`; `false` keeps explicit or default routing |
@@ -328,11 +372,12 @@ factory's and are not listed.
 
 ### Standards
 
-The gate and the session read the workspace's `standards/` first; the engine's `standards/` is only the fallback
-for a workspace without one. The profile's `[standards]` table picks the folder, the files (`include`, default
-`engineering` and `security`), the languages (`auto` or a list) and the brand file; a custom folder travels inside
-the profile to the pods ([profiles/README.md](../profiles/README.md#shared-standards)). The owner accepts a failing
-check for a while in `waivers.toml`; nothing the factory does can add one.
+The gate and the session read the workspace's `standards/` first, then the profile's `[standards] dir`; the engine
+has no standards of its own and no fallback copy, so with neither there are no rules. The profile's `[standards]`
+table picks the folder, the files (`include`, default `engineering` and `security`), the languages (`auto` or a
+list) and the brand file; a custom folder travels inside the profile to the pods
+([profiles/README.md](../profiles/README.md#shared-standards)). The owner accepts a failing check for a while in
+`waivers.toml`; nothing the factory does can add one.
 
 ### Profile tables
 
@@ -350,11 +395,9 @@ to run (`standards`, `vulture`, `duplicates`, `orphans`, `deps`, `branches`, `co
 the default branch of the workspace repository (`[repo] project`), and only the owner edits it. To add a repository,
 add a `[[target]]` and merge it there; the next weekly run includes it. The scan that decides the run's priority runs
 the standards gate on every repository target; `cadence_days` and `checks` guide the gardening session through its
-brief and do not change the scan. A workspace without the file has one target, the engine (`[repo] factory`), so the engine is gardened by default;
-the workspace template ships that same target as an explicit `repo = "factory"`, and the engine's own repository
-ships no file. A file with no `[[target]]` opts out. With no targets, or when the profile has no `[repo] factory`
-entry, the weekly task skips with the reason (it launches nothing and records no run), and a waiting gardening
-launch stays `low`.
+brief and do not change the scan. Gardening is opt-in: a workspace without the file, or with a file without `[[target]]`, has no targets. It runs as
+a project in the workspace repository, so it needs no `[repo] factory` entry. With no targets the weekly task skips
+with the reason (it launches nothing and records no run), and a waiting gardening launch stays `low`.
 
 ### Usage reserve and priority
 
@@ -457,7 +500,7 @@ the session role definitions, the browser image files and the workspace template
 | `_gate_tests.py` | the fail-to-pass run behind `factory:fail-to-pass`, test-weakening checks and junit reuse; when the pre-review cannot reuse `checks.sh`'s junit (a test-harness file changed) its own pytest run sends both lanes to child actions with the deployed engine's launcher, not the workspace's, and runs here only a lane that could not be placed |
 | `_module_size.py` | the module-size ratchet behind `factory:module-size` |
 | `_standards.py` | the rules of the workspace's standards and their `Enforced:` kinds; captured before deployment and selected again at review. The engine has no standards of its own |
-| `_target_run.py` | running one command of the target's CI: the runner-like environment, Rust toolchains, the run on the unpatched base, the nested checkout's changed files |
+| `_target_run.py` | running one command of the target's CI: the runner-like environment, Rust toolchains, the run on the unmodified base, the changed files of a legacy nested checkout |
 | `_evidence.py` | `factory-evidence.toml`: the commands a project declares for evidence rules |
 | `_target_ci.py` | what a project that delivers to another repository must pass: that repository's own CI and coverage |
 | `_waivers.py` | the owner's `waivers.toml` |
@@ -518,7 +561,8 @@ the session role definitions, the browser image files and the workspace template
 | `_push_guard.py` | the `pre-push` hook that pins a session's pushes to its launch repository |
 | `_github.py` | GitHub App access: installation tokens, default branch, commit health |
 | `_pull_requests.py` | a project's pull request, opened and kept current as the App |
-| `_promote.py` | promotion: patches onto the target, its CI and coverage, the PR |
+| `_promote.py` | `deliver`: the project's tree committed onto the target's head, scan, the target's CI and coverage, DCO sign-off, the PR |
+| `_delivery.py` | the `promote.toml` manifest, `import` (the baseline commit), and the scratch target checkout the gates run on |
 
 **Profile, names and deployment**
 

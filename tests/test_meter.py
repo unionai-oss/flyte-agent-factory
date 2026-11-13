@@ -767,3 +767,28 @@ def test_a_non_finite_percentage_is_no_reading():
     # QA board #15: `1e400` parses as inf and was published as a meter.
     snapshot = {"primary": {"used_percent": float("inf"), "window_minutes": 300}}
     assert _meter.parse_codex(snapshot, "codex", NOW, "exec-event") is None
+
+
+def test_note_limit_never_shortens_a_future_limit(tmp_path):
+    """#125 R2: a repeat refusal carrying a 30-minute guess overwrote a weekly reset."""
+    now = time.time()
+    store = _meter.MeterStore(tmp_path)
+    store.note_limit("codex", now + 5 * 86400)
+    store.note_limit("codex", now + 1800)
+    assert store.latest["codex"].limited_until == now + 5 * 86400
+    # A reading that does not know about the limit keeps it, and so does a restart.
+    store.update(_meter.Meter("codex", "app-server", now, 10.0, now + 3600))
+    assert store.latest["codex"].limited_until == now + 5 * 86400
+    assert _meter.MeterStore(tmp_path).latest["codex"].limited_until == now + 5 * 86400
+
+
+def test_note_limit_takes_a_later_reset_and_replaces_an_expired_one(tmp_path):
+    now = time.time()
+    store = _meter.MeterStore(tmp_path)
+    store.note_limit("codex", now + 1800)
+    store.note_limit("codex", now + 86400)
+    assert store.latest["codex"].limited_until == now + 86400
+    expired = _meter.MeterStore(tmp_path / "other", clock=lambda: now)
+    expired.note_limit("claude", now - 10)
+    expired.note_limit("claude", now + 600)
+    assert expired.latest["claude"].limited_until == now + 600

@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +68,9 @@ async def test_production_delegation_routes_on_the_stored_meter_and_a_mid_run_re
     monkeypatch.setattr(Dir, "from_local", upload)
     monkeypatch.setenv(_session_config.CODEX_TOKEN_ENV_VAR, "{}")
     monkeypatch.setenv("AGENT_FACTORY_DELEGATE_ENGINE", "codex")
+    # An explicit DELEGATE_ENGINE is a hard pin (decision-001): falling back to Claude when Codex is
+    # exhausted mid-run needs the opt-in. The hard-pin outcome, waiting for Codex, is tested below.
+    monkeypatch.setenv("AGENT_FACTORY_ENGINE_FALLBACK", "allow")
     timeline = _timeline._Timeline()
     supervisor = Delegations(
         bridge_root,
@@ -84,6 +88,74 @@ async def test_production_delegation_routes_on_the_stored_meter_and_a_mid_run_re
         ["codex", "claude"] if exhausted_during_upload else ["codex"]
     )
     assert all(record["reason"] for record in _session_config._routes)
+
+
+async def test_a_hard_pinned_delegation_waits_for_its_engine_exhausted_mid_run(
+    repo, bridge_root, tmp_path, monkeypatch
+):
+    import time
+    from pathlib import Path
+
+    from flyte_agent_factory import _meter
+
+    store = _meter.MeterStore(tmp_path / "meters")
+    now = time.time()
+    calls = []
+    waits: list[tuple[float, Any]] = []
+    store.latest["codex"] = _meter.Meter("codex", "app-server", now, 0, now + 3600)
+
+    async def upload(path):
+        if not waits:
+            store.note_limit("codex", now + 3600)
+        return path
+
+    class Output:
+        async def download(self, path):
+            Path(path).mkdir()
+            (Path(path) / "factory.patch").write_text("")
+
+    async def raw(**kwargs):
+        calls.append(kwargs["engine"])
+        return "done", Output()
+
+    monkeypatch.setattr(_usage, "_meters", store)
+    monkeypatch.setattr(_session_config, "_routes", [])
+    monkeypatch.setattr(_session_config, "CODEX_TOKEN_SECRET", "codex_token")
+    monkeypatch.setattr(_session_config, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "{}")
+    monkeypatch.setattr(_reviewer, "_call_reviewer_raw", raw)
+    monkeypatch.setattr(_usage, "_record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(Dir, "from_local", upload)
+    monkeypatch.setenv(_session_config.CODEX_TOKEN_ENV_VAR, "{}")
+    monkeypatch.setenv("AGENT_FACTORY_DELEGATE_ENGINE", "codex")
+    monkeypatch.delenv("AGENT_FACTORY_ENGINE_FALLBACK", raising=False)
+    timeline = _timeline._Timeline()
+    supervisor = Delegations(
+        bridge_root,
+        repo,
+        _session_setup._delegate_worker(timeline),
+        _usage._delegation_engine(timeline),
+        timeline.row,
+    )
+
+    async def sleep(seconds):
+        # What the job records while it waits, then Codex's limit passes.
+        waits.append((seconds, json.loads((bridge_root / "answers/delegate-fresh.json").read_text())))
+        store.readings.pop("codex", None)
+        store.latest["codex"] = _meter.Meter("codex", "app-server", time.time(), 0, now + 7200)
+
+    supervisor.sleep = sleep
+    await supervisor.service({"id": "delegate-fresh", "brief": "implement"})
+    answer = json.loads((bridge_root / "answers/delegate-fresh.json").read_text())
+    assert len(waits) == 1
+    assert waits[0][1]["state"] == "waiting"
+    assert waits[0][1]["engine"] == "codex"
+    assert waits[0][1]["until"] >= now + 3600 - 1
+    assert answer["state"] == "done", answer
+    # The pin is never broken: Claude is not called, and Codex runs once its limit has passed.
+    assert calls == ["codex"]
+    assert "error" not in answer
+    assert not (supervisor.jobs / "delegate-fresh/error.txt").exists()
 
 
 def git(repo, *args):
@@ -915,3 +987,48 @@ async def test_workspace_upload_writes_only_the_current_archive_name(tmp_path, m
         assert content is not None
         with content:
             assert content.read() == b"#!/bin/sh\n"
+
+
+def _waiting(bridge_root, job_id: str, until: float) -> None:
+    (bridge_root / "answers" / f"{job_id}.json").write_text(
+        json.dumps({"state": "waiting", "engine": "claude", "until": until})
+    )
+
+
+def test_status_names_the_engine_and_reset_of_a_waiting_job(bridge_root, tmp_path, monkeypatch, capsys):
+    # `status` also lists the workspace's own delegation directories; this one has none.
+    monkeypatch.setenv("AGENT_FACTORY_WORKSPACE", str(tmp_path))
+    soon = time.time() + 3 * 86400  # never today, whatever the hour
+    _waiting(bridge_root, "delegate-1-aa", soon)
+    (bridge_root / "requests" / "delegate-1-aa.json").write_text("{}")
+    assert _bridge.delegate_cli(["status"]) == 0
+    reset = time.strftime("%Y-%m-%d %H:%M", time.gmtime(soon))
+    assert capsys.readouterr().out == f"delegate-1-aa waiting for claude until {reset} UTC\n"
+
+
+def test_status_line_leaves_off_the_date_for_a_reset_today():
+    now = 1_700_000_000.0  # 2023-11-14 22:13 UTC
+    result: Any = {"state": "waiting", "engine": "claude", "until": now + 600}
+    assert _bridge._format_status_line("j", result, now) == "j waiting for claude until 22:23 UTC"
+    result["until"] = now + 7200
+    assert _bridge._format_status_line("j", result, now) == "j waiting for claude until 2023-11-15 00:13 UTC"
+    assert _bridge._format_status_line("j", {"state": "queued"}, now) == "j queued"
+
+
+def test_wait_that_times_out_on_a_waiting_job_names_the_engine(bridge_root, capsys, monkeypatch):
+    monkeypatch.setattr(_bridge, "_POLL_INTERVAL_S", 0.01)
+    soon = time.time() + 3 * 86400
+    _waiting(bridge_root, "delegate-2-bb", soon)
+    (bridge_root / "requests" / "delegate-2-bb.json").write_text("{}")
+    assert _bridge.delegate_cli(["wait", "delegate-2-bb", "--timeout", "0.05"]) == 3
+    reset = time.strftime("%Y-%m-%d %H:%M", time.gmtime(soon))
+    err = capsys.readouterr().err
+    assert f"delegate-2-bb waiting for claude until {reset} UTC" in err
+    assert "delegation wait timed out" in err
+
+
+def test_wait_that_times_out_on_a_queued_job_prints_no_status_line(bridge_root, capsys, monkeypatch):
+    monkeypatch.setattr(_bridge, "_POLL_INTERVAL_S", 0.01)
+    (bridge_root / "requests" / "delegate-3-cc.json").write_text("{}")
+    assert _bridge.delegate_cli(["wait", "delegate-3-cc", "--timeout", "0.05"]) == 3
+    assert capsys.readouterr().err == "delegation wait timed out\n"

@@ -193,14 +193,35 @@ class ReviewUnavailable(Exception):
     """No reviewer examined the work. Not a pass, not a fail, not the author's fault."""
 
 
-class ReviewLimited(ReviewUnavailable):
-    """No reviewer could run because the account is on its usage limit; retried after the reset."""
+class ReviewIncomplete(ReviewUnavailable):
+    """Some required judge returned no verdict or could not run, and none failed: not a round.
 
-    def __init__(self, reset_text: str) -> None:
+    `missing` maps each such judge to why (`NO_VERDICT: no output`, `NOT_RUN: ...`). The verdicts the
+    other judges returned on the same commit are kept (`_Timeline.carried`), so a re-run asks only these.
+    """
+
+    def __init__(self, missing: dict[str, str]) -> None:
+        """Keep `missing`, judge -> reason, for the timeline and the re-run."""
+        super().__init__(
+            "review incomplete, no verdict from "
+            + "; ".join(f"{j} ({why})" for j, why in sorted(missing.items()))
+        )
+        self.missing = dict(missing)
+
+
+class ReviewLimited(ReviewUnavailable):
+    """A required judge could not run because of a usage limit; the review re-runs after the reset.
+
+    `retry_at` is the router's own time to ask again (unix seconds) when it deferred the call; otherwise
+    None, and the supervisor reads the reset from `reset_text`. `missing` names the deferred judges; the
+    verdicts the others returned are kept for the re-run, as for `ReviewIncomplete`.
+    """
+
+    def __init__(
+        self, reset_text: str, retry_at: float | None = None, missing: dict[str, str] | None = None
+    ) -> None:
         """Keep `reset_text`, when the usage limit lifts, as the account reports it (may be empty)."""
         super().__init__(f"the reviewers are on the usage limit ({reset_text or 'reset time not shown'})")
         self.reset_text = reset_text
-
-
-#: judge -> the usage-limit text that stopped it, this round.
-_limited_reason: dict[str, str] = {}
+        self.retry_at = retry_at
+        self.missing = dict(missing or {})

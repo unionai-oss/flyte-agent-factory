@@ -283,9 +283,7 @@ def record_waits(plan: _planner.Plan, requests: dict[str, _queue.Request]) -> No
         detail: dict[str, Any]
         if reason.code == "low_priority_waits":
             text, detail = f"behind {reason.behind} request(s) that can start", {"behind": reason.behind}
-        elif reason.code == "engine_busy":  # the codes the dispatcher writes too keep its shape
-            text, detail = reason.with_identity, {"holders": list(reason.holders), "limit": reason.limit}
-        elif reason.code == "project_running":
+        elif reason.code == "project_running":  # the code the dispatcher writes too keeps its shape
             text, detail = reason.with_identity, {"holders": [reason.with_identity]}
         else:  # the planner's own codes keep their identity text as `detail`
             text = " ".join(filter(None, (reason.with_identity, reason.detail)))

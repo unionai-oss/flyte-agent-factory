@@ -20,7 +20,7 @@ from xml.etree import ElementTree
 
 import flyte_agent_factory
 
-from . import _gate_base, _gate_start, _secret_env
+from . import _gate_base, _gate_start, _secret_env, _vendored
 
 
 def _is_test(path: str) -> bool:
@@ -80,6 +80,9 @@ PYTEST_JUNIT_ENV = "AGENT_FACTORY_PYTEST_JUNIT_DIR"
 #: With the value `child`, `checks.sh` runs its slow lane in a child action (`_slow_lane.ENV_VAR`, the same
 #: name: `_slow_lane` declares a task environment, which importing it here would register as a side effect).
 SLOW_LANE_ENV = "AGENT_FACTORY_SLOW_LANE"
+#: Names an executable that runs a project's pytest lane, or `-- <command>`, in a child action (the launcher
+#: `write_lane_launcher` writes). Unset in CI and on a laptop: `checks.sh` then runs things itself.
+TEST_LANE_ENV = "AGENT_FACTORY_TEST_LANE"
 
 
 #: Not part of a tree's identity: caches and environments that running a tool in it creates.
@@ -259,13 +262,27 @@ print("image=" + re.findall(r'image: "([^"]+)"', str(d.pb2))[0])
 """
 
 
+#: Run id -> its root action's image. A run's image does not change, and every review asks for it.
+_RUN_IMAGES: dict[str, str] = {}
+
+
 def _run_image(project: Path, env: dict[str, str]) -> str:
-    """Return the image this run's root action runs on, or "" when it cannot be looked up."""
-    code, output = _gate_base._run(
-        [sys.executable, "-P", "-c", _RUN_IMAGE_LOOKUP], project, env=env, timeout=120
-    )
-    found = [line.removeprefix("image=") for line in output.splitlines() if line.startswith("image=")]
-    return found[-1] if code == 0 and found else ""
+    """Return the image this run's root action runs on, or "" when it cannot be looked up.
+
+    Outside a run (no `FLYTE_INTERNAL_EXECUTION_ID`) there is nothing to ask, so no lookup is started.
+    """
+    run = os.environ.get("FLYTE_INTERNAL_EXECUTION_ID", "")
+    if not run:
+        return ""
+    if run not in _RUN_IMAGES:
+        code, output = _gate_base._run(
+            [sys.executable, "-P", "-c", _RUN_IMAGE_LOOKUP], project, env=env, timeout=120
+        )
+        found = [line.removeprefix("image=") for line in output.splitlines() if line.startswith("image=")]
+        if code != 0 or not found:
+            return ""
+        _RUN_IMAGES[run] = found[-1]
+    return _RUN_IMAGES[run]
 
 
 def _launcher_command(
@@ -292,6 +309,37 @@ def _launcher_command(
     # The scrubbed environment is what `checks.sh` gets (`_session_setup._session_env`, same function), and
     # it keeps what the launcher needs to attach to the run.
     return command, _secret_env.child_env(PYTHONPATH=str(package_root), **{SLOW_LANE_ENV: "child"})
+
+
+def write_lane_launcher(directory: Path, image: str = "") -> Path:
+    """Write the executable `TEST_LANE_ENV` names into `directory`; return its path.
+
+    It is the launcher of `_launcher_command` made callable by a script, so any project's `checks.sh` can use
+    it: the supervisor's interpreter and engine, never the project's (`-P` keeps the cwd off `sys.path`, and
+    the insert, unlike `PYTHONPATH`, does not leak into the project's own pytest when the lane falls back to
+    running locally). It needs nothing from the project's environment.
+
+    `image` is the run's own image (`_run_image`): the child must use it, as `FLYTE_INTERNAL_IMAGE` here is
+    the plain Flyte image without git. Without it the child would fail setup, so the launcher does not offer
+    the child and runs the lane here. Only the image name is written: no credential or other env value.
+    """
+    package_root = Path(flyte_agent_factory.__file__).resolve().parent.parent
+    code = (
+        f"import sys; sys.path.insert(0, {str(package_root)!r}); "
+        "from flyte_agent_factory._slow_lane import main; sys.exit(main())"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    launcher = directory / "test-lane"
+    if image:
+        mode = f"AGENT_FACTORY_SLOW_LANE=child FLYTE_INTERNAL_IMAGE={shlex.quote(image)}"
+        setup = ""
+    else:
+        mode, setup = "", "unset AGENT_FACTORY_SLOW_LANE\n"
+    launcher.write_text(
+        f'#!/bin/sh\n{setup}{mode} exec {shlex.quote(sys.executable)} -P -c {shlex.quote(code)} "$@"\n'
+    )
+    launcher.chmod(0o755)
+    return launcher
 
 
 def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None:
@@ -398,6 +446,8 @@ class GateWork:
     #: The test-harness files the round changed: set, the junit `checks.sh` left is not trusted.
     reuse_refused: str = ""
     share_pytest: bool = False
+    #: The base the supervisor recorded for the project: the one commit vendored trees are read from locally.
+    trusted_base: str = ""
     #: The pre-review sets this: the head run sends its lanes to child actions (see `_run_head_pytest`).
     child_lanes: bool = False
     head_sha: str = ""
@@ -480,10 +530,50 @@ def fail_to_pass(
                 )
         except _gate_start._GateError as exc:
             return 1, str(exc)
+    project = _gate_base.project_dir(workspace, name, layout)
+    upstreams = _vendored.load(project, _gate_base._SKIP_DIRS, trusted_base=base)
+    code, output = _judge_tests(
+        workspace, name, layout, project, upstreams, changes, brief, demo, note, start, work
+    )
+    # Every outcome says which trees were taken as upstream's, and why any could not be: a passing rule too.
+    return code, "\n".join(filter(None, [output, upstreams.describe()]))
+
+
+def _judge_tests(
+    workspace: Path,
+    name: str,
+    layout: str,
+    project: Path,
+    upstreams: _vendored.Upstreams,
+    changes: list[str],
+    brief: str,
+    demo: str,
+    note: str,
+    start: Path,
+    work: GateWork | None,
+) -> tuple[int | _gate_base.Status, str]:
+    """Return `fail_to_pass`'s code and output for a start tree that exists."""
+
+    def project_relative(path: str) -> str:
+        return os.path.relpath(workspace / path, project)
+
+    # A vendored file identical to upstream is upstream's, not a change of the project's: it is neither
+    # weakened nor a test the project wrote. One the start tree has is the project's, judged against start.
+    changes = [p for p in changes if (start / p).exists() or not upstreams.unchanged(project_relative(p))]
     tests = [p for p in changes if _is_test(p)]
     permits_removal = bool(_REMOVAL_PERMISSION.search(brief))
+    if not permits_removal:
+        # A test file upstream has, missing from a directory the copy has: no diff shows a file that was never
+        # committed, so it is found here. One the start tree had is a change, judged below.
+        for omitted in upstreams.omitted_tests:
+            path = os.path.relpath(project / omitted, workspace)
+            if not (start / path).exists():
+                return 1, f"tests removed, deleted or skipped without brief authorization: {path}"
     for path in tests:
         before = (start / path).read_text(errors="replace") if (start / path).is_file() else None
+        if before is None and (upstream := upstreams.read_upstream(project_relative(path))) is not None:
+            # No start copy of a vendored test: what it was is what upstream has.
+            before = upstream.decode(errors="replace")
         after = (workspace / path).read_text(errors="replace") if (workspace / path).is_file() else None
         if permits_removal or before is None and after is None:
             continue
@@ -512,7 +602,6 @@ def fail_to_pass(
     if started_with_tests and re.search(r"refactor:\s*no behaviour change", note, re.IGNORECASE):
         return 0, "EXEMPT: refactor: no behaviour change"
     tests = [p for p in tests if (workspace / p).is_file() and Path(p).name != "conftest.py"]
-    project = _gate_base.project_dir(workspace, name, layout)
     if not tests:
         # New Python projects owe behaviour tests too; lack of a framework is not an exemption.
         # Terraform and docs changes have no Python behaviour to test.

@@ -72,6 +72,18 @@ def _app() -> _github.GithubApp:
     return _github.GithubApp(PROFILE.github.app_id, os.environ[_pull_requests.KEY_ENV_VAR])
 
 
+def _engine_source() -> dict[str, str]:
+    """Return the benchmark's `source_repo` / `source_path` for where `[loop]` says the engine is.
+
+    Empty when the benchmark's default is that engine already, so the call keeps its old shape: the root of
+    `[repo] factory`, or, with none, `[loop]`'s own repo and path (`_bench_flow.candidate_source`).
+    """
+    loop, factory = PROFILE.loop, PROFILE.repos.get("factory")
+    if not factory or (not loop.path and _github.parse_repo(factory).lower() == loop.repo.lower()):
+        return {}
+    return {"source_repo": loop.repo, "source_path": loop.path}
+
+
 async def _benchmark(head: str, baseline: str) -> str:
     task = remote.Task.get("factory-bench.benchmark", auto_version="latest")
     task = await task.override.aio(timeout=flyte.Timeout(max_queued_time=timedelta(minutes=10)))
@@ -99,6 +111,7 @@ async def _benchmark(head: str, baseline: str) -> str:
             candidate_sha=head,
             baseline_sha=baseline,
             max_usd=cast(_profile.Bench, PROFILE.bench).max_usd,
+            **_engine_source(),
         )
     await run.wait.aio()
     summary, _ = await run.outputs.aio()
@@ -330,8 +343,10 @@ async def loop_run(pr_number: int) -> str:
     branch, baseline = await asyncio.to_thread(app.default_branch_sha, repo)
     files = await asyncio.to_thread(app.pull_files, repo, pr_number)
     # The files endpoint supplies filename and, on renames, previous_filename.
-    classification = _loop.classify(cast(list[_loop.ChangedFile], files), pull.get("changed_files"))
-    # Benchmarks resolve engine SHAs in the factory repo, so a foreign head or another target is unsafe.
+    classification = _loop.classify(
+        cast(list[_loop.ChangedFile], files), pull.get("changed_files"), PROFILE.loop.path
+    )
+    # Benchmarks resolve engine SHAs in the loop's repo, so a foreign head or another target is unsafe.
     if (pull["head"].get("repo") or {}).get("full_name") != repo or pull["base"]["ref"] != branch:
         classification = "needs_owner"
     review = await asyncio.to_thread(app.status_at, repo, head, _pull_requests.STATUS_CONTEXT)

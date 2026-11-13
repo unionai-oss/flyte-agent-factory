@@ -29,6 +29,11 @@ SECRET = "offline-webhook-secret"
 SHA = "a" * 40
 
 
+def _with_webhook(profile):
+    """`[deploy] webhook = true`: pushes to the deploy repo reach the webhook."""
+    return dataclasses.replace(profile, deploy=dataclasses.replace(profile.deploy, webhook=True))
+
+
 @pytest.fixture
 async def intake(monkeypatch):
     profile = make_direction_profile("file:///tmp/webhook-state")
@@ -58,8 +63,7 @@ async def intake(monkeypatch):
         transport=httpx.ASGITransport(app=_webhook.app), base_url="http://test"
     ) as client:
         yield SimpleNamespace(client=client, calls=calls, live=live, profile=profile)
-    if _webhook._pending:
-        await asyncio.gather(*_webhook._pending)
+    await asyncio.gather(*_webhook._pending)  # nothing pending is fine: gather of none returns at once
 
 
 async def deliver(intake, event="push", *, signature="valid", repo="acme/factory", branch="main", **extra):
@@ -104,8 +108,8 @@ async def test_engine_direction_and_alias_submit_once(intake, monkeypatch, repo)
         ),
     )
     assert (await deliver(intake, repo=repo)).status_code == 202
-    if _webhook._pending:
-        await asyncio.gather(*_webhook._pending)
+    assert _webhook._pending  # a 202 always schedules the work
+    await asyncio.gather(*_webhook._pending)
     assert len(intake.calls) == 1
     assert intake.calls[0]["name"] == _deploy.DEPLOYER_TASK
     assert intake.calls[0]["auto_version"] == "latest"
@@ -122,8 +126,8 @@ async def test_ignores_other_events(intake, kwargs):
 async def test_live_deployer_suppresses_submission(intake):
     intake.live.append(SimpleNamespace(name="already-running"))
     assert (await deliver(intake)).status_code == 202
-    if _webhook._pending:
-        await asyncio.gather(*_webhook._pending)
+    assert _webhook._pending  # a 202 always schedules the work
+    await asyncio.gather(*_webhook._pending)
     assert intake.calls == []
 
 
@@ -155,7 +159,7 @@ async def test_response_does_not_wait_for_flyte_and_duplicates_are_coalesced(int
 def test_reconcile_rate_and_environment_selection(monkeypatch, configured, minutes):
     profile = make_profile("file:///tmp/webhook-state")
     if configured:
-        profile = _profile.parse(profile.text + 'webhook_secret = "hook"\n', "webhook")
+        profile = _with_webhook(_profile.parse(profile.text + 'webhook_secret = "hook"\n', "webhook"))
     assert _deployer._reconcile_minutes(profile) == minutes
     assert ("factory-webhook" in _deploy.factory_envs(profile)) == configured
     assert ("factory-webhook" in _deploy.planned_envs(profile)) == configured
@@ -191,8 +195,33 @@ async def test_direction_ref_overrides_default_branch(intake, monkeypatch):
     monkeypatch.setattr(_webhook, "PROFILE", dataclasses.replace(intake.profile, direction=direction))
     assert (await deliver(intake, repo="acme/direction")).status_code == 204
     assert (await deliver(intake, repo="acme/direction", branch="release")).status_code == 202
-    if _webhook._pending:
-        await asyncio.gather(*_webhook._pending)
+    assert _webhook._pending  # a 202 always schedules the work
+    await asyncio.gather(*_webhook._pending)
+    assert len(intake.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("secret", "webhook", "minutes"), [("", True, 5), ("hook", False, 5), ("hook", True, 60)]
+)
+def test_the_hourly_reconcile_needs_the_secret_and_a_deploy_repo_the_webhook_hears(secret, webhook, minutes):
+    profile = make_profile("file:///tmp/webhook-state")
+    profile = dataclasses.replace(
+        profile,
+        github=dataclasses.replace(profile.github, webhook_secret=secret),
+        deploy=dataclasses.replace(profile.deploy, webhook=webhook),
+    )
+    assert _deploy.reconcile_minutes(profile) == minutes
+
+
+async def test_pushes_to_the_deploy_repo_are_watched_not_the_factory_repo_when_they_differ(
+    intake, monkeypatch
+):
+    deploy = dataclasses.replace(intake.profile.deploy, repo="https://github.com/acme/engine")
+    monkeypatch.setattr(_webhook, "PROFILE", dataclasses.replace(intake.profile, deploy=deploy))
+    assert (await deliver(intake, repo="acme/factory")).status_code == 204
+    assert (await deliver(intake, repo="acme/engine")).status_code == 202
+    assert _webhook._pending  # a 202 always schedules the work
+    await asyncio.gather(*_webhook._pending)
     assert len(intake.calls) == 1
 
 
@@ -207,8 +236,8 @@ async def test_default_branch_is_taken_from_signed_repository(intake):
             },
         )
     ).status_code == 202
-    if _webhook._pending:
-        await asyncio.gather(*_webhook._pending)
+    assert _webhook._pending  # a 202 always schedules the work
+    await asyncio.gather(*_webhook._pending)
     assert len(intake.calls) == 1
 
 
@@ -218,7 +247,7 @@ def test_deployment_wires_webhook_and_actual_reconcile_trigger(monkeypatch, conf
 
     profile = make_profile("file:///tmp/webhook-state")
     if configured:
-        profile = _profile.parse(profile.text + 'webhook_secret = "hook"\n', "webhook")
+        profile = _with_webhook(_profile.parse(profile.text + 'webhook_secret = "hook"\n', "webhook"))
     monkeypatch.setattr(_profile, "require", lambda: profile)
     deployed = runpy.run_path(_deployer.__file__)
     assert deployed["TRIGGER"].automation.interval_minutes == (60 if configured else 5)
@@ -250,8 +279,8 @@ async def test_submission_failure_is_logged_without_payload_and_next_delivery_ca
         flyte, "with_runcontext", lambda **kwargs: SimpleNamespace(run=SimpleNamespace(aio=fail))
     )
     assert (await deliver(intake)).status_code == 202
-    if _webhook._pending:
-        await asyncio.gather(*_webhook._pending, return_exceptions=True)
+    assert _webhook._pending  # a 202 always schedules the work
+    await asyncio.gather(*_webhook._pending, return_exceptions=True)
     await asyncio.sleep(0)
     assert not _webhook._pending
     assert "OSError" in caplog.text
@@ -260,8 +289,8 @@ async def test_submission_failure_is_logged_without_payload_and_next_delivery_ca
 
     monkeypatch.setattr(flyte, "with_runcontext", runner)
     assert (await deliver(intake)).status_code == 202
-    if _webhook._pending:
-        await asyncio.gather(*_webhook._pending)
+    assert _webhook._pending  # a 202 always schedules the work
+    await asyncio.gather(*_webhook._pending)
     assert len(intake.calls) == 1
 
 
@@ -312,7 +341,7 @@ def test_queue_sweep_reconciles_at_the_same_rate_once_the_webhook_is_configured(
 
     profile = make_profile("file:///tmp/webhook-state")
     if configured:
-        profile = _profile.parse(profile.text + 'webhook_secret = "hook"\n', "webhook")
+        profile = _with_webhook(_profile.parse(profile.text + 'webhook_secret = "hook"\n', "webhook"))
     monkeypatch.setattr(_profile, "require", lambda: profile)
     factory = runpy.run_path(_factory.__file__)
     (trigger,) = factory["env"].tasks["factory.sweep"].triggers

@@ -33,6 +33,19 @@ Set `[mcp] public_url` in your profile and deploy with
 ## Connecting a client
 
 Use the HTTPS URL `<public_url>/flyte-mcp/mcp` (`Connector URL:` in the deployment output).
+
+On a Linux x86_64 machine, one bootstrap command does the key, the grant and the connector for the chat key; the
+bootstrap's `connect` step prints it with your values filled in (here the example values, and `--deploy-key` in its
+place makes the deployment key, shown once on your terminal only):
+
+```bash
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --chat-key
+```
+
+It makes the `factory-chat` key, a `factory-chat` policy binding `contributor` to the factory's project and domain
+(an existing policy of that name must bind exactly that), and the assignment; then it adds the connector to Claude
+Code, or shows the key once on your terminal for claude.ai, and never prints it to stdout. The rest of this section
+is the manual route, for someone running with another administrator or another machine.
 Send the header `Authorization: Bearer <credential>`, where the credential is either:
 
 - a Union API key: `flyte create api-key --name <name> --no-default-policies` (from
@@ -42,12 +55,25 @@ Send the header `Authorization: Bearer <credential>`, where the credential is ei
   `flyte delete assignment --creds-subject <name> --policy contributor` before granting the scoped one.
 - a Union sign-in access token.
 
-The key and policy commands come from `flyteplugins-union`, which this project installs only on Linux; its
+The bootstrap says: the deploy makes its one-off Union API key with flyteplugins-union, which installs on Linux x86_64 only. The key and policy commands come from `flyteplugins-union`, which this project installs only on Linux; its
 pinned release (0.15.5) ships a Linux x86_64 wheel and nothing for macOS or Linux on ARM. On macOS, run
 `flyte create api-key`, the policy grant below and `flyte delete assignment` on a Linux x86_64 machine or VM
 with the engine checked out and the same Flyte config; every other setup step runs on macOS.
 
 ### Grant the key a role
+
+When `--chat-key` or `--deploy-key` is refused the policy or the assignment (you may not manage access in the
+Union organization), it still hands over the key, ends `todo`, and prints one command for a Union admin, filled in
+with your values and the key's client ID. The admin runs it on a Linux x86_64 machine, signed in to the same
+endpoint (if that machine has no Flyte config for `--endpoint`, the command writes one and opens the browser sign-in first; a config for another endpoint stops it before any change); it makes or checks the policy (`contributor` on the project and domain only) and assigns it to that
+client ID, and makes no key. For the deployment key, here with the example values and a client ID that is the key's
+name:
+
+```bash
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --grant factory-deploy factory-deploy
+```
+
+The rest of this section is the same grant by hand, for a key made with `flyte create api-key`.
 
 Union only. A policy binds a role to a project and domain, and an assignment gives the policy to the key's
 client ID (the name, lowercased with other characters as hyphens, except on Union Serverless). Run this
@@ -160,8 +186,7 @@ second connector: see [github-connector.md](github-connector.md).
 
 ## Chat skill
 
-Build and install the `agent-factory` skill from the same deployment profile as in
-[chat-operator.md](chat-operator.md#2-install-the-skill). The archive uses the
-`agent-factory/SKILL.md` layout with `agent-factory/references/setup.md` for guided installation and renders every source placeholder with profile values.
-Keep the generated zip private: it contains deployment-specific values. The existing `dist/`
-git-ignore rule excludes it, and the personal-literal guard skips binary files rather than scanning the zip.
+The `agent-factory` and `since` skills are public and need no profile: download the committed zips from
+[`skills/dist/`](../skills/dist) and install them as in
+[chat-operator.md](chat-operator.md#install-and-update). `ops/package_skill.py` builds them from `skills/`, and
+`ops/package_skill.py --check <zip>` says whether an installed copy is current.

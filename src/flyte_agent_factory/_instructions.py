@@ -377,13 +377,14 @@ def _project_memory(
         'with a reason in SUMMARY.md". The supervisor runs both before any reviewer. List an '
         "uncovered line under a `## Uncovered changed lines` heading in SUMMARY.md as "
         "`path:line -- reason`.\n"
-        f"- **A delivery also leaves its patches in `{project_rel}/patches/`.** Promoting reads only "
-        "those files. When the work in the target checkout is committed, run "
-        f"`git format-patch <base>..HEAD -o <workspace root>/{project_rel}/patches` there, where `<base>` is "
-        "the commit the checkout started from (`git merge-base HEAD origin/HEAD`), and commit the patches. "
-        "Make them again after every later commit. `factory:target-patches` applies them with "
-        "`git am --3way` onto that base in a scratch clone and fails if the directory is missing or "
-        "empty, a patch does not apply, or the result is not the checkout's HEAD.\n"
+        f"- **The target's files are in `{project_rel}/<path>`, as `{project_rel}/promote.toml` says "
+        "(`path`, `.` for the project directory itself).** Edit and commit them there, in this workspace: "
+        "they are what gets reviewed and delivered. Never clone the target inside the project. "
+        "`factory:target-ci` and the coverage check run on a copy of that tree built from this workspace's "
+        "history, against the commit it was imported from. If `promote.toml` is missing, the gate fails "
+        "naming `python ops/promote.py import <target> <project directory>`, which only the operator runs: "
+        "ask for it rather than writing the file yourself. Delivering is the operator's step too, and "
+        "only committed work is delivered.\n"
         if _target_ci.parse_target(_session_config._project_brief)
         else ""
     )
@@ -427,6 +428,10 @@ def _project_memory(
         "judged against the brief whatever you write "
         "here, so writing it narrow buys you nothing.\n"
         f"{delivery_note}"
+        "- **A copy of another repository kept in the project directory (no `.git`) is declared in "
+        f"`{project_rel}/vendored.toml`**: one `[[tree]]` with `path`, `repo` (https) and `commit` (full "
+        "sha) per copy. The gates then judge only the files you changed in it (module size, test removal, "
+        "language detection); no waiver is needed. See `docs/standards.md` in the engine.\n"
         '- **Say when you are done** with `flyte-note "DONE: <one line on what was delivered and '
         'where>"`. That does not end the work -- it starts a review. An independent reviewer, in '
         "its own container with its own copy of this workspace and no knowledge of your "

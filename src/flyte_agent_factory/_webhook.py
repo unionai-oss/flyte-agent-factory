@@ -459,8 +459,11 @@ def _watched_branch(event: dict[str, Any]) -> str | None:
     if not isinstance(full_name, str) or not isinstance(branch, str) or not branch:
         return None
     identity = _git._repo_identity(f"https://github.com/{full_name}")
+    deploy_repo = PROFILE.deploy.repo
+    repos = [(deploy_repo, branch)]
     factory = PROFILE.repos.get("factory", "")
-    repos = [(factory, branch), *[(url, branch) for url in PROFILE.repo_aliases.get("factory", ())]]
+    if factory and deploy_repo and _git._repo_identity(factory) == _git._repo_identity(deploy_repo):
+        repos.extend((url, branch) for url in PROFILE.repo_aliases.get("factory", ()))
     if PROFILE.direction:
         direction = PROFILE.direction
         repos.append((direction.repo, direction.ref or branch))

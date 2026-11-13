@@ -7,10 +7,13 @@ import importlib.abc
 import json
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from flyte_agent_factory import (
+    _delivery,
     _gate_base,
     _gate_scope,
     _gates,
@@ -20,6 +23,7 @@ from flyte_agent_factory import (
     _session_config,
     _timeline,
 )
+from tests.test_delivery import seed_target
 
 pytestmark = pytest.mark.real_factory_gates
 
@@ -264,16 +268,37 @@ def test_the_direction_prompt_says_how_direction_arrives():
     assert "flyte signal" in source
 
 
-# --- patches for promote ---------------------------------------------------------------------
+# --- a delivering project: the target's tree is in the workspace --------------------------------
 
-BRIEF = "Add clamp to calc.\nDelivers to: acme/widgets at widgets\n"
+BRIEF = "Add clamp to calc.\nDelivers to: acme/widgets\n"
 CALC = "def sign(x):\n    return -1 if x < 0 else 1\n"
+TEST_CALC = "from calc import sign\n\n\ndef test_sign():\n    assert sign(1) == 1\n"
+COVERAGE = "coverage:\n\tpython -m coverage run --branch -m pytest -q\n"
+DOUBLE = CALC + "\n\ndef double(x):\n    return 2 * x\n"
+LINT = "lint:\n\t@python check.py\n"
+TARGET_FILES = {
+    "calc.py": CALC,
+    "test_calc.py": TEST_CALC,
+    "check.py": "import sys\nsys.exit(0)\n",
+    "Makefile": LINT + COVERAGE,
+}
 
 
-@pytest.fixture(params=["workspace", "sandbox"])
-def delivery(request, tmp_path):
-    """A workspace (or sandbox) project whose target checkout has one commit on `feature`."""
-    layout = request.param
+@pytest.fixture
+def operator(monkeypatch, tmp_path_factory):
+    """`import` commits as the operator: give it an identity, and no other git configuration.
+
+    The target's commands run `python ...`: it must be this interpreter, as under `uv run`.
+    """
+    monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}")
+    config = tmp_path_factory.mktemp("gitconfig") / "config"
+    config.write_text("[user]\n\tname = Op Erator\n\temail = operator@example.invalid\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+def make_workspace(tmp_path, layout):
+    """A workspace (`projects/proj/`) or the shared sandbox repo (`proj/`) with one project directory."""
     rel = "projects/proj" if layout == "workspace" else "proj"
     git(tmp_path, "init", "-b", "main")
     git(tmp_path, "config", "user.email", "t@example.com")
@@ -282,117 +307,241 @@ def delivery(request, tmp_path):
     (tmp_path / rel / "NOTES.md").write_text("n\n")
     git(tmp_path, "add", "-A")
     git(tmp_path, "commit", "-m", "base")
-    checkout = tmp_path / rel / "widgets"
+    return tmp_path / rel
+
+
+@pytest.fixture(params=["workspace", "sandbox"])
+def imported(request, tmp_path, operator):
+    """A project that imported the target's files, then committed `double()`: no nested checkout anywhere."""
+    (tmp_path / "upstream").mkdir()
+    target, _ = seed_target(tmp_path / "upstream", TARGET_FILES)
+    project = make_workspace(tmp_path, request.param)
+    _delivery.import_tree(str(target), project, path="widgets")
+    (project / "widgets/calc.py").write_text(DOUBLE)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-m", "add double")
+    return project, target
+
+
+def results_of(project, repo=None):
+    """The gate results; the brief names the manifest's own repository unless `repo` says another."""
+    delivery = _delivery.load(project)
+    assert delivery is not None
+    delivers = repo or delivery.repo
+    brief = f"Add clamp to calc.\nDelivers to: {delivers}\n"
+    return {r.rule: r for r in _gates.target_results(project, brief)}
+
+
+def test_an_imported_tree_gets_the_target_gates_from_workspace_history_alone(imported):
+    project, _ = imported
+    assert not list(project.rglob(".git")), "no nested checkout: only the workspace's own history"
+    results = results_of(project)
+    assert list(results) == ["factory:target-ci", "factory:target-coverage"]
+    assert results["factory:target-ci"].status is _gate_base.Status.PASS
+
+
+def test_the_coverage_is_judged_against_the_import_base(imported):
+    """Only `double()` is the project's change: `sign()` was imported, covered or not."""
+    project, _ = imported
+    result = results_of(project)["factory:target-coverage"]
+    assert result.status is _gate_base.Status.FAIL
+    assert "calc.py:6" in result.output and "calc.py:2" not in result.output
+    (project / "SUMMARY.md").write_text("## Uncovered changed lines\n- calc.py:6 -- demo\n")
+    assert results_of(project)["factory:target-coverage"].status is _gate_base.Status.PASS
+
+
+def test_uncommitted_work_is_what_the_gates_judge(imported):
+    project, _ = imported
+    (project / "widgets/calc.py").write_text(CALC)  # `double()` taken out again, not committed
+    assert results_of(project)["factory:target-coverage"].status is _gate_base.Status.PASS
+
+
+def test_the_checkout_of_a_project_from_before_imports_still_passes_the_gates(tmp_path, operator):
+    """A nested git checkout of the target is the legacy layout: it keeps working, without a patch gate."""
+    project = make_workspace(tmp_path, "workspace")
+    checkout = project / "widgets"
     checkout.mkdir()
-    (checkout / "calc.py").write_text(CALC)
+    for name, text in TARGET_FILES.items():
+        (checkout / name).write_text(text)
     git(checkout, "init", "-b", "main")
     git(checkout, "config", "user.email", "t@example.com")
     git(checkout, "config", "user.name", "t")
     git(checkout, "add", ".")
     git(checkout, "commit", "-m", "upstream")
     git(checkout, "checkout", "-b", "feature")
-    (checkout / "calc.py").write_text(CALC + "\n\ndef double(x):\n    return 2 * x\n")
+    (checkout / "calc.py").write_text(DOUBLE)
     git(checkout, "commit", "-am", "add double")
-    return tmp_path / rel, checkout
+    brief = "Add clamp to calc.\nDelivers to: acme/widgets at widgets\n"
+
+    results = {r.rule: r for r in _gates.target_results(project, brief)}
+
+    assert list(results) == ["factory:target-ci", "factory:target-coverage"]
+    assert "calc.py:6" in results["factory:target-coverage"].output
 
 
-def patches_result(project):
-    results = {r.rule: r for r in _gates.target_results(project, BRIEF)}
-    return results["factory:target-patches"]
-
-
-def format_patches(checkout, project):
-    git(checkout, "format-patch", "-o", str(project / "patches"), "main..HEAD")
-
-
-def test_missing_patches_directory_fails(delivery):
-    project, _ = delivery
-    result = patches_result(project)
-    assert result.status is _gate_base.Status.FAIL
-    assert "patches" in result.output
-
-
-def test_empty_patches_directory_fails(delivery):
-    project, _ = delivery
-    (project / "patches").mkdir()
-    assert patches_result(project).status is _gate_base.Status.FAIL
-
-
-def test_patches_that_apply_cleanly_pass(delivery):
-    project, checkout = delivery
-    format_patches(checkout, project)
-    result = patches_result(project)
-    assert result.status is _gate_base.Status.PASS, result.output
-    assert "1 patch" in result.output
-
-
-def test_the_check_leaves_the_checkout_untouched(delivery):
-    project, checkout = delivery
-    format_patches(checkout, project)
-    before = git(checkout, "status", "--porcelain=v1", "--branch"), git(checkout, "rev-parse", "HEAD")
-    patches_result(project)
-    assert (
-        git(checkout, "status", "--porcelain=v1", "--branch"),
-        git(checkout, "rev-parse", "HEAD"),
-    ) == before
-
-
-def test_patches_that_do_not_apply_to_the_base_fail(delivery):
-    project, checkout = delivery
-    format_patches(checkout, project)
-    patch = project / "patches/0001-add-double.patch"
-    # A context line the base does not have: git has nothing to merge it with.
-    patch.write_text(patch.read_text().replace(" def sign(x):", " def sign(y):"))
-    result = patches_result(project)
-    assert result.status is _gate_base.Status.FAIL
-    assert "git am" in result.output
-
-
-def test_a_patch_that_is_not_a_patch_fails(delivery):
-    project, _ = delivery
-    (project / "patches").mkdir()
-    (project / "patches/0001-nothing.patch").write_text("not a patch\n")
-    assert patches_result(project).status is _gate_base.Status.FAIL
-
-
-def test_patches_missing_commits_since_the_base_fail(delivery):
-    project, checkout = delivery
-    format_patches(checkout, project)
-    (checkout / "extra.py").write_text("x = 3\n")
-    git(checkout, "add", "extra.py")
-    git(checkout, "commit", "-m", "add extra")
-    result = patches_result(project)
-    assert result.status is _gate_base.Status.FAIL
-    assert "do not rebuild" in result.output
-
-
-def test_no_checkout_means_the_ci_check_reports_it_and_no_patch_check_runs(tmp_path):
+def test_no_tree_and_no_checkout_names_the_import_command(tmp_path):
     results = _gates.target_results(tmp_path, BRIEF)
     assert [r.rule for r in results] == ["factory:target-ci"]
+    assert results[0].status is _gate_base.Status.FAIL
+    assert "python ops/promote.py import acme/widgets" in results[0].output
 
 
-def test_an_ordinary_project_has_no_patch_check(delivery):
-    project, _ = delivery
+def test_a_promote_toml_that_is_not_committed_fails_the_gate_with_the_remedy(tmp_path):
+    project = make_workspace(tmp_path, "workspace")
+    (project / "promote.toml").write_text(f'repo = "acme/widgets"\nbase = "{"a" * 40}"\n')
+    result = results_of(project, "acme/widgets")["factory:target-ci"]
+    assert result.status is _gate_base.Status.FAIL and "not committed" in result.output
+
+
+def test_a_malformed_promote_toml_fails_the_gate(tmp_path):
+    (tmp_path / "promote.toml").write_text("repo = [\n")
+    results = _gates.target_results(tmp_path, BRIEF)
+    assert [r.rule for r in results] == ["factory:target-ci"]
+    assert results[0].status is _gate_base.Status.FAIL and "promote.toml" in results[0].output
+
+
+def test_an_ordinary_project_has_no_target_gates(imported):
+    project, _ = imported
     assert _gates.target_results(project, "An ordinary brief.\n") == []
 
 
-def test_the_gate_records_the_patch_check_for_a_delivery_project(delivery, tmp_path):
-    project, checkout = delivery
+def test_patches_are_retired():
+    assert not hasattr(_gates, "_target_patches_result")
+
+
+def test_the_gate_records_the_target_checks_for_a_delivery_project(imported, tmp_path):
+    project, _ = imported
     workspace = project.parent.parent if project.parent.name == "projects" else project.parent
-    format_patches(checkout, project)
-    git(workspace, "config", "user.email", "t@example.com")
     _gates.capture_base(workspace, "proj")
     layout = "workspace" if project.parent.name == "projects" else "sandbox"
-    _gates.run(workspace, "proj", BRIEF, "", "DONE", {}, _timeline._Timeline(), layout)
+    delivery = _delivery.load(project)
+    assert delivery is not None
+    brief = f"Add clamp to calc.\nDelivers to: {delivery.repo}\n"
+    _gates.run(workspace, "proj", brief, "", "DONE", {}, _timeline._Timeline(), layout)
     recorded = json.loads((workspace / ".claude-flyte/proj/standards-results.json").read_text())
-    assert {r["rule"]: r["status"] for r in recorded}["factory:target-patches"] == "PASS"
+    statuses = {r["rule"]: r["status"] for r in recorded}
+    assert statuses["factory:target-ci"] == "PASS"
+    assert statuses["factory:target-coverage"] == "FAIL"
+    assert "factory:target-patches" not in statuses
 
 
-def test_delivery_instructions_ask_for_the_patches(monkeypatch):
+def test_delivery_instructions_say_where_the_tree_is_and_who_imports_it(monkeypatch):
     monkeypatch.setattr(_session_config, "_project_brief", BRIEF)
-    for layout, where in (("workspace", "projects/proj/patches/"), ("sandbox", "proj/patches/")):
+    for layout, where in (("workspace", "projects/proj/"), ("sandbox", "proj/")):
         memory = _instructions._project_memory(False, name="proj", layout=layout)
-        assert "git format-patch" in memory and f"`{where}`" in memory
-        assert "factory:target-patches" in memory
+        assert f"`{where}promote.toml`" in memory and f"`{where}<path>`" in memory
+        assert "python ops/promote.py import" in memory and "Never clone the target" in memory
+        assert "format-patch" not in memory and "patches/" not in memory
     monkeypatch.setattr(_session_config, "_project_brief", "An ordinary brief.\n")
-    assert "git format-patch" not in _instructions._project_memory(False, name="proj", layout="workspace")
+    assert "promote.toml" not in _instructions._project_memory(False, name="proj", layout="workspace")
+
+
+# --- the manifest is the operator's: the session cannot move the baseline or the target -----------
+
+
+def test_a_manifest_naming_another_repository_than_delivers_to_is_refused(imported):
+    project, _ = imported
+    results = results_of(project, "acme/elsewhere")
+    assert list(results) == ["factory:target-ci"]
+    assert results["factory:target-ci"].status is _gate_base.Status.FAIL
+    assert "acme/elsewhere" in results["factory:target-ci"].output
+    assert "promote.toml" in results["factory:target-ci"].output
+
+
+def test_the_same_repository_spelled_differently_is_accepted(tmp_path, operator):
+    (tmp_path / "upstream").mkdir()
+    target, _ = seed_target(tmp_path / "upstream", TARGET_FILES)
+    project = make_workspace(tmp_path, "workspace")
+    _delivery.import_tree(str(target), project, path="widgets")
+    assert list(results_of(project, f"file://{target}/")) == ["factory:target-ci", "factory:target-coverage"]
+
+
+def test_a_comment_only_edit_of_promote_toml_cannot_erase_the_review_diff(imported, tmp_path):
+    """The attack: commit a comment-only manifest edit with the source change, so the newest manifest commit
+    (the old baseline) already contains the work and nothing is left to review."""
+    project, _ = imported
+    before = results_of(project)["factory:target-coverage"]
+    assert before.status is _gate_base.Status.FAIL and "calc.py:6" in before.output
+
+    manifest = project / "promote.toml"
+    manifest.write_text(manifest.read_text() + "# harmless\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-m", "tidy the manifest")
+
+    for rule, result in results_of(project).items():
+        assert result.status is _gate_base.Status.FAIL, (rule, result.output)
+    assert "promote.toml" in results_of(project)["factory:target-ci"].output
+
+
+def test_a_value_change_of_the_manifest_base_is_refused_too(imported, tmp_path):
+    project, _ = imported
+    delivery = _delivery.load(project)
+    assert delivery is not None
+    _delivery.write(project, _delivery.Delivery(delivery.repo, "b" * 40, delivery.path))
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-m", "move the base")
+    result = results_of(project)["factory:target-ci"]
+    assert result.status is _gate_base.Status.FAIL and "promote.toml" in result.output
+
+
+def test_an_uncommitted_manifest_edit_is_refused(imported):
+    project, _ = imported
+    (project / "promote.toml").write_text((project / "promote.toml").read_text() + "# x\n")
+    assert results_of(project)["factory:target-ci"].status is _gate_base.Status.FAIL
+
+
+def test_deleting_and_re_adding_the_manifest_does_not_move_the_base(imported, tmp_path):
+    project, _ = imported
+    original = (project / "promote.toml").read_text()
+    (project / "promote.toml").unlink()
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-m", "drop the manifest")
+    (project / "promote.toml").write_text(original)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-m", "put it back")
+    # Same bytes, same base: the diff is still the one against the import.
+    result = results_of(project)["factory:target-coverage"]
+    assert result.status is _gate_base.Status.FAIL and "calc.py:6" in result.output
+
+
+# --- a new repository has the empty tree as its baseline -----------------------------------------
+
+# `ok.py` is tested so that pytest has something to run; `never()` is the untested change. The lint is inline:
+# a `check.py` would itself be Python the new repository must cover.
+NEW_FILES = {
+    "app.py": "def never(x):\n    return x\n",
+    "ok.py": "def ok():\n    return 1\n",
+    "test_ok.py": "from ok import ok\n\n\ndef test_ok():\n    assert ok() == 1\n",
+    "Makefile": "lint:\n\t@python -c pass\n" + COVERAGE,
+}
+
+
+@pytest.fixture
+def new_project(tmp_path, operator):
+    project = make_workspace(tmp_path, "workspace") / "tree"
+    _delivery.import_tree("https://example.invalid/new.git", project, new=True)
+    for name, text in NEW_FILES.items():
+        (project / name).write_text(text)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-m", "start")
+    return project
+
+
+def test_a_new_repository_must_cover_all_its_python(new_project):
+    result = results_of(new_project)["factory:target-coverage"]
+    assert result.status is _gate_base.Status.FAIL, result.output
+    assert "app.py:1" in result.output and "app.py:2" in result.output
+    assert "merge-base" not in result.output
+
+
+def test_a_new_repository_honours_an_explicit_summary_exception(new_project):
+    (new_project / "SUMMARY.md").write_text(
+        "## Uncovered changed lines\n- app.py:1 -- demo\n- app.py:2 -- demo\n"
+    )
+    assert results_of(new_project)["factory:target-coverage"].status is _gate_base.Status.PASS
+
+
+def test_a_new_repository_whose_python_is_tested_passes(new_project, tmp_path):
+    test = "from app import never\n\n\ndef test_never():\n    assert never(1) == 1\n"
+    (new_project / "test_app.py").write_text(test)
+    assert results_of(new_project)["factory:target-coverage"].status is _gate_base.Status.PASS

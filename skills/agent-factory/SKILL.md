@@ -1,28 +1,75 @@
 ---
 name: agent-factory
-description: Be the person's operator for the Flyte agent factory. Write problem and requirements issues and briefs, launch and resume projects, explain status, queue, review and usage, answer or relay the factory's questions, send direction, stop projects, and merge or promote their pull requests on the person's word. Use for guided first setup, resuming partial installation, factory builds, queue management, PR delivery and deployment status.
+description: Set up the Flyte agent factory from nothing, take over as the person's operator in any chat, and operate it. Guide first installation or resume a partial one; write problem and requirements issues and briefs, launch and resume projects, explain status, queue, review and usage, answer or relay the factory's questions, send direction, stop projects, open and watch pull requests, and merge or promote them on the person's word. Use for setup, /agent-factory, factory builds, queue management, PR delivery and deployment status.
 ---
 
 # Agent factory
 
-## Setup or operate
+## Start: setup or take over
 
-For first installation, connection failures during setup, or a half-finished install, read
-[references/setup.md](references/setup.md). Start with what already exists and guide one step at a time.
-Before a profile is configured, collect the person's own
-non-secret values. Engine credentials are entered and stored locally, never through chat or MCP secret tools.
-Without deployment configuration, use only the setup reference; do not call factory tools. After setup,
-repackage with `PYTHONPATH=src uv run python ops/package_skill.py --profile mine` and replace this installed
-skill with the resulting zip.
+The person types `/agent-factory`. Decide which mode this is, then follow it:
 
-## Deployment
+- **Operate.** The factory MCP tools are reachable (`run_task` and the `factory.launch` task are registered, a call
+  to `list_projects` answers, and the server instructions name the factory). Go to Taking over.
+- **Set up.** Otherwise there is no working factory connection yet. Read
+  [references/setup.md](references/setup.md) and guide the person from where they are: setup resumes by checking
+  each step's evidence (does the workspace repo exist, is the secret there, is the app deployed), never by asking
+  the person to repeat finished steps. Do not call factory tools until they answer. Engine credentials are entered
+  and stored locally, never through chat or MCP secret tools.
 
-This section and everything after it are the operating instructions for an installed factory; the setup
-package ends before it.
+## Taking over
 
-Use Flyte project `{{project}}` and domain `{{domain}}` on every MCP call below.
-The default project repo is `{{repo}}`. Allowed chat repos: {{repos}}.
-Work runs use these exact task names (for monitoring only): {{work_tasks}}.
+Every `/agent-factory` in an operating install runs these steps. They are idempotent: running them again in the same
+chat changes nothing it already settled.
+
+1. **Retire other operators' check-ins.** List scheduled tasks. Retire every "Factory check-in" owned by another
+   chat. If the client refuses, those check-ins stand down by themselves, because each one reads the operator field
+   in STATE.md and does nothing when it is not the recorded operator.
+2. **Rebuild state from live sources.** `factory.queue_list`, then `factory.status` for each live project; open
+   pull requests and their CI on the workspace and engine repos (the repos named in the server instructions); the
+   newest `factory-deployer.deploy_if_changed` run. Add the workspace's `operator/STATE.md` for what live sources
+   cannot tell: direction, authorizations, plans. Where they disagree, live sources win.
+3. **Record this chat as the operator** in STATE.md (see Operator state). Create the file if it is absent, with the
+   GitHub file tools.
+4. **Schedule this chat's own check-in**: a recurring "Factory check-in" every 30 to 60 minutes, unless this chat
+   already has one. Where the client has no scheduled tasks, say that check-ins are unavailable in this client.
+   A check-in does what Taking over steps 2 and 6 do, acts on routine items (see Engineering judgement) and writes
+   only what changed.
+5. **Check this skill is current.** The last line of this skill is `Skill version: <digest>`. Read the engine's
+   published `skills/dist/VERSION` (GitHub file tools or a web fetch of
+   https://raw.githubusercontent.com/unionai-oss/flyte-agent-factory/main/skills/dist/VERSION). If the digests
+   differ, tell the person to download the skills again and re-save them
+   ([skills/dist](https://github.com/unionai-oss/flyte-agent-factory/tree/main/skills/dist)). If you cannot read
+   it, say so; do not guess.
+6. **Reply with a summary and the person's action items**, in the style of `/since`: what is running, queued,
+   waiting on a person, merged or failed since the last operator note, then a short list of what only the person can
+   do. Then suggest this chat's title `Agent Factory YYYY-MM-DD` (today's date) and a ` (retired)` suffix on the
+   previous operator chat's title.
+
+`/factory-handoff` is retired. `/agent-factory` in any chat takes over; there is nothing to run in the old chat.
+
+## Operator state
+
+The operator keeps one file in the person's workspace repo, `operator/STATE.md`, so a new chat can take over without
+the old one. It holds:
+
+- the person's standing direction, quoted, not paraphrased;
+- merges the person has authorized and the conditions on them;
+- planned launches and where their briefs live;
+- pending questions for the person;
+- decisions and lessons, with reasoning;
+- the current operator chat (title, date) and the time of the last check-in.
+
+Never put secrets, tokens or credential text in it. A check-in whose chat is not the recorded operator does nothing
+and does not reschedule itself. Update the file with GitHub file tools; when the workspace has a protected `main`,
+use a branch and a pull request, and say so.
+
+## Where the factory's values come from
+
+This skill holds no deployment values. On connect the factory MCP server instructions name the Flyte project, the
+domain and the allowed repositories, and `list_projects` returns only the factory's project. Read them there and pass
+`project` and `domain` on every MCP call below. The default project repo and the allowed chat repos are in the same
+instructions. The intake label is the profile's `[github] intake_label`.
 
 ## Your role: the operator
 
@@ -33,7 +80,7 @@ You are the person's default interface to the factory. Four jobs:
 - **Credential boundary.** You hold credentials the factory deliberately lacks: the GitHub connector (merge,
   close, issues, the board's Backlog and Ready, which the factory sets only when `[loop] enabled` or
   `[planner] admission = "planner"` is on) and, where you have a shell, the person's git credentials for
-  `ops/promote.py`. Use them only on the person's explicit word for that action; a passed review is not
+  `ops/promote.py` (import, deliver; see https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/architecture-repos.md#promotion). Use them only on the person's explicit word for that action; a passed review is not
   permission to merge. Never pass these credentials, or anything derived from them, into a brief, direction or
   answer.
 - **Inputs.** Help the person write problem and requirements documents (see Writing the brief and Filing issues),
@@ -45,7 +92,7 @@ You are the person's default interface to the factory. Four jobs:
 
 Today each project is a long-lived Claude session on a slot, with delegated workers and independent
 review. Chat calls `factory.launch`; a signed GitHub webhook (`factory-webhook`, `/github`) also accepts open
-issues bearing the profile's intake label (`{{intake_label}}`). Intake requires an allowed repository and
+issues bearing the profile's intake label (`[github] intake_label`). Intake requires an allowed repository and
 allowlisted human maintainers; issue comments from those maintainers become direction for linked live runs.
 `factory-issues.process` handles intake. The supervisor writes board status and milestone comments as a run
 moves; `factory-reconcile.reconcile` recomputes both from Flyte every five minutes and heals any it missed.
@@ -56,7 +103,7 @@ intake or `factory.launch`. Ready-board admission runs only when the profile set
 in production ([profile reference](https://github.com/unionai-oss/flyte-agent-factory/blob/main/profiles/README.md)).
 
 `factory.sweep` reconciles queued launches and dispatches them to available slots, oldest first, every five
-minutes (30 minutes when the webhook is configured). It does not turn board items into launches. A planned planner
+minutes, webhook or not. It does not turn board items into launches. A planned planner
 will launch short parallel jobs from work items instead of keeping a coordinator alive. A pure-Python
 router (`_router.route`) picks Claude or Codex per call from the live 5-hour and weekly meters, with no reserve:
 QA prefers the engine that did not build, an explicit pin wins unless exhausted, and when both are exhausted the
@@ -81,25 +128,24 @@ Claude Code, with a token header ([chat-operator](https://github.com/unionai-oss
 
 ## Cheap monitoring
 
-Prefer `run_task(name="factory.status", inputs={"name": "X"}, project="{{project}}", domain="{{domain}}")`,
-then `get_run_io(name=<returned run id>, project="{{project}}", domain="{{domain}}")` for a one-call summary task.
-For all live projects, `run_task(name="factory.queue_list", project="{{project}}", domain="{{domain}}")`, then
+Prefer `run_task(name="factory.status", inputs={"name": "X"}, project=<project>, domain=<domain>)`,
+then `get_run_io(name=<returned run id>, project=<project>, domain=<domain>)` for a one-call summary task.
+For all live projects, `run_task(name="factory.queue_list", project=<project>, domain=<domain>)`, then
 `get_run_io` gives the live run ids without paging through cron history.
 
 Always filter `list_runs` by an exact `task_name`. Unfiltered listings waste about 500 tokens per run on cron
 noise: `factory-reconcile.reconcile`, `factory.sweep`, and
 `factory-deployer.deploy_if_changed` (the deployment reconcile; there is no separate reconcile task).
-For a work task from the list above, call
-`list_runs(task_name=<exact work task>, limit=20, project="{{project}}", domain="{{domain}}")` and retain phases
-RUNNING, QUEUED, WAITING, WAITING_FOR_RESOURCES, INITIALIZING or PAUSED locally. Do not use this to pick a slot.
+Find live work with `factory.queue_list` (above), not by listing work tasks: it returns every live project with its
+run id, so you never need a slot or task name.
 
-For each live run call `list_conditions(run_name=<run id>, limit=1000, project="{{project}}", domain="{{domain}}")`;
+For each live run call `list_conditions(run_name=<run id>, limit=1000, project=<project>, domain=<domain>)`;
 retain `phase == "PAUSED"` and names starting `direct-` or `ask-`. This avoids paging through unrelated runs.
 The stock MCP has no phase/name-prefix filters and returns at most `limit` conditions; a full result may be
 truncated. Do not conclude there are no open conditions from a truncated list. `factory.status` includes open
 questions; if a direction inbox is absent, inspect the run in the console. The stock MCP condition listing omits prompts; read question text from `factory.status` or the console.
 Send with `signal_condition(name=<condition name>, run_name=<run id>, value=<message or answer>,
-project="{{project}}", domain="{{domain}}")`.
+project=<project>, domain=<domain>)`.
 
 ## Launch and queue
 
@@ -137,10 +183,13 @@ while signed in to Union).
 
 ## Benchmarks
 
-Call `run_task(name="factory-bench.benchmark", inputs=..., project="{{project}}", domain="{{domain}}")`.
+Call `run_task(name="factory-bench.benchmark", inputs=..., project=<project>, domain=<domain>)`.
 Read the summary JSON and cases JSONL with `get_run_io`. Inputs:
 
-- `candidate_sha`: required full 40-character commit SHA or ref in the factory repo.
+- `candidate_sha`: required full 40-character commit SHA or ref in the factory repo, or in `source_repo`.
+- `source_repo`, `source_path`: optional; benchmark a modified engine copy from a workspace project instead
+  (a profile repo, and the subtree holding the engine's `src/`). Workspace copies are for benchmarking and
+  testing only; production deploys what was merged.
 - `baseline_sha`: optional SHA or ref; empty (default) runs only the candidate arm.
 - `tasks`: suite task ids; empty or omitted runs all tasks. The suite contains `bugfix-shortlinks`,
   `feature-expiry`, `refactor-logstats`, `docs-standards`, `tf-bucket`, `ml-pipeline`, `vague` and `too-big`.
@@ -208,7 +257,7 @@ Usage-limit pauses resume automatically after reset unless the report requests h
 
 With GitHub configured, work uses `factory/<name>`. Review opens a draft PR (ready where drafts are unavailable),
 marks it ready on a pass and writes `factory/verifier` status. Pre-review check failures do not open a PR.
-The factory never merges or force-pushes (except `[loop] merge = "on"` on the engine repository); the user merges, or tells you to merge with the GitHub connector. Slot secrets are not an isolation boundary.
+The factory never merges or force-pushes (except `[loop] merge = "on"` on the `[loop] repo` repository, which needs the App there); the user merges, or tells you to merge with the GitHub connector. Slot secrets are not an isolation boundary.
 
 ## Questions and direction
 
@@ -240,9 +289,13 @@ question: usually about 30 minutes after the pass, later only if the session or 
 ## Stop
 
 Prefer `signal_condition` on the open `direct-...` with value `/stop`: clean exit, final snapshot, freed slot.
-Use `abort_run` only for an unresponsive session. An aborted run publishes no workspace, so relaunching the
-name resumes from an older published workspace, or starts empty: everything since the last successful run is lost.
-Confirm before either unless the user already requested it. Queue cancellation is for waiting launches.
+Use `abort_run` when a session is unresponsive: it has no direction inbox, is paused on a usage limit and ignores
+direction, or is idle past its nudges. An aborted run publishes no workspace, so relaunching the name resumes from an
+older published workspace, or starts empty: everything since the last successful run is lost. A session paused on
+one engine's limit can be aborted and relaunched pinned to the engine that still has quota, with launch policy
+`{"COORDINATOR_ENGINE":"claude","DELEGATE_ENGINE":"claude"}` (use the other engine's name when that is the one
+with quota). Stopping a stuck run and relaunching it is a routine operator action: do it and report it. Queue
+cancellation is for waiting launches.
 
 ## What else chat can do
 
@@ -250,7 +303,7 @@ The factory MCP has every stock Flyte tool, all limited to the factory's project
 is refused, and `list_projects` shows only this project). What you may do inside it is bounded by the caller's Union
 permissions. Beyond launching and following projects:
 
-- restart the deployer after a failed deploy (above);
+- restart the deployer after a failed deploy (below, under deployment diagnostics);
 - `list_secrets` shows secret names and types; no tool returns a value. Although `create_secret` and
   `delete_secret` exist, engine credentials must be stored or rotated with local commands, never sent through chat;
 - `list_apps`, `get_app`, `activate_app` and `deactivate_app` manage the factory's apps; `list_triggers`,
@@ -263,19 +316,24 @@ Do not run a slot task directly: it is unsupported, because it skips validation 
 
 ## Factory changes and deployment
 
-To improve the factory, launch an ordinary project on the allowed factory repo. Its brief must include
-`May edit: <paths>`; it works at the repo root. Harness files go in `.claude-flyte/{name}/` and need `git add -f`
-when they must be published. Until v1 the owner runs fast iteration: a change, gate-defining ones included (`_gates.py`, `_policy.py`,
-judge/contract/planner/arbiter prompts in `agent.py`, `standards/`, `profiles/`, `.github/`), merges once tests
-and independent QA pass. Only irreversible actions, extra spend, external publishing or credentials need
-the owner's `ask-human --approve`.
+The engine is a target repository like any other. Import it into the workspace as a project
+(`PYTHONPATH=src python ops/promote.py import <engine-url> projects/<name>`), then work and review it like any project. When it
+has passed, promote it with `deliver` ([Promotion](https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/architecture-repos.md#promotion)): the operator opens a
+pull request on the public repository, whose CI is rerun first, and the owner merges it. A project never pushes to
+the engine repository. When the work resolves a public issue, record its link on the workspace item when you file or
+launch it, and pass `--fixes <owner>/<repo>#N` to `deliver`, which writes `Fixes <owner>/<repo>#N` into the pull
+request body. After the owner-approved merge, confirm the public issue closed (close it on the owner's word if
+GitHub did not) and mark the workspace item Done with a link to the merged pull request. Only irreversible actions, extra spend, external publishing or credentials need
+the owner's `ask-human --approve`. To measure a modified copy against production before promoting it, benchmark it:
+[Benchmarking an engine candidate](https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/operating.md#benchmarking-an-engine-candidate).
 
-With `[deploy] auto = true`, `factory-deployer.deploy_if_changed` deploys merged changes to slots, their worker
-environments, factory, MCP and itself. The signed webhook triggers it for eligible default-branch pushes and
-CI/status events; polling reconciles missed events every 30 minutes with a webhook, five without. It checks
-CI and `factory/verifier`, skips pending/failing commits, retries a failed SHA three times and waits for a new
-commit thereafter. With auto disabled, scheduled ticks do nothing. Running projects keep their starting version.
-The deployed profile comes from the direction repo when configured, otherwise the engine tree.
+With `[deploy] auto = true`, `factory-deployer.deploy_if_changed` deploys the default branch of `[deploy] repo`
+once its CI has passed, to slots, their worker environments, factory, MCP and itself. The signed webhook triggers it
+for eligible default-branch pushes and CI/status events; polling reconciles missed events every 60 minutes when
+`webhook_secret` is set and `[deploy] webhook = true`, otherwise every five. It checks
+CI and `factory/verifier`, skips pending/failing commits and ones with no passing check, retries a failed SHA
+three times and waits for a new commit thereafter. With auto disabled, scheduled ticks do nothing. Running projects keep their starting version.
+The deployed profile comes from the direction repo when configured, otherwise the deployed tree.
 
 For deployment diagnostics, filter `list_runs(task_name="factory-deployer.deploy_if_changed", limit=5)` and
 read small logs. `factory.read_login_meter` is internal, as are sweep and
@@ -284,3 +342,35 @@ After a failed deploy, `run_task(name="factory-deployer.deploy_if_changed")` (no
 waiting for the next tick; read the result with `get_run_io`.
 `ops/deploy_*.py` are for first install/emergencies; rollback uses `ops/deploy_factory.py --ref <older commit>`
 from that commit's checkout. Report or fix failed deploys through the factory.
+
+## Engineering judgement versus owner decisions
+
+When a session or the person's work raises an engineering ask, answer it by asking what is right, not only by choosing
+among the listed options; the right answer may be none of them. Never choose a waiver, a lowered threshold, a removed
+rule or a skipped test to make a check pass. Relay to the person only: spend, credentials, irreversible or external
+actions, publishing, merges outside the sandbox, and product direction that is not yet set.
+
+Routine operator actions are done, then reported, without asking: stop a stuck run and relaunch it; reorder the queue;
+pin a project to the engine that has quota; fix a profile value that blocks a deploy; open pull requests for pushed
+branches; file problem issues. Tell the person what you decided and why.
+
+## Opening pull requests for factory branches
+
+When `factory.status` reports a pushed branch (`factory/<name>`) without a pull request, open one with the GitHub
+tools. Write a problem-first description: the problem, what changed, how it was checked and what is not covered. Then
+watch CI and report failures; do not merge without the person's word.
+
+## Profile changes and deploys
+
+The profile lives in the workspace repo as `profile.toml`. The deployer validates the `[direction]` profile with both
+the running deployer and the engine version being deployed. So a new key goes in only after the engine pull request
+adding it is deployed, and a retired key leaves the profile first. After any merge or profile edit, check the newest
+`factory-deployer.deploy_if_changed` run and its logs. A push to the direction repo triggers a tick through the
+webhook. The deployer refuses to change its own `[direction]`, so moving onto it or changing it needs one deploy run by
+the person: give them the bootstrap's `--redeploy` command with their values filled in
+([references/setup.md](references/setup.md), First deploy), and do not try it through the factory.
+
+## Related commands
+
+`/since` summarizes everything since the person's last message (or the last check-in in a fresh chat). It is the
+`since` skill, installed beside this one.

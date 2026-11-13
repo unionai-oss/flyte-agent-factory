@@ -210,13 +210,31 @@ class _Timeline:
         self.passed_at: float | None = None
         #: The commit the last review round judged: where the next round's changes start.
         self.last_round_head = ""
+        #: The latest review round's judges: judge -> {outcome, reason, engine, attempts, carried}.
+        self.judges: dict[str, dict[str, Any]] = {}
+        #: Every time a judge returned no verdict (retries included), by judge and by engine.
+        self.no_verdict: dict[str, dict[str, int]] = {"by_judge": {}, "by_engine": {}}
+        #: judge -> its PASS/ADVISORY on a commit whose review round ended undecided (`_review._Carried`
+        #: fields), so the re-run asks only the judges still missing, across a restart too.
+        self.carried: dict[str, dict[str, Any]] = {}
         self._image_defects: list[str] = []
         self._metrics_saved = ""
         self._metrics_save_failed = False
         self._restore_metrics()
 
-    def phase(self, kind: str, *, round_: int = 0, limited_until: float | None = None) -> None:
-        """Where the project is, for the dashboard's status line; the clock restarts when it changes."""
+    def phase(
+        self,
+        kind: str,
+        *,
+        round_: int = 0,
+        limited_until: float | None = None,
+        paused: dict[str, Any] | None = None,
+    ) -> None:
+        """Where the project is, for the dashboard's status line; the clock restarts when it changes.
+
+        `paused` is `_router.Paused.as_dict()` while the author waits on a limit: who, until when, and why
+        not the other engines. `factory.status` returns it as is.
+        """
         if (kind, round_) != (self._phase["kind"], self._phase["round"]):
             self._phase = {"kind": kind, "since": time.time(), "round": round_, "limited_until": None}
             self.phase_history = _bounded_history([*self.phase_history, [kind, self._phase["since"]]])
@@ -226,6 +244,18 @@ class _Timeline:
             self.review_round = round_
             self.review_started_at = self._phase["since"]
         self._phase["limited_until"] = limited_until
+        self._phase["paused"] = paused
+        self._dirty = True
+
+    def record_judge_outcome(self, judge: str, **fields: Any) -> None:
+        """Record how `judge` ended this round (`outcome`, `reason`, `engine`, `attempts`, `carried`)."""
+        self.judges[judge] = {**fields, "reason": str(fields.get("reason", ""))[:200]}
+        self._dirty = True
+
+    def count_no_verdict(self, judge: str, engine: str) -> None:
+        """Count one judge call that returned no verdict, under the judge and the engine it ran on."""
+        for key, name in (("by_judge", judge), ("by_engine", engine or "unknown")):
+            self.no_verdict[key][name] = self.no_verdict[key].get(name, 0) + 1
         self._dirty = True
 
     def _metrics_path(self) -> Path:
@@ -244,13 +274,19 @@ class _Timeline:
             "round_scores": self.round_scores,
             "passed_at": self.passed_at,
             "last_round_head": self.last_round_head,
+            "judges": self.judges,
+            "no_verdict": self.no_verdict,
+            "carried": self.carried,
         }
 
-    def _save_metrics(self) -> None:
-        """Write the metrics state when it changed, under STATE_ROOT so it rides the checkpoint."""
+    def _save_metrics(self) -> bool:
+        """Write the metrics state when it changed, under STATE_ROOT so it rides the checkpoint.
+
+        Return False when it could not be written.
+        """
         text = json.dumps(self._metrics_state(), sort_keys=True)
         if text == self._metrics_saved:
-            return
+            return True
         try:
             self._metrics_path().parent.mkdir(parents=True, exist_ok=True)
             _write_atomic(self._metrics_path(), json.loads(text))
@@ -259,8 +295,9 @@ class _Timeline:
             if not self._metrics_save_failed:
                 _log_line(f"[timeline] could not save the metrics state: {type(e).__name__}: {e}", err=True)
             self._metrics_save_failed = True
-            return
+            return False
         self._metrics_saved = text
+        return True
 
     def _restore_metrics(self) -> None:
         """Take back the metrics state of the run before a restart; the restart is one more phase entry.
@@ -286,6 +323,19 @@ class _Timeline:
         self.metric_labels, self.verdicts, self.round_scores = labels, verdicts, round_scores
         _policy.knobs_seen.update(knobs)
         self.phase_history = _bounded_history([*history, ["restarting", self.started_at]])
+        # Newer keys: a state file from before them is still good.
+        try:
+            self.judges = {str(j): dict(v) for j, v in saved["judges"].items()}
+            self.no_verdict = {
+                key: {str(k): int(n) for k, n in saved["no_verdict"][key].items()}
+                for key in ("by_judge", "by_engine")
+            }
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
+        try:
+            self.carried = {str(j): dict(v) for j, v in saved["carried"].items()}
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
 
     def metric_label(self, **label: Any) -> None:
         for field, limit in (("file", 300), ("title", 200), ("evidence_kind", 200)):
@@ -660,6 +710,8 @@ class _Timeline:
                 # The checkpointed pass record survives score reset and timeline truncation.
                 "passed_round": _session_config._load_pass(),
                 "open": list(self.open_findings),
+                "judges": {j: dict(v) for j, v in self.judges.items()},
+                "no_verdict": {key: dict(counts) for key, counts in self.no_verdict.items()},
                 "converging": self.converging,
                 "rulings": len(_session_config._rulings),
             },

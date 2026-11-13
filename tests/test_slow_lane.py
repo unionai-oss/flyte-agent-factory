@@ -268,12 +268,25 @@ def test_a_repository_without_commits_has_no_history(tmp_path):
     assert _slow_lane.pack_history(tmp_path) == b""
 
 
+def test_a_subdirectory_project_has_no_history_of_its_own(tmp_path):
+    # HEAD of the enclosing repository holds other paths: the container commits the packed tree instead.
+    repo, _ = _committed_repo(tmp_path)
+    sub = repo / "projects" / "p"
+    sub.mkdir(parents=True)
+    (sub / "f.txt").write_text("x\n")
+    _git(repo, "add", ".")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "p")
+
+    assert _slow_lane.pack_history(sub) == b""
+    assert _slow_lane.pack_history(repo) != b""
+
+
 def test_the_lane_task_takes_the_history_beside_the_tree():
     from flyte.io import File
 
     inputs = _slow_lane.task._inputs
     assert inputs is not None
-    assert inputs["tree"] is File and inputs["history"] is File
+    assert inputs["tree"] is File and inputs["history"] is File and inputs["mode"] is str
 
 
 def test_unpacked_tree_runs_pytest_with_the_slow_marker(tmp_path):
@@ -392,6 +405,40 @@ def test_the_lane_script_restores_head_so_git_sees_the_same_tree_as_the_pod(tmp_
 
     assert (out / "code").read_text() == "0", (out / "tail").read_text()
     assert (tmp_path / "git-report.txt").read_text() == f"{sha}\n M a.txt\n?? b.txt\n"
+
+
+def _command_lane(tmp_path: Path, command: list[str], lock: bool) -> Path:
+    inputs = _lane_tree(tmp_path, {})
+    if lock:
+        (tmp_path / "src-tree" / "uv.lock").write_text("")
+        with tarfile.open(inputs / "tree", "w:gz") as tar:
+            for path in sorted((tmp_path / "src-tree").rglob("*")):
+                tar.add(path, arcname=path.relative_to(tmp_path / "src-tree").as_posix(), recursive=False)
+    (inputs / "pytest_args").write_text(json.dumps(command))
+    out = tmp_path / "out"
+    env = {**os.environ, "PATH": f"{_fake_bin(tmp_path, True)}{os.pathsep}{os.environ['PATH']}"}
+    env["TMPDIR"] = str(tmp_path)
+    (inputs / "mode").write_text("command")
+    cmd = [*_slow_lane.LANE_COMMAND, str(inputs), str(out), "file:///nonexistent", "0" * 64, "12000"]
+    assert subprocess.run(cmd, env=env, capture_output=True, text=True).returncode == 0
+    return out
+
+
+def test_the_lane_script_runs_a_command_and_reports_its_exit_code(tmp_path):
+    command = ["bash", "-c", 'echo "$AGENT_FACTORY_LANE_JUNIT" > "$PWD/../junit-path"; echo hi; exit 3']
+    out = _command_lane(tmp_path, command, lock=False)
+
+    assert (out / "code").read_text() == "3"
+    assert "hi" in (out / "tail").read_text()
+    assert not (tmp_path / "uv.log").exists(), "no uv.lock: nothing to sync"
+
+
+def test_the_lane_script_syncs_a_command_project_that_has_a_lock(tmp_path):
+    out = _command_lane(tmp_path, ["bash", "-c", "command -v python"], lock=True)
+
+    assert (out / "code").read_text() == "0"
+    assert "sync --frozen" in (tmp_path / "uv.log").read_text()
+    assert "/.venv/bin/python" in (out / "tail").read_text()
 
 
 def test_the_lane_script_keeps_only_the_tail_of_a_long_output(tmp_path):
@@ -950,3 +997,24 @@ def test_a_bug_in_the_poll_is_not_taken_for_a_failed_call():
 
     with pytest.raises(AttributeError):
         asyncio.run(_slow_lane._settle(never(), finished, poll_s=0.01, grace_s=0.01))
+
+
+def test_submit_runs_the_async_submission_to_completion(monkeypatch):
+    seen = []
+
+    async def submit_async(pytest_args, interruptible, result, mode):
+        seen.append((pytest_args, interruptible, result, mode))
+        return 0, "tail", "<testsuites/>"
+
+    monkeypatch.setattr(_slow_lane, "_submit_async", submit_async)
+    assert _slow_lane._submit(["-k", "x"], True, None, "command") == (0, "tail", "<testsuites/>")
+    assert seen == [(["-k", "x"], True, None, "command")]
+
+
+def test_a_command_that_cannot_start_exits_127_and_is_recorded(tmp_path, capsys):
+    result = tmp_path / "result.json"
+    missing = str(tmp_path / "no-such-program")
+    assert _slow_lane._run_local_command(None, [missing, "arg"], result) == 127
+    assert f"slow lane: cannot run {missing}:" in capsys.readouterr().err
+    # 127 is outside the codes a finished lane reports, so no completion record is written for it.
+    assert not result.exists()

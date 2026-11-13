@@ -6,9 +6,12 @@ import asyncio
 import re
 import time
 import traceback
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 import flyte
+import flyte.errors
 from flyte.io import Dir
 
 from flyte_agent_factory import (
@@ -29,7 +32,81 @@ from flyte_agent_factory import (
 )
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
-_VERDICT = re.compile(r"^VERDICT:\s*(PASS|FAIL)\s*$", re.MULTILINE | re.IGNORECASE)
+# One verdict per line, last line wins. Tolerates the markdown a model wraps around the line
+# (`**VERDICT:** PASS`, `**VERDICT: PASS**`, backticks, a quote or heading prefix), a `-` or dash for the
+# colon, trailing punctuation and one short parenthetical. A line that merely mentions both words is not
+# a verdict: the word must follow the separator directly, and nothing else may trail it.
+_VERDICT = re.compile(
+    r"^[ \t>#*_`]*VERDICT[*_`]*[ \t]*[:\-\u2013\u2014][*_`]*[ \t]*[*_`]*(PASS|FAIL)[*_`]*[ \t]*[.!]?"
+    r"[ \t]*(?:\([^()\n]{0,80}\))?[ \t]*[.!]?[*_`]*[ \t\r]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# What a judge round ended in. PASS, FAIL and ADVISORY (craft, not blocking) are decisions; the rest are not.
+PASS, FAIL, ADVISORY = "PASS", "FAIL", "ADVISORY"
+NO_VERDICT, DEFERRED, NOT_RUN = "NO_VERDICT", "DEFERRED", "NOT_RUN"
+#: Attempts at one judge that returned no verdict: the first and two retries.
+_NO_VERDICT_ATTEMPTS = 3
+#: A reply shorter than this whose first line starts the way a CLI or API error does is that error.
+_ERROR_ONLY_CHARS = 400
+#: How a CLI or API error begins. Only a reply whose first non-empty line starts this way is the error
+#: itself; a review that mentions a rate limit or an error, even at the start of a later line, is a review.
+_ERROR_START = re.compile(r"\[?(?:API Error|HTTP 429|You'?ve hit)", re.IGNORECASE)
+
+
+def _is_only_an_error(flat: str) -> bool:
+    """Return whether a stripped, non-empty reply is a tool or limit error rather than a review."""
+    first = flat.splitlines()[0]
+    if first.startswith(_usage.USAGE_LIMIT_MARK):
+        return True
+    return len(flat) < _ERROR_ONLY_CHARS and bool(_ERROR_START.match(first))
+
+
+def _classify_no_verdict(text: str) -> str:
+    """Return why a judge's text holds no verdict: no output, turn limit, tool or limit error, or unparseable.
+
+    A call that raised a timeout never gets here: that is NOT_RUN with reason `timeout` (see `_one_judge`).
+    """
+    flat = (text or "").strip()
+    if not flat or flat == _reviewer._NO_FINAL_MESSAGE:
+        return "no output"
+    # On a turn limit the CLI may exit 0 and the "text" is its raw result JSON.
+    if "error_max_turns" in flat:
+        return "turn limit"
+    if _is_only_an_error(flat):
+        return "tool or limit error"
+    return "unparseable"
+
+
+@dataclass
+class _JudgeOutcome:
+    """How one judge ended this round: what `_evaluate` decides from, and the timeline shows."""
+
+    outcome: str
+    reason: str = ""
+    engine: str = ""
+    attempts: int = 1
+    #: DEFERRED only: the router's time to ask again, and the untruncated limit text.
+    retry_at: float | None = None
+    limit_text: str = ""
+    carried: bool = False
+
+
+@dataclass
+class _Carried:
+    """A PASS/ADVISORY judge of a round that was not decided, kept for the re-run on the same commit."""
+
+    sha: str
+    round: int
+    outcome: str
+    report: str
+    nonblocking: list[str] = field(default_factory=list)
+    unverified: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+
+
+#: A carried judge's report and item lists are bounded: they live in the metrics file.
+_CARRIED_REPORT_CHARS, _CARRIED_ITEMS = 8000, 30
 
 
 #: The reviewers, one per concern. Separate agents rather than one asked to
@@ -674,12 +751,37 @@ def _evidenced_findings(text: str) -> tuple[list[str], list[str]]:
         re.MULTILINE,
     )
     findings = blocks[1:]
-    if not findings and re.search(r"^VERDICT:\s*FAIL", text, re.MULTILINE | re.IGNORECASE):
+    if not findings and any(m.group(1).upper() == "FAIL" for m in _VERDICT.finditer(text)):
         findings = [text]
     # A finding the reviewer itself labelled minor stays advisory however good its evidence is.
     minor = re.compile(r"(?:minor|nit|advisory|non-?blocking):", re.IGNORECASE)
     blocking = [b for b in findings if evidence.search(b) and not minor.match(b)]
     return (blocking, [b for b in findings if b not in blocking])
+
+
+def _find_usable_result_gap(text: str, advisory_craft: bool) -> str:
+    """Return "" when a judge's text can be used, else why not (see `_classify_no_verdict`).
+
+    A verdict line makes any judge's text usable. An advisory craft needs none: any report is usable, but
+    an empty one, the raw result of a turn limit, or a short reply that is only a tool or limit error
+    means craft did not run.
+    """
+    if _VERDICT.search(text):
+        return ""
+    reason = _classify_no_verdict(text)
+    if advisory_craft:
+        return reason if reason in ("no output", "turn limit", "tool or limit error") else ""
+    return reason
+
+
+def _pick_other_engine(used: str) -> str | None:
+    """Return an engine to retry a judge on other than `used`, or None to retry on the same routing.
+
+    A hard pin never moves, and an exhausted engine would only refuse the call.
+    """
+    if _usage._hard_pins or not used:
+        return None
+    return next((e for e in _usage._author_engines() if e != used and not _usage._engine_exhausted(e)), None)
 
 
 async def _one_judge(
@@ -690,7 +792,6 @@ async def _one_judge(
     acceptance: str,
     round_: int,
     timeline: _timeline._Timeline,
-    unreviewed: list[str] | None = None,
     facts: str = "",
     unverified: list[str] | None = None,
     notes: str = "",
@@ -698,70 +799,117 @@ async def _one_judge(
     conflicts: list[str] | None = None,
     blocking: list[int] | None = None,
     new_reqs: list[str] | None = None,
+    outcomes: dict[str, _JudgeOutcome] | None = None,
 ) -> tuple[str, bool, str]:
     """Run one reviewer as a child action. Returns (judge, passed, findings).
 
-    A reviewer that cannot run is tried twice, because the usual cause is a pod
-    that did not schedule. If it still cannot run it does not hold a finished
-    project open -- but it is not a quiet pass either: its name goes into
-    `unreviewed`, and the session is told which concern nobody checked.
-    """
-    text = ""
-    setting = _policy.resolve("judge", round_)
-    for attempt in (1, 2):
-        try:
-            text, _ = await _reviewer._call_reviewer(
-                timeline=timeline,
-                purpose=judge,
-                round_=round_,
-                answer_only=True,
-                brief=_qa_prompt(
-                    judge,
-                    instruction,
-                    brief,
-                    acceptance,
-                    round_,
-                    facts,
-                    notes,
-                    _prior_findings.get(judge, ""),
-                    _reviewer._earlier_requirements(judge, round_),
-                    "\n".join(f"- {r}" for r in _session_config._rulings),
-                    _contract._contract,
-                    "\n".join(f"- {d}" for d in _inbox._directions),
-                ),
-                workdir=snapshot,
-                role="verify",
-                model=setting.model,
-                effort=setting.effort,
-                max_turns=120,
-            )
-            break
-        except Exception as e:  # noqa: BLE001 -- one broken reviewer must not sink the round
-            traceback.print_exc()
-            timeline.row(
-                "⚠️",
-                f"{_roles.display_role(judge)} review could not run (attempt {attempt}/2): "
-                f"{type(e).__name__}: {e}",
-            )
-            if _usage.USAGE_LIMIT_MARK in str(e):
-                _reviewer._limited_reason[judge] = str(e).split(_usage.USAGE_LIMIT_MARK, 1)[1].strip()[:200]
-                break  # a second try minutes later meets the same limit
-    else:
-        if unreviewed is not None:
-            unreviewed.append(judge)
-        return judge, True, ""
-    if judge in _reviewer._limited_reason:
-        if unreviewed is not None:
-            unreviewed.append(judge)
-        return judge, True, ""
+    How the judge ended is recorded in `outcomes[judge]`; `_evaluate` decides the round from that.
 
-    advisory_craft = judge == "craft" and _policy.read("CRAFT_BLOCKING", "false").lower() != "true"
+    A reviewer that cannot run is tried twice, because the usual cause is a pod
+    that did not schedule. If it still cannot run it is not a pass: it is NOT_RUN, or DEFERRED on a
+    usage limit, and the round is not decided without it.
+    A reviewer that ran and returned no verdict is asked again, up to `_NO_VERDICT_ATTEMPTS` times in all,
+    on the other engine when there is one to use.
+    """
+    outcomes = outcomes if outcomes is not None else {}
+    display = _roles.display_role(judge)
+    setting = _policy.resolve("judge", round_)
+    advisory_craft = judge == "craft" and not _is_craft_blocking()
+    used: list[str] = []  # the engine of each call, from `_call_reviewer`'s own report
+    engine: str | None = None
+    for tries in range(1, _NO_VERDICT_ATTEMPTS + 1):
+        text: str | None = None
+        error: Exception | None = None
+        limit_text, retry_at = "", None
+        for attempt in (1, 2):
+            try:
+                text, _ = await _reviewer._call_reviewer(
+                    timeline=timeline,
+                    purpose=judge,
+                    round_=round_,
+                    answer_only=True,
+                    brief=_qa_prompt(
+                        judge,
+                        instruction,
+                        brief,
+                        acceptance,
+                        round_,
+                        facts,
+                        notes,
+                        _prior_findings.get(judge, ""),
+                        _reviewer._earlier_requirements(judge, round_),
+                        "\n".join(f"- {r}" for r in _session_config._rulings),
+                        _contract._contract,
+                        "\n".join(f"- {d}" for d in _inbox._directions),
+                    ),
+                    workdir=snapshot,
+                    role="verify",
+                    model=setting.model,
+                    effort=setting.effort,
+                    max_turns=120,
+                    on_engine=lambda name, _label: used.append(name),
+                    **({"engine": engine} if engine else {}),
+                )
+                break
+            except Exception as e:  # noqa: BLE001 -- one broken reviewer must not sink the round
+                traceback.print_exc()
+                error = e
+                timeline.row(
+                    "⚠️",
+                    f"{display} review could not run (attempt {attempt}/2): {type(e).__name__}: {e}",
+                )
+                if _usage.USAGE_LIMIT_MARK in str(e):
+                    # The whole text: the router's `; retry at HH:MM UTC` is at its end.
+                    limit_text = str(e).split(_usage.USAGE_LIMIT_MARK, 1)[1].strip()
+                    retry_at = getattr(e, "retry_at", None)
+                    break  # a second try minutes later meets the same limit
+        ran_on = used[-1] if used else ""
+        if text is None:
+            if limit_text:
+                outcomes[judge] = _JudgeOutcome(
+                    DEFERRED,
+                    reason=limit_text,
+                    engine=ran_on,
+                    attempts=tries,
+                    retry_at=retry_at,
+                    limit_text=limit_text,
+                )
+                timeline.row("⏸️", f"{display}: DEFERRED ({_dashboard._short(limit_text, 160)})")
+            else:
+                # A timeout is the one failure worth naming without its text: the text says nothing more.
+                timed_out = isinstance(error, (asyncio.TimeoutError, flyte.errors.TaskTimeoutError))
+                reason = "timeout" if timed_out else f"{type(error).__name__}: {error}"[:160]
+                outcomes[judge] = _JudgeOutcome(NOT_RUN, reason, ran_on, tries)
+                timeline.row("⚠️", f"{display}: NOT RUN ({reason})")
+            return judge, False, ""
+        reason = _find_usable_result_gap(text, advisory_craft)
+        if not reason:
+            break
+        timeline.count_no_verdict(judge, ran_on)
+        last = tries == _NO_VERDICT_ATTEMPTS
+        engine = None if last else _pick_other_engine(ran_on)
+        timeline.row(
+            "⚠️",
+            f"{display}: NO VERDICT ({reason}; attempt {tries}/{_NO_VERDICT_ATTEMPTS}"
+            + ("" if last else f", retrying{f' on {engine}' if engine else ''}")
+            + ")",
+        )
+    else:
+        # No verdict is not a pass: a reviewer that wandered off checked nothing. Nor is it a FAIL, which
+        # would cost the author a whole round of fixing what nobody found; `_evaluate` asks again.
+        outcomes[judge] = _JudgeOutcome(NO_VERDICT, reason, ran_on, _NO_VERDICT_ATTEMPTS)
+        return judge, False, _review_report(text or "(returned nothing)")
+
+    def record_outcome(outcome: str) -> None:
+        outcomes[judge] = _JudgeOutcome(outcome, "", ran_on, tries)
+
     if advisory_craft:
         timeline.row("ℹ️", f"judge-craft advisory: {_review_report(text)}")
         if nonblocking is not None:
             nonblocking.append(f"craft advisory: {_review_report(text)}")
         if blocking is not None:
             blocking.append(0)
+        record_outcome(ADVISORY)
         return judge, True, _review_report(text)
     if conflicts is not None and round_ > 1 and _reviewer._review_ledger:
         # Only where there were earlier requirements to conflict with; pass or fail alike.
@@ -791,7 +939,8 @@ async def _one_judge(
             if blocking is not None:
                 blocking.append(0)
             # The supervisor's verdict, recorded like any other: a FAIL without evidence counts as a PASS.
-            timeline.row("✅", f"{_roles.display_role(judge)}: PASS")
+            timeline.row("✅", f"{display}: PASS")
+            record_outcome(PASS)
             return judge, True, _review_report(text)
         for finding in evidenced:
             evidence = next((line for line in finding.splitlines() if "Evidence:" in line), "")
@@ -812,13 +961,7 @@ async def _one_judge(
 
     # The *last* verdict line: the prompt puts it last, and a reviewer quoting the
     # author (whose notes it now sees) must not have a quoted "VERDICT: PASS" win.
-    match = verdicts[-1] if verdicts else None
-    if match is None:
-        # No verdict is not a pass: a reviewer that wandered off checked nothing.
-        timeline.row("⚠️", f"{_roles.display_role(judge)}: no verdict, treating as FAIL")
-        if blocking is not None:
-            blocking.append(1)
-        return judge, False, _review_report(text or "(returned nothing)")
+    match = verdicts[-1]
     passed = match.group(1).upper() == "PASS"
     if blocking is not None:
         blocking.append(_blocking_count(text, passed))
@@ -828,8 +971,95 @@ async def _one_judge(
         unverified += [f"{judge}: {item}" for item in _unverified_lines(text)]
     if passed and nonblocking is not None:
         nonblocking += [f"{judge}: {item}" for item in _heading_lines(text, _NONBLOCKING)]
-    timeline.row("✅" if passed else "❌", f"{_roles.display_role(judge)}: {match.group(1).upper()}")
+    timeline.row("✅" if passed else "❌", f"{display}: {match.group(1).upper()}")
+    record_outcome(PASS if passed else FAIL)
     return judge, passed, _review_report(text)
+
+
+def _is_craft_blocking() -> bool:
+    """Return whether the craft judge's verdict blocks a round (CRAFT_BLOCKING), not only advises."""
+    return _policy.read("CRAFT_BLOCKING", "false").lower() == "true"
+
+
+def _take_carried(sha: str, timeline: _timeline._Timeline) -> dict[str, _Carried]:
+    """Return the judges whose verdict on `sha` an undecided round kept; drop them all if the commit moved.
+
+    They live on the timeline (`carried`), saved with its metrics, so a restart during the wait keeps them.
+    """
+    try:
+        carried = {name: _Carried(**kept) for name, kept in timeline.carried.items()}
+    except TypeError:
+        carried = {}
+        timeline.row("🔁", "all judges re-run: the carried verdicts could not be read")
+    if carried and any(kept.sha != sha for kept in carried.values()):
+        carried = {}
+        timeline.row("🔁", "all judges re-run: the commit changed since the undecided round")
+    if carried.get("craft") and carried["craft"].outcome == ADVISORY and _is_craft_blocking():
+        del carried["craft"]  # craft became blocking since: an advisory report is not its verdict
+    timeline.carried = {name: asdict(kept) for name, kept in carried.items()}
+    return carried
+
+
+def _keep_carried(
+    sha: str,
+    round_: int,
+    outcomes: dict[str, _JudgeOutcome],
+    reports: dict[str, str],
+    own: dict[str, tuple[list[str], list[str], list[str]]],
+    carried: dict[str, _Carried],
+    timeline: _timeline._Timeline,
+) -> None:
+    """Keep each PASS/ADVISORY judge for this round's re-run; a judge carried already keeps its round."""
+    for name, o in outcomes.items():
+        if o.outcome in (PASS, ADVISORY):
+            unverified, nonblocking, conflicts = own[name]
+            kept = carried.get(name) or _Carried(
+                sha,
+                round_,
+                o.outcome,
+                reports[name][:_CARRIED_REPORT_CHARS],
+                nonblocking=nonblocking[:_CARRIED_ITEMS],
+                unverified=unverified[:_CARRIED_ITEMS],
+                conflicts=conflicts[:_CARRIED_ITEMS],
+            )
+            timeline.carried[name] = asdict(kept)
+    if timeline.carried and not timeline._save_metrics():
+        timeline.row(
+            "⚠️",
+            "the carried verdicts could not be saved: a restart before the re-run re-runs every judge",
+        )
+
+
+def _raise_undecided(
+    missing: dict[str, _JudgeOutcome], round_: int, timeline: _timeline._Timeline
+) -> NoReturn:
+    """End a round with no decision: ReviewLimited when a usage limit is part of it, else ReviewIncomplete.
+
+    Nothing is recorded as a round (no verdict, score, ledger entry or contract change): the supervisor
+    asks again for the same round, and the judges that did decide are not asked again.
+    """
+    reasons = {n: f"{o.outcome}: {o.reason}" for n, o in missing.items()}
+    deferred = {n: o for n, o in missing.items() if o.outcome == DEFERRED}
+    nobody_ran = len(missing) == len(_JUDGES) and all(o.outcome == NOT_RUN for o in missing.values())
+    if nobody_ran:
+        timeline.row("⚠️", f"QA round {round_} undecided: none of the reviewers could run")
+    else:
+        timeline.row(
+            "⏸️" if deferred else "⚠️",
+            f"QA round {round_} undecided, no verdict from {', '.join(sorted(missing))}; "
+            "it re-runs for those judges only",
+        )
+    if deferred:
+        dated = sorted((o.retry_at, n) for n, o in deferred.items() if o.retry_at is not None)
+        # The text of the judge that frees first: with no retry_at the supervisor parses the reset from it.
+        first = deferred[dated[0][1]] if dated else next(iter(deferred.values()))
+        raise _reviewer.ReviewLimited(
+            first.limit_text, retry_at=dated[0][0] if dated else None, missing=reasons
+        )
+    if nobody_ran:
+        # Nobody looked. Passing here would let a cluster blip approve every DONE.
+        raise _reviewer.ReviewUnavailable("none of the reviewers could run")
+    raise _reviewer.ReviewIncomplete(reasons)
 
 
 async def _evaluate(
@@ -845,7 +1075,7 @@ async def _evaluate(
     """
     _usage._metering_round = round_
     timeline.row("🔍", f"QA round {round_}: {len(_JUDGES)} reviewers")
-    _reviewer._limited_reason.clear()
+    timeline.judges.clear()
     await _usage._read_meters(timeline)
     await timeline.flush(force=True)
     try:
@@ -853,6 +1083,7 @@ async def _evaluate(
         # Read before uploading, so the push fact describes the uploaded commit.
         _, reviewed_head = await _checkpoint._git_out(workspace, "rev-parse", "HEAD")
         timeline.reviewed_sha = reviewed_head
+        carried = _take_carried(reviewed_head, timeline)
         snapshot = await _checkpoint._upload_workspace(workspace)
     except Exception as e:  # cannot review what cannot be uploaded
         timeline.row("⚠️", f"QA round {round_} could not snapshot: {type(e).__name__}: {e}")
@@ -882,14 +1113,17 @@ async def _evaluate(
         )
         if code == 0:
             round_files = sorted(p for p in diff.split("\0") if p)
-    timeline.last_round_head = reviewed_head
-    unreviewed: list[str] = []
     unverified: list[str] = []
     nonblocking: list[str] = []
     conflicts: list[str] = []
     blocking: list[int] = []
     new_reqs: list[str] = []
+    outcomes: dict[str, _JudgeOutcome] = {}
+    # Each judge collects its own items, so a PASS judge's can be carried to a re-run of the round.
+    own: dict[str, tuple[list[str], list[str], list[str]]] = {name: ([], [], []) for name, _ in _JUDGES}
     await _contract._load_or_freeze_contract(snapshot, brief, acceptance, timeline)
+    # After the contract: a limit while freezing it leaves the round undecided, and its head with it.
+    decided_head, timeline.last_round_head = timeline.last_round_head, reviewed_head
     facts = await _review_facts()
     gate_results = workspace / ".claude-flyte" / _session_config._project_name / "standards-results.json"
     if gate_results.is_file():
@@ -900,6 +1134,7 @@ async def _evaluate(
     notes = ""
     push = await _push_fact(workspace, reviewed_head)
     facts = f"{facts}\n{push}" if facts else push
+    to_run = [(name, instruction) for name, instruction in _JUDGES if name not in carried]
     results = await asyncio.gather(
         *(
             _one_judge(
@@ -910,49 +1145,80 @@ async def _evaluate(
                 acceptance,
                 round_,
                 timeline,
-                unreviewed,
                 facts,
-                unverified,
+                own[name][0],
                 notes=notes,
-                nonblocking=nonblocking,
-                conflicts=conflicts,
+                nonblocking=own[name][1],
+                conflicts=own[name][2],
                 blocking=blocking,
                 new_reqs=new_reqs,
+                outcomes=outcomes,
             )
-            for name, instruction in _JUDGES
+            for name, instruction in to_run
         ),
         return_exceptions=True,
     )
 
-    failed: list[str] = []
-    for result in results:
+    reports: dict[str, str] = {}
+    for (name, _), result in zip(to_run, results, strict=True):
         if isinstance(result, BaseException):
-            timeline.row("⚠️", f"a reviewer raised: {type(result).__name__}")
+            timeline.row("⚠️", f"{_roles.display_role(name)}: NOT RUN (raised {type(result).__name__})")
+            outcomes[name] = _JudgeOutcome(NOT_RUN, f"raised {type(result).__name__}")
+        else:
+            reports[name] = result[2]
+    for name, kept in carried.items():
+        outcomes[name] = _JudgeOutcome(kept.outcome, carried=True)
+        reports[name] = kept.report
+        own[name] = (list(kept.unverified), list(kept.nonblocking), list(kept.conflicts))
+        # Not rerun, so say so here: this is the row a reader of the timeline finds for the judge.
+        if kept.outcome == ADVISORY:
+            timeline.row(
+                "ℹ️",
+                f"judge-craft advisory (carried from round {kept.round}, same commit): {kept.report}",
+            )
+        else:
+            timeline.row(
+                "✅", f"{_roles.display_role(name)}: PASS (carried from round {kept.round}, same commit)"
+            )
+    for name, _ in _JUDGES:
+        unverified += own[name][0]
+        nonblocking += own[name][1]
+        conflicts += own[name][2]
+        o = outcomes[name]
+        timeline.record_judge_outcome(
+            name, outcome=o.outcome, reason=o.reason, engine=o.engine, attempts=o.attempts, carried=o.carried
+        )
+
+    missing = {n: o for n, o in outcomes.items() if o.outcome in (NO_VERDICT, DEFERRED, NOT_RUN)}
+    if missing and not any(o.outcome == FAIL for o in outcomes.values()):
+        # Nothing failed, but not every required judge decided: never a pass, and not a round either.
+        _keep_carried(reviewed_head, round_, outcomes, reports, own, carried, timeline)
+        timeline.last_round_head = decided_head  # the round that decides still reports what changed since
+        _raise_undecided(missing, round_, timeline)
+
+    failed: list[str] = []
+    for name, _ in _JUDGES:
+        outcome = outcomes[name].outcome
+        findings = reports.get(name, "")
+        passed = outcome in (PASS, ADVISORY)
+        if outcome in (NO_VERDICT, DEFERRED, NOT_RUN):
+            # Another judge failed, so the round is decided; the author is told who is still unheard.
+            failed.append(f"### {name} reviewer: {outcome.replace('_', ' ')} ({outcomes[name].reason})")
             continue
-        judge, passed, findings = result
-        if judge not in unreviewed:
-            if passed:
-                for path in changed_files:
-                    timeline.metric_label(kind="judge", round=round_, name=judge, verdict="PASS", file=path)
-            else:
-                timeline.metric_label(kind="judge", round=round_, name=judge, verdict="FAIL", file="")
+        if passed:
+            for path in changed_files:
+                timeline.metric_label(kind="judge", round=round_, name=name, verdict="PASS", file=path)
+        else:
+            timeline.metric_label(kind="judge", round=round_, name=name, verdict="FAIL", file="")
         # Only a failing judge's findings carry forward: a passing judge's text holds
         # nothing blocking, and replaying it as "still blocking" invents new gates.
-        if judge in unreviewed:
-            pass  # could not run: keep what it said the round before
-        elif not passed and findings.strip():
-            _prior_findings[judge] = findings
-            _reviewer._review_ledger.append((round_, judge, findings))
+        if not passed and findings.strip():
+            _prior_findings[name] = findings
+            _reviewer._review_ledger.append((round_, name, findings))
         elif passed:
-            _prior_findings.pop(judge, None)
+            _prior_findings.pop(name, None)
         if not passed:
-            failed.append(f"### {judge} reviewer\n\n{findings}")
-    if len(unreviewed) == len(_JUDGES):
-        # Nobody looked. Passing here would let a cluster blip approve every
-        # DONE; the partial case below is different, because somebody did.
-        if all(j in _reviewer._limited_reason for j in unreviewed):
-            raise _reviewer.ReviewLimited(next(iter(_reviewer._limited_reason.values()), ""))
-        raise _reviewer.ReviewUnavailable("none of the reviewers could run")
+            failed.append(f"### {name} reviewer\n\n{findings}")
     conflict_note = ""
     conflicts_block = False
     # Three judges often report the same conflict word for word; it is one conflict.
@@ -1030,6 +1296,9 @@ async def _evaluate(
         failed.append(f"### Design conflicts\n\n{conflict_note}")
     timeline.open_findings = _dashboard.finding_titles("\n\n".join(failed))
     verdict = "PASS" if not failed else "FAIL"
+    if timeline.carried:
+        timeline.carried.clear()  # decided: the next round judges afresh, after a restart too
+        timeline._save_metrics()
     timeline.verdicts.append(
         {
             "round": round_,
@@ -1043,9 +1312,9 @@ async def _evaluate(
     if timeline.issues:
         timeline.issues.milestone(f"review-{round_}", _issues.review_body(round_, verdict, sum(blocking)))
     if not failed:
-        caveat = _unreviewed_caveat(unreviewed)
+        caveat = ""
         if unverified:
-            caveat = (caveat + " " if caveat else "") + (
+            caveat = (
                 "Reviewers could not reach, and so did not verify: "
                 + "; ".join(unverified)
                 + ". Say in your `ask-human` summary which evidence you committed for each."
@@ -1138,13 +1407,3 @@ def _stalled(scores: list[int]) -> bool:
     it decides only when the planner gives no verdict.
     """
     return len(scores) >= 3 and scores[-1] >= scores[-3]
-
-
-def _unreviewed_caveat(judges: list[str]) -> str:
-    """Return what a pass must admit when some reviewers never ran. "" when all did."""
-    if not judges:
-        return ""
-    return (
-        f"The {', '.join(sorted(judges))} reviewer(s) could not run at all, so that part of "
-        "the work was NOT independently checked. Say so plainly in your `ask-human` summary."
-    )

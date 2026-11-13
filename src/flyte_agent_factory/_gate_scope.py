@@ -6,7 +6,7 @@ import re
 import shlex
 from pathlib import Path, PurePosixPath
 
-from . import _gardening, _waivers
+from . import _delivery, _gardening, _waivers
 
 #: Harness files whose every byte is the harness's.
 _HARNESS_FILES = {".mcp.json"}
@@ -27,13 +27,23 @@ def _glob_match(path: str, pattern: str) -> bool:
     return re.fullmatch(regex, path) is not None
 
 
+def _manifest_path(name: str, layout: str) -> str:
+    """Where the project's `promote.toml` is in the repository.
+
+    The operator's import wrote it: it names the target and the commit the review's diff starts at, so a
+    session that could edit it could choose its own diff.
+    """
+    prefix = {"workspace": f"projects/{name}/", "sandbox": f"{name}/"}.get(layout, "")
+    return prefix + _delivery.FILE
+
+
 def _classify_scope(
     path: str, name: str, brief: str, owned: set[str] | None = None, layout: str = "sandbox"
 ) -> str:
     """`ok`, `flag` (advisory) or `block` for one changed path.
 
-    `waivers.toml`, `gardening.toml` and everything under `standards/` are the owner's and always block,
-    whatever the brief permits.
+    `waivers.toml`, `gardening.toml`, everything under `standards/` and the project's `promote.toml` are the
+    owner's (or the operator's) and always block, whatever the brief permits.
 
     In the root layout scope is exactly the brief's `May edit:` paths plus harness state: `<name>/`
     grants nothing there, because the project name may be a real top-level directory (`src`). The
@@ -41,6 +51,8 @@ def _classify_scope(
     `.gitkeep`, other projects) and everything outside it is blocked, never merely flagged.
     """
     if path in (_waivers.FILE, _gardening.FILE) or PurePosixPath(path).parts[:1] == (STANDARDS_DIR,):
+        return "block"
+    if path == _manifest_path(name, layout):
         return "block"
     permissions = " ".join(
         re.findall(r"^[ \t]*(?:[-*][ \t]*)?May edit:[ \t]*(.*)$", brief, re.MULTILINE | re.IGNORECASE)

@@ -132,6 +132,13 @@ def _suite_profile_survives_every_test():
     os.environ.pop("AGENT_FACTORY_PROFILE_TOML", None)
 
 
+@pytest.fixture(autouse=True)
+def _not_inside_the_run_that_runs_the_tests(monkeypatch):
+    """A factory pod is itself a Flyte run: its run id would send lookups (`_gate_tests._run_image`) to the
+    real cluster. Tests run as CI does, outside a run; one that needs a run sets its own id."""
+    monkeypatch.delenv("FLYTE_INTERNAL_EXECUTION_ID", raising=False)
+
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -168,6 +175,16 @@ def _roles_come_from_the_package(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(
         _session_setup, "AGENT_ROLES_DIR", str(tmp_path_factory.getbasetemp() / "no-image-roles")
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_workspace_env(monkeypatch):
+    """Undo AGENT_FACTORY_WORKSPACE before every test.
+
+    `_session_setup._export_runtime_env` writes it straight into os.environ, so without this a test reads
+    the workspace an earlier test on the same worker exported.
+    """
+    monkeypatch.delenv("AGENT_FACTORY_WORKSPACE", raising=False)
 
 
 @pytest.fixture

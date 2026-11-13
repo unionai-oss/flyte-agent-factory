@@ -5,6 +5,7 @@ import dataclasses
 import json
 import re
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -75,7 +76,8 @@ def section_titles(page: str) -> list[str]:
         (lambda t: t.phase("building"), "building"),
         (lambda t: t.phase("checks"), "checks"),
         (lambda t: t.phase("review", round_=2), "review round 2 of"),
-        (lambda t: t.phase("limited", limited_until=1_700_000_000), "limited until 22:13 UTC"),
+        # Not today, so the date is shown (`test_phase_label_shows_date_when_not_today`).
+        (lambda t: t.phase("limited", limited_until=1_700_000_000), "limited until Tue 14 Nov 22:13 UTC"),
         (lambda t: t.phase("limited"), "limited (reset time not shown)"),
         (lambda t: t.phase("done"), "done"),
         (lambda t: t.phase("released"), "released (idle after passing review)"),
@@ -101,6 +103,42 @@ def test_each_phase_renders_in_the_status_line(setup, label):
         "released",
         "failed",
     }
+
+
+def test_phase_label_shows_date_when_not_today():
+    """A pause that ends today shows the clock; one that ends another day shows the day too."""
+    now = datetime(2026, 11, 15, 22, 0, tzinfo=timezone.utc).timestamp()
+    tonight = datetime(2026, 11, 15, 23, 50, tzinfo=timezone.utc).timestamp()
+    tomorrow = datetime(2026, 11, 16, 0, 40, tzinfo=timezone.utc).timestamp()
+    paused = {
+        "engine": "claude",
+        "until": tomorrow,
+        "others": {"codex": "pinned to claude"},
+        "needs_human": "",
+    }
+
+    def label(until, paused=paused):
+        return _dashboard.phase_label({"kind": "limited", "limited_until": until, "paused": paused}, now)
+
+    assert label(tonight, {**paused, "until": tonight}) == "limited until 23:50 UTC, waiting for claude"
+    assert label(tomorrow) == "limited until Mon 16 Nov 00:40 UTC, waiting for claude"
+    assert label(tomorrow, None) == "limited until Mon 16 Nov 00:40 UTC"
+    assert label(None, {**paused, "until": None}) == "limited (reset time not shown), waiting for claude"
+    # Nobody to wait for (a human needs to look): no engine is named.
+    assert label(tomorrow, {**paused, "engine": ""}) == "limited until Mon 16 Nov 00:40 UTC"
+    assert _dashboard.clock_or_date(datetime(2026, 11, 6, 9, 5, tzinfo=timezone.utc).timestamp(), now) == (
+        "Fri 6 Nov 09:05 UTC"
+    )
+
+    # The page and its data carry the same pause the label reads.
+    timeline = timeline_for()
+    later = time.time() + 3 * 86400
+    timeline.phase("limited", limited_until=later, paused={**paused, "until": later})
+    page = timeline.render()
+    assert f"limited until {_dashboard.clock_or_date(later, time.time())}, waiting for claude" in page
+    assert data_of(page)["phase"]["paused"] == {**paused, "until": later}
+    timeline.phase("building")  # the pause ends with the phase
+    assert data_of(timeline.render())["phase"]["paused"] is None
 
 
 def test_sections_come_in_the_agreed_order():

@@ -7,7 +7,7 @@ import asyncio
 import flyte
 import pytest
 
-from flyte_agent_factory import _session_config, _supervise_support, _timeline
+from flyte_agent_factory import _session_config, _supervise_support, _timeline, _usage
 from tests._wait import wait_for
 from tests.test_limit_resume import FINDINGS, WALL0, _clock, finish, rows, start, tick
 from tests.test_nudge import _Proc, _pump, _Queue
@@ -60,7 +60,12 @@ async def test_refused_carry_on_then_redraw_tail_is_not_running_again(monkeypatc
     proc.notice(text, now["t"])
     proc.last_output = now["t"] - 120
     await wait_for(lambda: rows(tl, "usage limit reached"))
-    now["t"] += 46 * 60  # past 30 min and past 8:40pm+60
+    # Past 30 min and past the stated reset + 60 s: 8:40pm today, or Oct 22 9am, which is now read as that
+    # date rather than an unknown time, so the resume waits for it.
+    wall = vars(_usage)["time"].time()  # the fake wall clock `_clock` installed
+    reset = _usage._reset_at(text, wall)
+    assert reset is not None
+    now["t"] += max(46 * 60, reset + 61 - wall)
     await wait_for(lambda: len(proc.submitted) == 2)
     # refusal: our carry-on echoes and the notice is redrawn (genuine refusal)
     now["t"] += 1

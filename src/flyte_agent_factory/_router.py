@@ -23,7 +23,7 @@ which the caller records (`limited_until`) or passes in (`exclude`). Rules, in o
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
@@ -42,7 +42,11 @@ DEFAULT_RETRY_S = 300.0
 
 
 class RouterDeferred(RuntimeError):
-    """Every engine is exhausted; the call was not made."""
+    """Every engine is exhausted; the call was not made. `retry_at` is when to ask again, if known."""
+
+    def __init__(self, message: str, retry_at: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_at = retry_at
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,8 @@ class Candidate:
     source: str | None = None
     age_s: float | None = None
     login: str | None = None
+    #: The meter's error (a dead login), shown as the reason the engine is out.
+    error: str = ""
 
     def describe(self) -> str:
         if self.state == "unavailable":
@@ -102,6 +108,8 @@ class Decision:
     #: What the caller resolved for the chosen engine; the router itself holds no model names.
     model: str = ""
     effort: str = ""
+    #: The engine a hard pin waits for; "" when the deferral is not a pin's.
+    pin: str = ""
 
     @property
     def deferred(self) -> bool:
@@ -152,6 +160,7 @@ def _candidate(engine: str, meter: Meter | None, available: bool, now: float) ->
         "source": meter.source,
         "age_s": max(0.0, now - meter.observed_at),
         "login": meter.account.partition(" ")[2] or meter.account,
+        "error": meter.error or "",
     }
     five, five_at = _window(meter.five_hour_pct, meter.five_hour_resets_at, now)
     week, week_at = _window(meter.weekly_pct, meter.weekly_resets_at, now)
@@ -207,11 +216,7 @@ def route(
     refused = tuple(e for e in exclude if e in order)
     candidates = tuple(
         # A refusal may predate any meter reading, so it has no known reset of its own.
-        Candidate(
-            c.engine, "exhausted", 0.0, c.five_hour_pct, c.weekly_pct, c.usable_at, c.source, c.age_s, c.login
-        )
-        if c.engine in refused and c.state != "exhausted"
-        else c
+        replace(c, state="exhausted", headroom=0.0) if c.engine in refused and c.state != "exhausted" else c
         for c in candidates
     )
     states = {c.engine: c for c in candidates}
@@ -228,7 +233,7 @@ def route(
     if pin:
         if pin not in order:
             if hard_pin:
-                return decide(None, f"pin {pin} not configured", pinned=True, retry_at=now + retry_s)
+                return decide(None, f"pin {pin} not configured", pinned=True, retry_at=now + retry_s, pin=pin)
             notes.append(f"pin {pin} ignored: not configured")
         elif pin in refused:
             pass
@@ -240,7 +245,7 @@ def route(
 
     if hard_pin and pin in order:
         retry_at = states[pin].usable_at or now + retry_s
-        return decide(None, "; ".join(notes), pinned=True, retry_at=retry_at)
+        return decide(None, "; ".join(notes), pinned=True, retry_at=retry_at, pin=pin)
 
     if not order:
         return decide(None, "no engines configured", retry_at=now + retry_s)
@@ -310,3 +315,111 @@ def _best(
         return decide(best.engine, "; ".join(notes) or "most headroom")
     best = min(pool, key=lambda c: order[c.engine])
     return decide(best.engine, "; ".join(notes) or "profile order")
+
+
+@dataclass(frozen=True)
+class Paused:
+    """What a deferred decision means for a person: who is awaited, until when, and why not the others."""
+
+    #: The engine waited for; "" when none can be waited for.
+    engine: str
+    #: Epoch seconds: the earliest known reset among the permitted engines. None when none is known.
+    until: float | None
+    #: Each other engine and why it is not used, e.g. "pinned to claude (ENGINE_FALLBACK unset)".
+    others: dict[str, str]
+    #: "" unless no permitted engine can run without someone acting; then what to do, engine by engine.
+    needs_human: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "engine": self.engine,
+            "until": self.until,
+            "others": self.others,
+            "needs_human": self.needs_human,
+        }
+
+
+#: Where each engine's credential is given, for the text that says how to unblock it.
+_FIX = {
+    "claude": "replace CLAUDE_CODE_OAUTH_TOKEN",
+    "codex": "replace the [secrets] codex_token secret",
+}
+_ADD = {"claude": "add the [secrets] claude_token secret", "codex": "add the [secrets] codex_token secret"}
+
+
+def _reset_text(at: float) -> str:
+    return f"{datetime.fromtimestamp(at, timezone.utc):%Y-%m-%d %H:%M} UTC"
+
+
+def paused(
+    decision: Decision,
+    *,
+    now: float,
+    fallback_key: str = "ENGINE_FALLBACK",
+    pin_why: str = "",
+    pin_fix: str = "",
+) -> Paused:
+    """Summarise a deferred `decision`. Pure: the timeline, status and human-needed text all read this.
+
+    Only an engine that is out for a limit can be waited for. One that is not configured, or whose login
+    was rejected, stays out until a person acts, so it never counts as a way forward.
+
+    `pin_why` says what holds the pin (a direction, the benchmark's hard_pin, the fallback setting) and
+    `pin_fix` what would lift it; the router knows only that the pin is hard, not where it came from.
+    """
+    pin_why = pin_why or f"{fallback_key} unset"
+    pin_fix = pin_fix or f'set {fallback_key}="allow"'
+    cands = {c.engine: c for c in decision.candidates}
+    pin = decision.pin
+    permitted = [pin] if pin else list(cands)
+
+    def needs_action(c: Candidate) -> bool:
+        return c.state == "unavailable" or (c.state == "exhausted" and bool(c.error))
+
+    waitable = [cands[e] for e in permitted if e in cands and not needs_action(cands[e])]
+    known = [c for c in waitable if c.usable_at is not None and c.usable_at > now]
+    awaited = min(known, key=lambda c: c.usable_at or 0.0) if known else (waitable[0] if waitable else None)
+    until = awaited.usable_at if awaited and awaited in known else None
+
+    others: dict[str, str] = {}
+    for e, c in cands.items():
+        if awaited and e == awaited.engine:
+            continue
+        if c.state == "unavailable":
+            others[e] = "not configured"
+        elif c.state == "exhausted" and c.error:
+            others[e] = f"login rejected: {c.error}"
+        elif pin and e != pin:
+            others[e] = f"pinned to {pin} ({pin_why})"
+        elif c.state == "exhausted":
+            others[e] = (
+                f"limited until {_reset_text(c.usable_at)}" if c.usable_at else "limited, reset unknown"
+            )
+        else:
+            others[e] = c.describe()
+    if pin and pin not in cands:  # a pin to an engine the router does not know of
+        others[pin] = "not configured"
+
+    needs_human = ""
+    if not waitable:
+        # A usable engine is listed too when the pin forbids it: lifting the pin is then the quickest fix.
+        needs_human = "; ".join(
+            _unblock(c, pin, cands, pin_fix)
+            for c in cands.values()
+            if c.state != "usable" or (pin and c.engine != pin)
+        )
+    return Paused(awaited.engine if awaited else "", until, others, needs_human)
+
+
+def _unblock(c: Candidate, pin: str, cands: Mapping[str, Candidate], pin_fix: str) -> str:
+    """One engine's line of the human-needed text: why it is out and what would unblock it."""
+    if c.state == "unavailable":
+        fix = f"no credential -- {_ADD[c.engine]}"
+        if c.engine == pin and any(o.state != "unavailable" for e, o in cands.items() if e != pin):
+            fix += f", or {pin_fix} to use the other engine"
+        return f"{c.engine}: {fix}"
+    if c.state == "exhausted" and c.error:
+        return f"{c.engine}: login rejected ({c.error}) -- {_FIX[c.engine]}"
+    if pin and c.engine != pin:
+        return f"{c.engine}: not used, pinned to {pin} -- {pin_fix} to use it"
+    return f"{c.engine}: {c.describe()}"

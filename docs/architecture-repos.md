@@ -4,8 +4,8 @@ Two kinds of repository. This replaces the three-repo split (engine, sandbox, di
 
 | Repository | Holds | Who writes it |
 |---|---|---|
-| Engine, [unionai-oss/flyte-agent-factory](https://github.com/unionai-oss/flyte-agent-factory) | the factory's code. Deployments run a pinned release | maintainers, through ordinary pull requests. Users never write to it |
-| Workspace template, `unionai-oss/flyte-agent-workspace` | the starting layout. Public | maintainers; also shipped in the engine at `src/flyte_agent_factory/_assets/workspace_template/` |
+| Engine, [unionai-oss/flyte-agent-factory](https://github.com/unionai-oss/flyte-agent-factory) | the factory's code. Deployments run its default-branch head once its CI passes | pull requests only: maintainers', and yours, promoted from a workspace project like any other target ([Promotion](#promotion)) |
+| Workspace template, bundled in the engine | the starting layout; a separate `unionai-oss/flyte-agent-workspace` repository is not published yet (optional, later) | maintainers; shipped in the engine at `src/flyte_agent_factory/_assets/workspace_template/` |
 | Workspace, `<user>/agent-workspace` | one user's standards, profile, projects and backlog | the user, and the factory in a project's own directory under `projects/` |
 
 ## The workspace
@@ -16,12 +16,14 @@ Two kinds of repository. This replaces the three-repo split (engine, sandbox, di
   set; `tests/test_workspace_template.py` checks that it parses. The engine's own `pyproject.toml` ruff and mypy settings
   are compared with the template's `standards/languages/configs/` by the `configs` gardening check
   (`_gardening.config_drift`).
-- `profile.toml` is the user's Union project and domain, engines and limits. The template ships only
-  `profile.example.toml`. The engine does not look for a `profile.toml` in the workspace: it loads
-  `profiles/<name>.toml` from its own checkout (or `AGENT_FACTORY_PROFILES_DIR`), or the path you pass. To have a
-  merge to the workspace deploy itself, point `[direction] repo` and `profile` at it (`profile = "profile.toml"`).
+- `profile.toml` is the user's Union project and domain, engines and limits; it is the workspace's only profile
+  name. The template ships only `profile.example.toml`, and the bootstrap (or you) copies it to `profile.toml`. The
+  engine does not look for a `profile.toml` in the workspace by itself: the first deploy passes it with
+  `--profile <clone>/profile.toml`. Only when the App exists, the file carries `[direction] repo` (the
+  workspace) and `profile = "profile.toml"`, so a merge to the workspace deploys itself from then on.
 - `waivers.toml` is owner-only, like `standards/`. `gardening.toml` is too: the engine reads it from the workspace's default branch, and
-  without it gardens the engine (see [architecture.md](architecture.md#gardening-targets)).
+  without it gardening has no targets (see
+  [architecture.md](architecture.md#gardening-targets)).
 - `projects/<name>/` is a project's directory, on branch `factory/<name>`, with one pull request per project. A
   repository whose root has a `projects/` directory is a *workspace*, and a project there works in
   `projects/<name>/`.
@@ -36,7 +38,7 @@ follow it:
 |---|---|---|
 | `workspace` | the repository's root has a `projects/` directory | `projects/<name>/` |
 | `sandbox` | the `[repo] project` repository, shared by several projects, without `projects/` | `<name>/` |
-| `root` | any other repository, such as the engine's | the whole repository |
+| `root` | any other repository | the whole repository |
 
 The scope check judges writes against the project's directory. The code and the example profile still call
 `[repo] project` the sandbox; with the workspace template it is the workspace.
@@ -44,44 +46,81 @@ The scope check judges writes against the project's directory. The code and the 
 ### Credentials
 
 `[secrets] deploy_key` is the deploy key of the `[repo] project` repository. `[repo_keys]` adds one deploy key per
-further `[repo]` entry, for example the engine repository for a factory-improvement launch. Every slot mounts all of
-them, but a session installs only the key of the repository it was launched on and the rest are dropped from its
-environment, so a session holds one key and can push only to that repository. A launch into the engine repository
-therefore pushes there, on `factory/<name>`.
+further `[repo]` entry. Every slot mounts all of them, but a session installs only the key of the repository it was
+launched on and the rest are dropped from its environment, so a session holds one key and can push only to that
+repository.
 
 A session's checkout also carries a `pre-push` hook (`_push_guard.install`) that refuses a push to any URL other than
 the launch repository's. It checks the URL only, not the branch. The key is the limit; the hook catches mistakes
 before they reach it.
 
-The factory does not merge its own work. The exception is the loop: with `[loop] merge = "on"` the loop task merges
-a pull request on the `[repo] factory` repository once review has passed and its checks hold
-([profiles/README.md](../profiles/README.md#loop)).
+A repository delivered to by promotion needs no key: the session works on the imported copy in the workspace, and
+the operator pushes ([Promotion](#promotion)). That includes the engine.
+
+The factory does not merge its own work. The one exception is opt-in: with `[loop] merge = "on"` the loop task merges
+its own pull request on its `[loop] repo` repository once review has passed and its checks hold
+([profiles/README.md](../profiles/README.md#loop)). It acts through the GitHub App, so it needs the App installed on
+that repository and does not apply to a public engine repository the owner cannot install an App on; there the
+owner merges the promotion pull request.
 
 ## Promotion
 
-Delivering to another repository happens outside the factory. A project whose brief has a `Delivers to:` line leaves
-its result as patches: `projects/<name>/patches/*.patch`, made with `git format-patch` against the target's default
-branch. The session that does the work produces them, and the pre-review gate's `factory:target-patches` check holds
-a DONE back until they are there. A project that does not deliver elsewhere leaves no patches.
+Another repository is a project like any other. Nothing in the factory pushes to it: the chat operator does, on your
+word, from a shell with your git and `gh` credentials, by running `ops/promote.py` (the factory MCP has no promote
+task). A shell user runs the same commands. They run from an engine checkout (`PYTHONPATH=src`); `projects/<name>`
+stands for the project's path in your workspace checkout, such as `../agent-workspace/projects/<name>`.
 
-`ops/promote.py` takes a reviewed project's patches and:
+1. **Import.** `python ops/promote.py import <target-url> projects/<name> [--ref BRANCH] [--path DIR] [--new]` writes
+   the target's files into the project, records the repository and the commit they came from in
+   `projects/<name>/promote.toml`, and makes one commit in the workspace. `--new` is for a repository that does not
+   exist yet. The operator owns `promote.toml`; the gate rejects a project change to it.
+2. **Work.** A project whose brief has a `Delivers to:` line edits that tree and commits it like any other project.
+   The pre-review gate runs the target's own CI commands and the changed-line coverage check on it
+   (`factory:target-ci`, `factory:target-coverage`). A changed Python line the tests do not cover passes when it is
+   listed in the project's `SUMMARY.md`.
+3. **Review.** As for every project. Only committed, reviewed content is delivered.
+4. **Deliver.** `python ops/promote.py deliver projects/<name> <branch> [--to URL] [--fork URL] [--title TEXT]
+   [--base SHA] [--dco | --no-dco] [--fixes OWNER/REPO#N] [--dry-run] [--replace]` replays the project's changes onto the
+   target's current default branch as one commit by the operator's git identity (`user.name` and `user.email`
+   must be set), scans what the commit adds (`ops/scan_public.py`), reruns the target's CI and coverage, and
+   pushes the branch and opens or updates a pull request with `SUMMARY.md` as its body. Changes made upstream
+   since the import are kept. A conflict, an empty result, a finding or a red check stops it before anything
+   is pushed. A target with no coverage command of its own is measured with pytest-cov (a uv project in its
+   own environment), so for one that is not a uv project the `python` on your PATH needs `pytest-cov`.
+   The rerun skips the workflow's machine-setup steps (`sudo`, `apt`, `npm install -g` and the like), so what they
+   install must already be on your machine: for the engine that is Playwright MCP with Chromium. Without
+   `gh` the report prints the pull request body to open it by hand. `--fork` pushes to your fork instead,
+   `--fixes` adds a `Fixes OWNER/REPO#N` line to the body for each public issue the change resolves (the
+   workspace item records that link), and `--dry-run` does everything but push. A branch that already exists
+   on the target (or the fork) is replaced only when its tip is your earlier promotion; otherwise `deliver`
+   refuses, and `--replace` overwrites it. A `--new` project is delivered once: after that, re-import it.
+5. **Merge.** The owner merges, or tells the operator to. `deliver` never merges. After the merge the operator
+   confirms each fixed public issue closed and marks the workspace item Done with a link to the merged pull request.
 
-1. clones the target and creates the branch from its current default branch,
-2. applies the patches with `git am --3way`; a conflict stops and reports,
-3. runs the target's own CI commands and the changed-line coverage check (`_target_ci`); a red check stops and reports. The CI commands run as in the gate (a runner-like
-   environment; a failure the unpatched base has too is not the project's, and a command that cannot run here is `NOT RUN`),
-4. pushes the branch and opens or updates a pull request with `gh`, or prints the compare URL.
+If the target asks for a DCO (a `.github/dco.yml`, a `DCO` file, or CONTRIBUTING or a workflow mentioning it),
+`deliver` adds `Signed-off-by` with the operator's identity at promotion; `--dco` and `--no-dco` override the
+detection, and `--no-dco` on such a target prints a warning that its DCO check will fail. The sign-off is the human's personal certification, made at promotion with the operator's (the owner's)
+git identity; the commits a session made in the sandbox stay attributed to the factory, and factory sessions never
+sign off. A CLA or a commit format in the target's rules is printed as a notice.
 
-The coverage check covers changed Python lines only. A changed line the tests do not cover passes when it is listed in
-the project's `projects/<name>/SUMMARY.md`; that file is also the body of the pull request.
+### Deploying the factory
 
-`--dry-run` does everything but push. Promotion runs with the caller's own git credentials (ssh agent, `gh` login),
-so "run from chat" means a chat client with a local shell that can run `ops/promote.py`. The factory MCP has no
-promote task, and a factory session holds a credential for the target only if the owner lists that repo's deploy key under `[repo_keys]` (every slot mounts those).
+Deploying is a setting, the same for every owner: with `[deploy] auto`, the deployer ships the default branch of
+`[deploy] repo` (default `[repo] factory`) once its CI has passed
+([profiles/README.md](../profiles/README.md#schema)). Developing the engine is a workspace project like any
+other, imported with `ops/promote.py import` and promoted as above; it needs no App, deploy key or webhook on the
+repository that is deployed. A modified engine copy in the workspace is deployed only for testing and benchmarking;
+production, the owner's own factory included, runs what was merged. Without the App on the deployed repository the
+deployer reads it anonymously and takes its deploy lock in `[direction] repo`, so `[direction]` is then required
+and the App must be installed on the direction repository.
 
-The factory's own improvement is a root-layout project on the engine repository: it is launched into the `[repo]
-factory` repository, which needs a `[repo_keys]` entry and a place in `[mcp] repos`, and works on `factory/<name>`
-there.
+The owner's own factory deploys from `unionai-oss/flyte-agent-factory` main, as every other owner's does from the
+public repository or a fork. The alternative, deploying from a private engine repository, would let a change reach
+production before it is public, with the factory's App on the deployed repository and no public CI. The cost of the
+public repository is latency: a change reaches production only after its promotion pull request passes the
+public CI and is merged, and the deployer reads that repository without the App, so it polls (`[deploy] webhook`
+off) and keeps its lock in `[direction] repo`. In exchange the owner runs exactly the documented setup, and every
+deployed commit is public, reviewed and green.
 
 ## The public template
 

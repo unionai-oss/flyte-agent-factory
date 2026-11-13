@@ -12,6 +12,7 @@ from flyte.io import Dir
 from flyte_agent_factory import (
     _checkpoint,
     _dashboard,
+    _delivery,
     _inbox,
     _policy,
     _reviewer,
@@ -193,12 +194,26 @@ _CONTRACT_ANY = re.compile(r"^[ \t>#*_`-]*C(\d+)[*_`]*[.):][*_`]*[ \t]+(.+)$")
 def _target_ci_facts(brief: str) -> str:
     """Return the commands the target repo's CI runs, as contract facts; "" for an ordinary project."""
     target = _target_ci.parse_target(brief)
-    checkout = _target_ci.find_checkout(_session_config._project_dir(), target) if target else None
-    if checkout is None:
+    if target is None:
         return ""
-    commands = "\n".join(f"- `{c.command}` ({c.origin})" for c in _target_ci.discover(checkout))
+    project = _session_config._project_dir()
+    found: list[_target_ci.Command] | None
+    try:
+        delivery = _delivery.load(project)
+        if delivery is not None:
+            _delivery.require_repo(delivery, target.repo)
+            with _delivery.target_checkout(project, delivery) as scratch:
+                found = _target_ci.discover(scratch)
+        else:
+            checkout = _target_ci.find_checkout(project, target)
+            found = _target_ci.discover(checkout) if checkout else None
+    except _delivery.DeliveryError:
+        return ""
+    if found is None:
+        return ""
+    commands = "\n".join(f"- `{c.command}` ({c.origin})" for c in found)
     return (
-        f"## The target repo's own CI (facts: this project delivers to {target.repo if target else ''})\n\n"
+        f"## The target repo's own CI (facts: this project delivers to {target.repo})\n\n"
         "The supervisor runs these in the target checkout before every review and the work fails if "
         "any does. Name them in the contract, and require 100% line and branch coverage of changed "
         "lines, or each uncovered line listed with a reason in SUMMARY.md.\n\n"
@@ -273,7 +288,7 @@ async def _freeze_contract(snapshot: Dir, brief: str, acceptance: str, timeline:
                 # first): wait for the reset like a review, rather than give up on the contract
                 # for the rest of the project (qa).
                 raise _reviewer.ReviewLimited(
-                    str(e).split(_usage.USAGE_LIMIT_MARK, 1)[1].strip()[:200]
+                    str(e).split(_usage.USAGE_LIMIT_MARK, 1)[1].strip(), retry_at=getattr(e, "retry_at", None)
                 ) from e
             timeline.row("⚠️", f"contract on {setting.model} failed: {type(e).__name__}: {str(e)[:160]}")
             setting = nxt

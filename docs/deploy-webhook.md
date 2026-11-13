@@ -1,9 +1,12 @@
 # GitHub webhook: deploy on push, issues as intake
 
 The `factory-webhook` app follows Union's [GitHub webhook example](https://www.union.ai/docs/v2/union/user-guide/build-apps/hybrid-graphs/).
-It verifies HMAC-SHA256 over the raw body, accepts pushes to the engine repository's default
+It verifies HMAC-SHA256 over the raw body, accepts pushes to the `[deploy] repo` default
 branch and the direction repository's configured branch (default branch when `ref` is unset),
-and submits the latest `factory-deployer.deploy_if_changed`. Repository aliases are accepted.
+and submits the latest `factory-deployer.deploy_if_changed`. Repository aliases are accepted. A repository without
+the App never sends pushes: set `[deploy] webhook = false` and the deployer polls every 5 minutes instead. When the
+App's webhook does cover the deploy repo, set `[deploy] webhook = true`: only then, with `webhook_secret`, does the deployer's
+reconcile slow from 5 to 60 minutes (`webhook_secret` alone leaves it at 5).
 A push usually arrives before its CI has finished, and the deployer skips a head whose CI is
 pending, so the app also accepts the events that say CI finished on such a branch head:
 `check_suite` with action `completed` and that `head_branch`; `status` in a final state
@@ -58,7 +61,8 @@ most two bodies are read at once (`MAX_CONCURRENT_BODIES`), so unsigned requests
    delivers this event for organization boards; a user-owned board gets no board event, so the planner
    keeps a three-minute poll there. Set `[board] node_id` (the board's `PVT_...` id) so moves on other
    boards of the same organization are ignored; without it they wake one spare, idempotent planner pass. Issue events (opened, reopened, edited, labeled, unlabeled) wake it through **Issues**.
-   Ensure the installation includes both the engine and direction repositories and Contents: read.
+   Ensure the installation includes the direction (workspace) repository and Contents: read, and the
+   `[deploy] repo` too when you can install the App there; a public engine without the App is polled instead.
    GitHub sends pushes for all branches; the handler filters to the branches described above.
    The deploy prints `GitHub webhook URL: <app public URL>/github` (in `ops/deploy_factory.py`'s
    output, or the `factory-deployer` run's logs). If it says the app has no public URL yet, take
@@ -73,7 +77,7 @@ The HTTP handler schedules submission and returns without waiting for Flyte. A 2
 intake, not durable submission or deployment success. The app serves `/github` and the signed internal planner wake endpoint; FastAPI's
 `/docs`, `/redoc` and `/openapi.json` are off. Submission failures log the exception type
 without the payload or secret. GitHub does not automatically redeliver failures: the hourly
-reconcile recovers missed deliveries, app restarts, submission failures and pending CI. Without
+reconcile (with `[deploy] webhook = true`) recovers missed deliveries, app restarts, submission failures and pending CI. Without
 `webhook_secret`, the existing 5-minute trigger remains. Removing the setting also requires
 retiring the deployed public app through the normal app administration process: a
 deploy never removes an environment, so `factory-webhook` keeps serving with its old profile
@@ -100,7 +104,7 @@ On a shared-environment profile (`[concurrency]`, see `profiles/README.md`) "fre
 
 Run `python ops/deploy_status.py` with the usual profile and backend credentials to see the
 `factory-deployer` run count over the last 24 hours. `--json` adds a row with `runs_24h`.
-Compare a full day before and after activation: the old poll alone made 288 runs/day; the
+Compare a full day before and after activation: the old poll alone made 288 runs/day; with `[deploy] webhook = true` the
 hourly reconcile makes 24/day plus push submissions. The queue sweep stays at 288
 `factory.sweep` runs/day, each an idle listing when nothing waits. With issue intake on (`maintainers` set), `factory-issues`
 is deployed too and adds one `process` run per accepted issue event; without `maintainers` it is
@@ -115,7 +119,7 @@ and retries; record real counts rather than treating these expected rates as mea
 The endpoint is public. An attacker who keeps reconnecting slow uploads (about ten sockets, almost no bandwidth)
 can keep both body slots busy, so genuine deliveries get 503 for as long as the attack lasts. Nothing wrong can
 deploy (deliveries are signed and deploys are idempotent) and memory stays bounded; deploys fall back to the
-hourly reconcile, which is the backstop. Defeating it needs per-IP connection limits or GitHub-address
+reconcile (hourly with `[deploy] webhook = true`), which is the backstop. Defeating it needs per-IP connection limits or GitHub-address
 allowlisting in front of the app (the ingress), not in the app.
 
 ## Issue intake
@@ -228,8 +232,8 @@ Coordinator merge messages and PR bodies must name their board item: use `Closes
 (or `Fixes #N` / `Resolves #N`) for completed work, or `board #N` for a whole item.
 For a partial delivery use `board #N chunk K` (or `#N chunk K`); it starts work
 without closing the issue. Keywords are case insensitive. Qualified references
-such as `owner/repo#N` and GitHub issue URLs count only for the factory repository
-(`[repo] factory`, falling back to the project repository).
+such as `owner/repo#N` and GitHub issue URLs count only for the workspace repository
+(`[repo] project`), where the board's issues live, whatever repository a project delivers to.
 
 The signed webhook submits these events to the existing `factory-issues.process`
 task, which holds the board PAT and App key. Enable **Pushes**, **Branch or tag

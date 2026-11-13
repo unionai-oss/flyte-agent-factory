@@ -1,13 +1,14 @@
 """`factory-deployer`: merged factory changes deploy themselves.
 
-On a signed push, or a periodic reconcile, `deploy_if_changed` compares the factory repo's
-default-branch head with the SHA recorded at the last successful deploy. If they differ and CI
-is not failing, it deploys that SHA: the work slots, the factory environments and itself, then the apps.
-It is on by `[deploy] auto` in the profile and is otherwise a no-op.
+On a signed push, or a periodic reconcile, `deploy_if_changed` compares the deploy repo's
+(`[deploy] repo`, default `[repo] factory`) default-branch head with the SHA recorded at the last
+successful deploy. If they differ and its CI passed, it deploys that SHA: the work slots, the factory
+environments and itself, then the apps. It is on by `[deploy] auto` in the profile and is otherwise a no-op.
 
 It holds no deploy key. Status and source come through the profile's GitHub App
-(`_github`), the source as a shallow fetch of exactly the SHA over HTTPS. Projects that are
-running keep the version they started with, so a deploy never interrupts one.
+(`_github`) when it is installed on the deploy repo, else anonymously (a public repository); the source is
+a shallow fetch of exactly the SHA over HTTPS. Projects that are running keep the version they started with,
+so a deploy never interrupts one.
 
 Release history and attempt counts live in labelled Flyte runs.
 """
@@ -87,7 +88,7 @@ _reconcile_minutes = _deploy.reconcile_minutes
 TRIGGER = flyte.Trigger(
     name="deploy-on-merge",
     automation=flyte.FixedRate(_reconcile_minutes(PROFILE)),
-    description="Deploy the factory repo's default branch when it has changed and its CI is not failing",
+    description="Deploy the deploy repo's default branch when it has changed and its CI has passed",
     auto_activate=True,
 )
 
@@ -105,15 +106,31 @@ def _label_hash(text: str) -> str:
 
 def release_labels(profile: _profile.Profile) -> dict[str, str]:
     # A rename must not inherit the old repository's success or give-up history.
-    repo = _factory_repo(profile).lower()
+    repo = _deploy_repo(profile).lower()
     return {"deploy-repo": _label_hash(repo), "deploy-profile": _label_hash(profile.name)}
 
 
-def _factory_repo(profile: _profile.Profile) -> str:
-    url = profile.repos.get("factory")
-    if not url:
-        raise _deploy.DeployError("[deploy] auto needs a [repo] factory in the profile")
-    return _github.parse_repo(url)
+def _deploy_repo(profile: _profile.Profile) -> str:
+    if not profile.deploy.repo:
+        raise _deploy.DeployError("[deploy] auto needs a [deploy] repo or a [repo] factory in the profile")
+    return _github.parse_repo(profile.deploy.repo)
+
+
+def _deploy_reader(app: _github.GithubApp, repo: str) -> _github.GithubApp | _github.PublicGithub:
+    """Return the App where it is installed on `repo`, else anonymous reads (the deploy repo is public)."""
+    try:
+        app.installation_token(repo)
+    except _github.GithubError as exc:
+        if exc.status != 404:
+            raise
+        return _github.PublicGithub()
+    return app
+
+
+def _clone_url(app: _github.GithubApp, repo: str) -> str:
+    if _deploy_reader(app, repo) is app:
+        return _github.clone_url(repo, app.installation_token(repo))
+    return f"https://github.com/{repo}.git"
 
 
 def _pair_labels(profile: _profile.Profile, sha: str, direction_sha: str) -> dict[str, str]:
@@ -221,8 +238,12 @@ async def _failed_attempts(profile: _profile.Profile, labels: dict[str, str], la
 
 def _heads(profile: _profile.Profile, app: _github.GithubApp) -> tuple[str, str, str, str]:
     """(repo, sha, direction_repo, direction_sha) of the default branches now; direction ones "" without."""
-    repo = _factory_repo(profile)
-    _, sha = app.default_branch_sha(repo)
+    repo = _deploy_repo(profile)
+    # `git ls-remote` is not REST: a tick whose head is already deployed spends none of an anonymous
+    # reader's 60 calls an hour. A repository it cannot read (private) falls back to the App.
+    sha = _deploy.public_head(repo)
+    if not sha:
+        _, sha = _deploy_reader(app, repo).default_branch_sha(repo)
     direction_repo = direction_sha = ""
     if profile.direction:
         direction_repo = _github.parse_repo(profile.direction.repo)
@@ -254,10 +275,14 @@ async def _not_deployable(
     if direction_repo:
         targets.append((direction_repo, direction_sha, "direction "))
     for target, head, prefix in targets:
-        health, detail = app.commit_health(target, head)
+        reader = _deploy_reader(app, target) if target == repo else app
+        health, detail = reader.commit_health(target, head)
         if health in ("failing", "pending"):
             retry = "; retrying next tick" if health == "pending" else ""
             return f"skipped {prefix}{head}: {detail}{retry}"
+        if health == "none" and target == repo:
+            # Deploying code nothing tested is the bug a CI-less repository would silently reintroduce.
+            return f"no CI reported on {head}: not deployed; the deploy repo must run CI"
         _say(f"deploying {prefix}{head} (CI: {health}, {detail})")
     return None
 
@@ -286,6 +311,20 @@ async def _submit(task_name: str, *, labels: dict[str, str] | None = None, **inp
     ).run.aio(task, **inputs)
 
 
+def _lock_repo(profile: _profile.Profile, app: _github.GithubApp) -> str:
+    """Return the deploy lock's repository: the deploy repo if the App is installed, else [direction]."""
+    repo = _deploy_repo(profile)
+    if _deploy_reader(app, repo) is app:
+        return repo
+    if profile.direction:
+        return _github.parse_repo(profile.direction.repo)
+    raise _deploy.DeployError(
+        "nothing is deployed: the deploy lock needs a repository the GitHub App can write, and the App is "
+        f"not installed on {repo}. Install the App on {repo}, or set [direction] repo to a repository it is "
+        "installed on"
+    )
+
+
 def _acquire_ref(profile: _profile.Profile, app: _github.GithubApp, run_name: str, sha: str) -> bool:
     """GitHub's create-if-absent / fast-forward update supplies CAS when listings cannot.
 
@@ -293,7 +332,7 @@ def _acquire_ref(profile: _profile.Profile, app: _github.GithubApp, run_name: st
     contenders create sibling commits, so only one fast-forward can replace the terminal holder.
     A missing/unreadable holder never expires: fail closed until its Flyte phase is authoritative.
     """
-    repo = _factory_repo(profile)
+    repo = _lock_repo(profile, app)
     key = hashlib.sha256(f"{PROJECT}/{DOMAIN}/{profile.name}".encode()).hexdigest()
     ref = f"heads/factory-deployer-lock/{key}"
     path = f"/repos/{repo}/git"
@@ -315,7 +354,10 @@ def _acquire_ref(profile: _profile.Profile, app: _github.GithubApp, run_name: st
         if str(holder.phase).split(".")[-1] not in _TERMINAL:
             _say(f"lease held by {owner['run']}")
             return False
-    source = app._call(repo, "GET", f"{path}/commits/{sha}")
+    # The lock commit must be made of objects its own repository has: the deployed commit is not in a
+    # lock repo that is not the deploy repo, so that repo's own head stands in.
+    anchor = sha if repo == _deploy_repo(profile) else app.default_branch_sha(repo)[1]
+    source = app._call(repo, "GET", f"{path}/commits/{anchor}")
     commit = app._call(
         repo,
         "POST",
@@ -323,7 +365,7 @@ def _acquire_ref(profile: _profile.Profile, app: _github.GithubApp, run_name: st
         json={
             "message": json.dumps({"run": run_name, "profile": profile.name, "scope": f"{PROJECT}/{DOMAIN}"}),
             "tree": source["tree"]["sha"],
-            "parents": [parent or sha],
+            "parents": [parent or anchor],
         },
     )
     try:
@@ -416,7 +458,7 @@ def _deploy_sha(
     # The children import and run the deployed code: they get neither the App key nor a token.
     credentials = _pull_requests.credential_env_vars(profile.github.private_key_secret, os.environ)
     base = {k: v for k, v in os.environ.items() if k not in credentials}
-    with _deploy.fetched_tree(_github.clone_url(repo, app.installation_token(repo)), sha) as tree:
+    with _deploy.fetched_tree(_clone_url(app, repo), sha) as tree:
         if profile.direction:
             # The direction's profile carries its own standards, captured from the direction repository: the
             # children must not capture them again from the engine tree.
@@ -524,6 +566,7 @@ async def run_once(
         release = await deployed_pair(profile)
         if release and release[1] == (sha, direction_sha):
             return _say(f"up to date at {shown}")
+        _lock_repo(profile, app)  # refuse here, where the owner reads it, rather than in the deploy run
         refused = await _not_deployable(profile, app, heads, release and release[0])
         if refused:
             return _say(refused)
@@ -578,16 +621,22 @@ async def run_pair(
             previous_slots = set(previous.get("slots", previous_slots))
         output: DeployOutput = {"deployed": False}
         for deploy in range(MAX_DEPLOYS_PER_RUN):
+            # Every deploy, the first included, is judged on CI as it is now: the tick that queued this
+            # run may have seen green minutes ago (lock wait, queue time).
+            heads = _heads(profile, app)
             if deploy:
-                heads = _heads(profile, app)
                 if (heads[1], heads[3]) == (sha, direction_sha):
                     break
                 sha, direction_sha = heads[1], heads[3]
                 shown = _shown(sha, direction_sha)
-                refused = await _not_deployable(profile, app, heads, release and release[0])
-                if refused:
-                    _say(f"{refused}; leaving it for the next tick")
-                    break
+            elif (heads[1], heads[3]) != (sha, direction_sha):
+                # Moved while waiting for the lock; the next tick judges the new heads.
+                _say(f"{shown} is no longer the head; leaving it for the next tick")
+                break
+            refused = await _not_deployable(profile, app, heads, release and release[0])
+            if refused:
+                _say(f"{refused}; leaving it for the next tick")
+                break
             try:
                 envs, deployed_profile, standards = await asyncio.to_thread(
                     _deploy_sha, profile, app, repo, sha, direction_sha

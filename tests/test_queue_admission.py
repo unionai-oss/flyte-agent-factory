@@ -18,13 +18,11 @@ SANDBOX = "git@example.org:team/sandbox.git"
 
 
 @pytest.fixture
-def lane(monkeypatch):
-    """The engine repository is configured; one project on it at a time."""
+def engine(monkeypatch):
+    """The engine repository is configured: its projects share the slots like any other repository's."""
     profile = _factory_base.PROFILE
     monkeypatch.setattr(
-        _factory_base,
-        "PROFILE",
-        dataclasses.replace(profile, repos={**profile.repos, "factory": ENGINE}, factory_projects=1),
+        _factory_base, "PROFILE", dataclasses.replace(profile, repos={**profile.repos, "factory": ENGINE})
     )
 
 
@@ -37,26 +35,36 @@ def rows():
     return {row["name"]: row for row in factory.queue_view()["queue"]}
 
 
-def occupy_lane(world, slot=0):
-    world.add("engine-run", _factory_base.SLOTS[slot], inputs={"repo": ENGINE})
+def occupy_slot(world, slot=0, repo=ENGINE):
+    world.add("repo-run", _factory_base.SLOTS[slot], inputs={"repo": repo})
 
 
-def test_a_lane_capped_normal_launch_does_not_hold_a_low_sandbox_launch(flyte_world, lane):
-    occupy_lane(flyte_world)
+@pytest.mark.parametrize("repo", [ENGINE, SANDBOX])
+def test_two_projects_on_one_repo_are_both_admitted_while_two_slots_are_free(flyte_world, engine, repo):
+    enqueue(flyte_world, "first", 1.0, repo=repo)
+    enqueue(flyte_world, "second", 2.0, repo=repo)
+    assert projects(flyte_world, factory.dispatch()) == ["first", "second"]
+
+
+def test_a_project_starts_beside_a_running_one_on_its_repo_and_a_low_one_waits_for_a_slot(
+    flyte_world, engine
+):
+    occupy_slot(flyte_world)
     enqueue(flyte_world, "engine-work", 1.0, repo=ENGINE)
     enqueue(flyte_world, "sandbox", 2.0, "low")
-    assert projects(flyte_world, factory.dispatch()) == ["sandbox"]
-    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["engine-work"]
+    assert projects(flyte_world, factory.dispatch()) == ["engine-work"]
+    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["sandbox"]
+    assert rows()["sandbox"]["wait"]["code"] == "no_free_slot"
 
 
-def test_the_freed_lane_goes_to_the_normal_engine_launch_before_low_work(flyte_world, lane):
-    occupy_lane(flyte_world)
+def test_the_freed_slot_goes_to_the_normal_engine_launch_before_low_work(flyte_world, engine):
+    occupy_slot(flyte_world)
     flyte_world.add(
         "other", _factory_base.SLOTS[1]
     )  # occupies the second slot; the freed one is the only free
     enqueue(flyte_world, "engine-work", 2.0, repo=ENGINE)
     enqueue(flyte_world, "sandbox", 1.0, "low")
-    flyte_world.runs["engine-run"].phase = "SUCCEEDED"
+    flyte_world.runs["repo-run"].phase = "SUCCEEDED"
     assert projects(flyte_world, factory.dispatch()) == ["engine-work"]
     assert [e.name for e in _queue.pending(flyte_world.queue)] == ["sandbox"]
 
@@ -115,26 +123,24 @@ def test_a_launch_that_fails_for_good_does_not_hold_low_work(flyte_world, error)
     assert _queue.pending(flyte_world.queue) == []
 
 
-def test_expedite_goes_first_even_when_a_lane_capped_normal_launch_waits(flyte_world, lane):
-    occupy_lane(flyte_world)
+def test_expedite_goes_first_when_one_slot_is_free(flyte_world, engine):
+    occupy_slot(flyte_world)
     enqueue(flyte_world, "engine-work", 1.0, repo=ENGINE)
     enqueue(flyte_world, "sandbox", 2.0)
     enqueue(flyte_world, "urgent", 3.0, "expedite")
     assert projects(flyte_world, factory.dispatch()) == ["urgent"]
 
 
-def test_every_waiting_entry_says_why_in_the_queue_json(flyte_world, lane):
-    occupy_lane(flyte_world)
-    enqueue(flyte_world, "engine-work", 1.0, repo=ENGINE)
+def test_every_waiting_entry_says_why_in_the_queue_json(flyte_world):
+    flyte_world.add("old", _factory_base.SLOTS[0], labels={_factory_base.LABEL_PROJECT: "held"})
+    enqueue(flyte_world, "held", 1.0, kind="resume")
     enqueue(flyte_world, "sandbox", 2.0, "low")
     assert projects(flyte_world, factory.dispatch()) == ["sandbox"]
     listed = json.loads(json.dumps(factory.queue_view()))["queue"]
     assert listed and all(row["wait_reason"] for row in listed)
     by_name = {row["name"]: row for row in listed}
-    assert by_name["engine-work"]["wait"]["code"] == "engine_busy"
-    assert by_name["engine-work"]["wait"]["holders"] == ["engine-run"]
-    assert by_name["engine-work"]["wait"]["limit"] == 1
-    assert "engine-run" in by_name["engine-work"]["wait_reason"]
+    assert by_name["held"]["wait"] == {"code": "project_running", "holders": ["old"]}
+    assert "old" in by_name["held"]["wait_reason"]
 
 
 def test_a_low_entry_behind_runnable_work_says_how_many(flyte_world):
@@ -175,7 +181,7 @@ def manual(name, priority="normal", repo=PLANNER_SANDBOX):
 
 def facts(*requests, holders=1):
     runs = (
-        (_planner.ActiveRun("engine-run", PLANNER_ENGINE, predicted_files=("elsewhere.py",)),)
+        (_planner.ActiveRun("engine-run", PLANNER_ENGINE, predicted_files=("engine-work.py",)),)
         if holders
         else ()
     )
@@ -183,21 +189,19 @@ def facts(*requests, holders=1):
         capacity=(_planner.Capacity("claude", "login", slot="slot"),),
         manual_requests=tuple(requests),
         active_runs=runs,
-        engine_repo=PLANNER_ENGINE,
-        engine_projects=1,
         now=NOW,
     )
 
 
-def test_the_planner_starts_a_low_request_when_the_normal_one_is_lane_capped():
+def test_the_planner_starts_a_low_request_when_the_normal_one_waits_on_a_file_conflict():
     result = _planner.plan(facts(manual("engine-work", repo=PLANNER_ENGINE), manual("sandbox", "low")))
     assert [cast(_planner.ManualRequest, launch.item).name for launch in result.launches] == ["sandbox"]
     assert [(cast(_planner.ManualRequest, w.item).name, w.reason.code) for w in result.waiting] == [
-        ("engine-work", "engine_busy")
+        ("engine-work", "file_conflict")
     ]
 
 
-def test_the_planner_gives_the_freed_lane_to_the_normal_request_before_low_work():
+def test_the_planner_gives_the_freed_slot_to_the_normal_request_before_low_work():
     result = _planner.plan(
         facts(manual("sandbox", "low"), manual("engine-work", repo=PLANNER_ENGINE), holders=0)
     )
@@ -207,7 +211,7 @@ def test_the_planner_gives_the_freed_lane_to_the_normal_request_before_low_work(
     ]  # the one slot went to the engine launch
 
 
-def test_the_planner_orders_expedite_before_a_lane_capped_normal_request():
+def test_the_planner_orders_expedite_before_a_normal_request_waiting_on_a_file_conflict():
     result = _planner.plan(
         facts(
             manual("engine-work", repo=PLANNER_ENGINE), manual("urgent", "expedite"), manual("sandbox", "low")
@@ -231,7 +235,7 @@ def test_the_planner_run_leaves_its_reasons_for_the_queue_list(flyte_world):
     assert "behind 1" in listed["sandbox"]["wait_reason"]
 
 
-def test_the_planner_lane_hold_lists_its_holders_and_limit_in_the_queue_json(flyte_world):
+def test_the_planner_file_conflict_names_the_holding_run_in_the_queue_json(flyte_world):
     from flyte_agent_factory import _planner_runtime
 
     enqueue(flyte_world, "engine-work", 1.0, repo=ENGINE)
@@ -239,7 +243,7 @@ def test_the_planner_lane_hold_lists_its_holders_and_limit_in_the_queue_json(fly
     requests = {e.name: e.request for e in _queue.pending(flyte_world.queue) if e.request}
     _planner_runtime.record_waits(plan, requests)
     row = json.loads(json.dumps(factory.queue_view()))["queue"][0]
-    assert row["wait"] == {"code": "engine_busy", "holders": ["engine-run"], "limit": 1}
+    assert row["wait"] == {"code": "file_conflict", "detail": "engine-run"}
     assert "engine-run" in row["wait_reason"]
 
 
@@ -380,23 +384,6 @@ def test_a_hand_over_taken_by_another_normal_project_still_keeps_a_slot_from_low
     assert projects(flyte_world, factory.dispatch()) == ["resumed"]
 
 
-def test_a_hand_over_on_the_engine_repo_still_holds_the_lane_against_low_work(flyte_world, lane):
-    # The ending run is on the engine repository: for `low` work it still holds the lane, so a low engine
-    # launch neither exceeds the cap nor takes the lane before the resume.
-    flyte_world.add(
-        "old",
-        _factory_base.SLOTS[0],
-        labels={_factory_base.LABEL_PROJECT: "resumed"},
-        inputs={"repo": ENGINE},
-    )
-    enqueue(flyte_world, "resumed", 1.0, kind="resume", repo=ENGINE)
-    enqueue(flyte_world, "low-eng", 2.0, "low", repo=ENGINE)
-    assert factory.dispatch(exclude_run="old") == []
-    assert rows()["low-eng"]["wait"] == {"code": "engine_busy", "holders": ["old"], "limit": 1}
-    flyte_world.runs["old"].phase = "SUCCEEDED"
-    assert projects(flyte_world, factory.dispatch()) == ["resumed"]
-
-
 def test_a_launch_cancelled_after_its_create_does_not_hold_low_work(flyte_world):
     enqueue(flyte_world, "alpha", 1.0)
     enqueue(flyte_world, "garden", 2.0, "low")
@@ -464,7 +451,9 @@ def test_a_launch_that_started_before_its_error_keeps_its_slot(flyte_world, monk
     assert _queue.pending(flyte_world.queue) == []
 
 
-def test_a_launch_that_started_before_its_error_still_counts_toward_the_lane(flyte_world, monkeypatch, lane):
+def test_a_launch_that_started_before_its_error_still_counts_toward_the_slots(
+    flyte_world, monkeypatch, engine
+):
     real = factory.launch_on_slot
 
     def launch_on_slot(slot, brief, name, *args, **kwargs):
@@ -474,31 +463,30 @@ def test_a_launch_that_started_before_its_error_still_counts_toward_the_lane(fly
         return run
 
     monkeypatch.setattr(factory, "launch_on_slot", launch_on_slot)
+    occupy_slot(flyte_world, 1)
     enqueue(flyte_world, "eng-a", 1.0, repo=ENGINE)
     enqueue(flyte_world, "eng-b", 2.0, repo=ENGINE)
     factory.dispatch()
     assert [e.name for e in _queue.pending(flyte_world.queue)] == ["eng-b"]
-    assert rows()["eng-b"]["wait"]["code"] == "engine_busy"
+    assert rows()["eng-b"]["wait"]["code"] == "no_free_slot"
 
 
-def test_the_oldest_low_launch_takes_the_slot_a_lane_capped_launch_cannot_use(flyte_world, lane):
-    occupy_lane(flyte_world)
-    enqueue(flyte_world, "engine-work", 1.0, repo=ENGINE)
+def test_the_oldest_low_launch_takes_the_only_free_slot(flyte_world, engine):
+    occupy_slot(flyte_world)
     enqueue(flyte_world, "a", 2.0, "low")
     enqueue(flyte_world, "b", 3.0, "low")
     assert projects(flyte_world, factory.dispatch()) == ["a"]
-    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["engine-work", "b"]
+    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["b"]
     assert rows()["b"]["wait"]["code"] == "no_free_slot"
 
 
-def test_the_oldest_normal_launch_takes_the_slot_a_lane_capped_launch_cannot_use(flyte_world, lane):
+def test_the_oldest_normal_launch_takes_the_only_free_slot(flyte_world, engine):
     """Passes on main: the order rule among same-priority launches is unchanged; this is coverage."""
-    occupy_lane(flyte_world)
-    enqueue(flyte_world, "engine-work", 1.0, repo=ENGINE)
+    occupy_slot(flyte_world)
     enqueue(flyte_world, "a", 2.0)
     enqueue(flyte_world, "b", 3.0)
     assert projects(flyte_world, factory.dispatch()) == ["a"]
-    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["engine-work", "b"]
+    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["b"]
 
 
 def test_a_launch_with_no_codex_slot_says_so_and_does_not_hold_low_work(flyte_world, monkeypatch):
@@ -601,19 +589,20 @@ def concurrent_twin(flyte_world, monkeypatch):
     return arrange
 
 
-def test_a_surviving_twin_holds_the_engine_lane(flyte_world, lane, concurrent_twin):
+def test_a_surviving_twin_holds_its_slot_from_low_work(flyte_world, engine, concurrent_twin):
     twin = concurrent_twin(_factory_base.SLOTS[1])
+    occupy_slot(flyte_world, 0)
     enqueue(flyte_world, "alpha", 1.0, repo=ENGINE)
     enqueue(flyte_world, "garden", 2.0, "low", repo=ENGINE)
     assert factory.dispatch() == []
     assert twin.phase == "RUNNING"
     assert len(flyte_world.created) == 1
     assert flyte_world.runs[flyte_world.created[0]["name"]].phase == "ABORTED"
-    assert rows()["garden"]["wait"] == {"code": "engine_busy", "holders": [twin.name], "limit": 1}
+    assert rows()["garden"]["wait"]["code"] == "no_free_slot"
 
 
 @pytest.mark.parametrize("twin_slot", [0, 1])
-def test_a_surviving_twin_holds_only_its_actual_slot(flyte_world, lane, concurrent_twin, twin_slot):
+def test_a_surviving_twin_holds_only_its_actual_slot(flyte_world, engine, concurrent_twin, twin_slot):
     twin = concurrent_twin(_factory_base.SLOTS[twin_slot])
     enqueue(flyte_world, "alpha", 1.0, repo=ENGINE)
     enqueue(flyte_world, "garden", 2.0, "low")
@@ -624,9 +613,7 @@ def test_a_surviving_twin_holds_only_its_actual_slot(flyte_world, lane, concurre
     assert _queue.marker(flyte_world.queue, "alpha", 1, "started")["slot"] == twin.task
 
 
-def test_a_known_surviving_twin_is_not_counted_twice(flyte_world, monkeypatch, lane, concurrent_twin):
-    profile = _factory_base.PROFILE
-    monkeypatch.setattr(_factory_base, "PROFILE", dataclasses.replace(profile, factory_projects=2))
+def test_a_known_surviving_twin_is_not_counted_twice(flyte_world, engine, concurrent_twin):
     twin = concurrent_twin(_factory_base.SLOTS[1], known=True)
     enqueue(flyte_world, "alpha", 1.0, repo=ENGINE)
     enqueue(flyte_world, "garden", 2.0, "low", repo=ENGINE)

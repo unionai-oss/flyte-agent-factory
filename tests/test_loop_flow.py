@@ -293,6 +293,90 @@ def test_benchmark_submission_uses_deployed_task_and_ceiling(world, monkeypatch)
     assert events[2] == {"candidate_sha": "head", "baseline_sha": "main", "max_usd": 300}
 
 
+@pytest.mark.parametrize(
+    "loop_repo, loop_path, source",
+    [
+        ("acme/factory", "", {}),
+        (
+            "acme/direction",
+            "projects/engine",
+            {"source_repo": "acme/direction", "source_path": "projects/engine"},
+        ),
+        ("acme/direction", "", {"source_repo": "acme/direction", "source_path": ""}),
+        ("acme/factory", "engine", {"source_repo": "acme/factory", "source_path": "engine"}),
+    ],
+)
+def test_benchmark_carries_the_loops_engine_source(world, monkeypatch, loop_repo, loop_path, source):
+    from types import SimpleNamespace
+
+    from connectrpc.code import Code
+    from connectrpc.errors import ConnectError
+
+    submitted: list[dict[str, Any]] = []
+
+    class Task:
+        def __init__(self):
+            self.override = SimpleNamespace(aio=self.overridden)
+
+        async def overridden(self, **kwargs):
+            return self
+
+        async def __call__(self, **kwargs):
+            submitted.append(kwargs)
+            return '{"verdict": {}}', ""
+
+    async def missing(name):
+        raise ConnectError(Code.NOT_FOUND, "missing")
+
+    async def wait():
+        pass
+
+    def context(**kwargs):
+        async def submit(actual, **inputs):
+            result = await actual(**inputs)
+
+            async def outputs():
+                return result
+
+            return SimpleNamespace(wait=SimpleNamespace(aio=wait), outputs=SimpleNamespace(aio=outputs))
+
+        return SimpleNamespace(run=SimpleNamespace(aio=submit))
+
+    monkeypatch.setattr(remote.Run, "get", SimpleNamespace(aio=missing))
+    monkeypatch.setattr(flyte, "with_runcontext", context)
+    monkeypatch.setattr(flyte, "ctx", lambda: SimpleNamespace(action=SimpleNamespace(run_name="loop")))
+    monkeypatch.setattr(remote.Task, "get", lambda name, **kwargs: Task())
+    profile = _loop_flow.PROFILE
+    monkeypatch.setattr(
+        _loop_flow,
+        "PROFILE",
+        replace(
+            profile,
+            repos={**profile.repos, "factory": "git@github.com:acme/factory.git"},
+            bench=_profile.Bench("repo", "key", 300),
+            loop=_profile.Loop(enabled=True, repo=loop_repo, path=loop_path),
+        ),
+    )
+    asyncio.run(BENCHMARK("head", "main"))
+    assert submitted == [{"candidate_sha": "head", "baseline_sha": "main", "max_usd": 300, **source}]
+
+
+def test_changes_outside_the_engine_subtree_need_the_owner(world, monkeypatch):
+    app, calls = world
+    profile = _loop_flow.PROFILE
+    monkeypatch.setattr(
+        _loop_flow,
+        "PROFILE",
+        replace(profile, loop=_profile.Loop(enabled=True, repo="acme/factory", merge="on", path="engine")),
+    )
+    app.files = [{"filename": "engine/src/flyte_agent_factory/_dashboard.py"}, {"filename": "notes.md"}]
+    assert run() == "needs_owner"
+    assert not calls
+    app.files = [{"filename": "engine/src/flyte_agent_factory/_dashboard.py"}]
+    assert run() == "merge"
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("changed", ["head", "main"])
 def test_movement_while_posting_comment_is_stale(world, monkeypatch, changed):
     app, _ = world

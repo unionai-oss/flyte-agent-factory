@@ -257,14 +257,6 @@ class Waits(dict[str, dict[str, Any]]):
         )
 
 
-def word_engine_busy(holders: Sequence[str], limit: int) -> str:
-    """Word an `engine_busy` hold: who holds the engine-repo lane, and its limit when it is not 1."""
-    # The same wording as the planner's `engine_busy` reason. Not imported from it: `_planner` is admission,
-    # which a slot's bundle does not carry (see test_every_package_module_loads_with_the_agent).
-    names = ", ".join(holders)
-    return f"{names} (limit {limit})" if limit > 1 else names
-
-
 def word_engine_limit(request: _queue.Request) -> str:
     """Word an `engine_limit` hold: the engine this request would launch on is at its project limit."""
     return f"{pick_launch_engine(request)} is at its project limit"

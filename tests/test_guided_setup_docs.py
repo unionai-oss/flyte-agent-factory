@@ -41,7 +41,9 @@ def test_deploy_environment_bootstrap_is_documented_before_deployment():
         assert f"unset {variable}" in guide
     assert "endpoint:client_id:client_secret:org" in guide
     assert "create api-key" in guide
-    assert "--setup" in guide and "--profile mine" in guide
+    # Retired: the setup-only and per-profile skill packages. One public skill is downloaded, not built.
+    assert "package_skill.py --setup" not in guide and "--profile mine" not in guide
+    assert "ops/bootstrap.py" in guide
     reference = read("skills/agent-factory/references/setup.md")
     assert "_UNION_EAGER_API_KEY" in reference and "[state]" in reference
 
@@ -91,7 +93,7 @@ def without_heredoc_bodies(block):
 
 def guided_markdown():
     names = ["README.md", "docs/quickstart.md", "docs/chat-operator.md", "docs/factory-mcp-setup.md"]
-    names += ["docs/setup.md"]
+    names += ["docs/setup.md", "docs/github-app.md"]
     names += [str(p.relative_to(ROOT)) for p in sorted((ROOT / "skills/agent-factory").rglob("*.md"))]
     return names
 
@@ -177,6 +179,36 @@ def test_no_default_policies_keys_have_a_written_grant():
     assert re.search(r'client_id=\n: "\$\{client_id:\?', grant)
 
 
+def test_the_documented_admin_grant_is_the_command_the_bootstrap_prints():
+    from flyte_agent_factory._bootstrap_base import Settings
+    from flyte_agent_factory._bootstrap_keys import build_command
+
+    example = Settings(
+        endpoint="flyte.example.com",
+        project="my-agents",
+        workspace="you/agent-workspace",
+        state_uri="s3://my-agent-state/factory/mine",
+    )
+    grant = build_command(example, "--grant factory-deploy factory-deploy")
+    section = read("docs/factory-mcp-setup.md").split("### Grant the key a role", 1)[1]
+    assert f"```bash\n{grant}\n```" in section
+    skill = read("skills/agent-factory/references/setup.md")
+    assert "`--grant factory-deploy`" in skill and "`--grant factory-chat`" in skill
+
+
+def test_the_docs_say_the_bootstrap_and_skill_links_need_the_engine_on_its_public_main():
+    published = re.compile(
+        r"resolve only once this change is on `unionai-oss/flyte-agent-factory`\s+`main`", re.MULTILINE
+    )
+    for path in ("docs/quickstart.md", "docs/install-audit.md"):
+        text = read(path)
+        assert published.search(text), path
+        assert "unionai-oss/flyte-agent-workspace" in text and "does not exist yet" in text, path
+        assert "404" in text, f"{path} does not say what fails until then"
+    assert "skills/dist/*.zip" in read("docs/install-audit.md")
+    assert "ops/bootstrap.py" in read("docs/quickstart.md").split("**Publish the engine first.**", 1)[1]
+
+
 def test_non_echo_prompts_run_in_a_bash_child_or_avoid_bash_only_flags():
     for path in guided_markdown():
         for block in SHELL_FENCE.findall(read(path)):
@@ -187,46 +219,69 @@ def test_non_echo_prompts_run_in_a_bash_child_or_avoid_bash_only_flags():
             )
 
 
-SKILL_STEPS = [
-    ("**GitHub.**", "## 1. GitHub access"),
-    ("**Local tools and engine.**", "Clone the public engine"),
-    ("**Backend.**", "uv run flyte create config"),
-    ("**Profile.**", "## 3. Profile and secret names"),
-    ("**Credentials.**", "## 4. Store engine credentials"),
-    ("**Deploy.**", "## 5. Deploy and connect"),
-    ("**Factory MCP.**", "Create or reuse a scoped **Union** API key"),
-    ("**Skill and GitHub connector.**", "Package and install the deployment-specific"),
-    ("**Launch.**", "## 6. Launch and confirm"),
+SKILL_PHASES = [
+    "## Is there a factory already?",
+    "## Establish where to resume",
+    "## Prerequisites",
+    "## Do what you can yourself",
+    "## Hand over one copy-paste command",
+    "## Resume from `--status`",
+    "## What the bootstrap sets up, in the command's order",
+    "## Connect the factory MCP, then verify",
+    "## Take over, launch, and finish",
+    "## If Flyte or Union is not up",
+]
+
+BOOTSTRAP_STEPS = [
+    "tools",
+    "workspace",
+    "template",
+    "profile",
+    "signin",
+    "project",
+    "deploy-key",
+    "github-app",
+    "ruleset",
+    "board",
+    "engine-token",
+    "deploy",
+    "mcp-url",
+    "connect",
 ]
 
 
 def test_setup_skill_steps_follow_the_quickstart_order():
+    # The guided setup retired the numbered `--setup` packaging steps; the order pin is now on the skill's
+    # phases and on the bootstrap's step names, in both the skill and the quickstart.
     skill = read("skills/agent-factory/references/setup.md")
     quickstart = read("docs/quickstart.md")
-    steps = re.findall(r"^\d+\. (\*\*[^*]+\*\*)", skill, re.MULTILINE)
-    assert steps == [title for title, _ in SKILL_STEPS]
-    positions = [quickstart.index(anchor) for _, anchor in SKILL_STEPS]
-    assert positions == sorted(positions)
-    # The skill's one packaging and token steps sit where the quickstart puts them.
-    body = {
-        title: text
-        for title, text in re.findall(
-            r"^\d+\. (\*\*[^*]+\*\*)(.*?)(?=^\d+\. \*\*|^## )", skill, re.MULTILINE | re.DOTALL
-        )
-    }
-    assert "package_skill.py --setup" in body["**Local tools and engine.**"]
-    assert "claude setup-token" in body["**Credentials.**"]
-    assert "claude setup-token" not in body["**Profile.**"]
-    for title, text in body.items():
-        if "claude setup-token" in text:
-            assert title == "**Credentials.**"
+    assert re.findall(r"^## .*$", skill, re.MULTILINE) == SKILL_PHASES
+    # Both name every bootstrap step, in the bootstrap's order: the one a person pastes back with --status.
+    for name, text in (("skill", skill), ("quickstart", quickstart)):
+        positions = []
+        for step in BOOTSTRAP_STEPS:
+            found = re.search(rf"`{re.escape(step)}`", text)
+            assert found, f"{name}: bootstrap step {step} is not named"
+            positions.append(found.start())
+        if name == "quickstart":
+            table = quickstart.split("| Step | Plain words", 1)[1].split("Each line of its output", 1)[0]
+            assert re.findall(r"^\| `([\w-]+)` \|", table, re.MULTILINE) == BOOTSTRAP_STEPS
+        else:
+            listed = skill.split("The steps, in the command's order, are:", 1)[1].split(".", 1)[0]
+            assert re.findall(r"`([\w-]+)`", listed) == BOOTSTRAP_STEPS
+    # Engine-token handling lives only where the token is stored.
+    for heading, body in re.findall(r"^(## .*?)$(.*?)(?=^## |\Z)", skill, re.MULTILINE | re.DOTALL):
+        if "claude setup-token" in body:
+            assert heading == "## Hand over one copy-paste command"
 
 
 def test_resume_does_not_overwrite_a_profile_or_repeat_an_mcp_registration():
     quickstart = read("docs/quickstart.md")
     chat = read("docs/chat-operator.md")
-    assert "cp profiles/example-claude-personal.toml profiles/mine.toml" not in re.sub(
-        r"\[ -e profiles/mine.toml \] \|\| cp [^\n]*", "", quickstart
+    assert "profiles/mine.toml" not in quickstart
+    assert "[ -e ../my-workspace/profile.toml ] || cp ../my-workspace/profile.example.toml" in quickstart
+    assert "cp ../my-workspace/profile.example.toml ../my-workspace/profile.toml" not in re.sub(
+        r"\[ -e \.\./my-workspace/profile.toml \] \|\| cp [^\n]*", "", quickstart
     )
     for text in (quickstart, chat, read("skills/agent-factory/references/setup.md")):
         assert "claude mcp list" in text
@@ -495,27 +550,40 @@ def test_setup_operator_prepares_filled_in_handoffs_at_the_step_that_needs_them(
         assert "claude.ai has no local shell" in text
         assert "GitHub file-edit tool" in text
         assert "non-secret" in text and "never" in text.lower()
-        for heading, required in (
-            ("GitHub", ("CODEOWNERS", "@OWNER")),
-            ("Profile", ("filled-in", "[state]", "[backend]", "[repo]", "[secrets]", "never overwrite")),
-            ("Deploy", ("[mcp] public_url", "only", "one copy-paste command")),
-            ("Factory MCP", ("grant block", "client_id", "factory-chat", "one copy-paste command")),
-        ):
-            if path.startswith("skills/"):
-                found = re.search(rf"\*\*{heading}\.\*\*(.*?)(?=^\d+\. |^## |\Z)", text, re.S | re.M)
-                assert found, f"{path}: no **{heading}.** step"
-                section = found[1]
-            else:
-                anchors = {
-                    "GitHub": ("## 1.", "## 2."),
-                    "Profile": ("## 3.", "## 4."),
-                    "Deploy": ("## 5.", "Follow [chat-operator.md"),
-                    "Factory MCP": ("Follow [chat-operator.md", "## 6."),
-                }
-                start, end = anchors[heading]
+        if path.startswith("skills/"):
+            sections = {
+                "GitHub": ("## Do what you can yourself", ("CODEOWNERS", "create_repository")),
+                "Profile": (
+                    "## What the bootstrap sets up, in the command's order",
+                    ("profile.toml", "[repo] project", "[direction]", "never overwritten"),
+                ),
+                "Deploy": ("## Hand over one copy-paste command", ("factory-deploy", "client_id")),
+                "Factory MCP": (
+                    "## Connect the factory MCP, then verify",
+                    ("grant", "client_id", "factory-chat", "one copy-paste command"),
+                ),
+            }
+            for heading, (start, required) in sections.items():
+                section = text.split(start, 1)[1].split("\n## ", 1)[0]
+                for value in required:
+                    assert value in section, f"{path}: {heading} handoff missing {value}"
+        else:
+            anchors = {
+                "GitHub": ("## 1.", "## 2."),
+                "Profile": ("## 3.", "## 4."),
+                "Deploy": ("## 5.", "Follow [chat-operator.md"),
+                "Factory MCP": ("Follow [chat-operator.md", "## 6."),
+            }
+            required_by_heading = {
+                "GitHub": ("CODEOWNERS", "@OWNER"),
+                "Profile": ("filled-in", "[state]", "[backend]", "[repo]", "[secrets]", "never overwrite"),
+                "Deploy": ("[mcp] public_url", "only", "one copy-paste command"),
+                "Factory MCP": ("grant block", "client_id", "factory-chat", "one copy-paste command"),
+            }
+            for heading, (start, end) in anchors.items():
                 section = text.split(start, 1)[1].split(end, 1)[0]
-            for value in required:
-                assert value in section, f"{path}: {heading} handoff missing {value}"
+                for value in required_by_heading[heading]:
+                    assert value in section, f"{path}: {heading} handoff missing {value}"
         assert "factory-deploy" in text and "client_id" in text
 
 
@@ -532,3 +600,202 @@ def test_install_audit_classifies_every_step_and_keeps_external_work_not_run():
     for value in ("CODEOWNERS", "[state]", "public_url", "client_id"):
         assert any(value in " ".join(row) and "One copy-paste command" in row[1] for row in rows)
     assert "test_setup_operator_prepares_filled_in_handoffs_at_the_step_that_needs_them" in audit
+    page = read("docs/install-audit.md")  # the skill-install row sits above the walkthrough section
+    assert "agent-factory.zip" in page and "since.zip" in page
+
+
+APP_ERROR = "the GitHub App (id <your App id>) is not installed on unionai-oss/flyte-agent-factory"
+#: What the deployer does where the App is not installed (`_deployer._deploy_reader`); the docs say so.
+ANONYMOUS = ("anonymously", "`[direction] repo`")
+FIRST_COMMAND = next(
+    block.strip()
+    for block in re.findall(r"```bash\n(.*?)```", read("docs/quickstart.md"), re.DOTALL)
+    if "ops/bootstrap.py --endpoint" in block and "--redeploy" not in block
+)
+REDEPLOY = FIRST_COMMAND + " --redeploy"
+SETUP_FILES = (
+    "docs/quickstart.md",
+    "docs/github-app.md",
+    "skills/agent-factory/references/setup.md",
+)
+
+
+def test_the_public_engine_without_the_app_is_read_anonymously_and_has_one_redeploy_command():
+    for path in SETUP_FILES:
+        text = " ".join(read(path).split())
+        assert APP_ERROR not in text, f"{path}: the deployer no longer fails there; it reads anonymously"
+        assert all(words in text for words in ANONYMOUS), path
+        assert REDEPLOY in text, path
+        assert "ops/deploy_factory.py --profile" not in text, f"{path}: the hand redeploy command is retired"
+    skill = " ".join(read("skills/agent-factory/references/setup.md").split())
+    # The skill must not "repair" anything by dropping the direction or installing on the engine.
+    assert "do not remove `[deploy] auto` or `[direction]`" in skill
+    assert "do not ask them to install the App on unionai-oss" in skill
+
+
+def test_docs_do_not_tell_users_to_fork_the_engine_or_install_the_app_on_it():
+    app = " ".join(read("docs/github-app.md").split())
+    assert "and the engine repository if you use" not in app
+    quick = " ".join(read("docs/quickstart.md").split())
+    assert "use a fork and configure `[repo] factory`" not in quick
+    assert "factory = the public engine" in quick or "public engine" in quick
+
+
+def test_owner_onboarding_steps_appear_in_the_owners_order():
+    guide = read("docs/quickstart.md")
+    section = guide[guide.index("The setup it performs") : guide.index("Around those seven")]
+    order = ["Private workspace", "Profile at the workspace root", "Write deploy key", "Your own GitHub App"]
+    order += ["Protected main", "Board", "First deploy"]
+    positions = [section.index(f"**{name}.**") for name in order]
+    assert positions == sorted(positions)
+    for words in ("CODEOWNERS", "[repo] project", "[direction]", "manifest flow", "Default repository"):
+        assert words in section
+    # Honest boundaries stay stated.
+    flat = " ".join(guide.split())
+    assert "Default repository" in flat and "by hand" in flat
+    assert "reads that repository anonymously" in flat
+
+
+def test_direction_and_auto_are_documented_as_written_only_with_the_app():
+    guide = " ".join(read("docs/quickstart.md").split())
+    assert "`[direction]` and `[deploy] auto = true`, only when the App exists" in guide
+    assert "no `[direction]`" in " ".join(read("docs/github-app.md").split()).lower()
+    repos = " ".join(read("docs/architecture-repos.md").split())
+    assert "Only when the App exists, the file carries `[direction] repo`" in repos
+
+
+def test_board_link_click_is_only_for_a_missing_link():
+    guide = " ".join(read("docs/quickstart.md").split())
+    assert "already links the board" in guide
+    assert "only if the Projects tab does not list it" in guide
+
+
+def test_package_check_output_is_documented_as_printed():
+    printed = subprocess.run(
+        [sys.executable, "ops/package_skill.py", "--check", "skills/dist/agent-factory.zip"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+    assert (printed.stdout.strip(), printed.returncode) == ("current", 0)
+    doc = read("docs/chat-operator.md")
+    assert "stale: installed X, source Y" in doc and "stale (installed" not in doc
+    assert "exits 0 only for `current`" in " ".join(doc.split())
+
+
+def test_mode_detection_uses_the_same_call_in_every_place():
+    skill = " ".join(read("skills/agent-factory/SKILL.md").split())
+    start = skill[skill.index("## Start: setup or take over") : skill.index("## Taking over")]
+    assert "`list_projects`" in start and "queue_list" not in start
+    reference = " ".join(read("skills/agent-factory/references/setup.md").split())
+    assert "`list_projects`" in reference[: reference.index("## Establish where to resume")]
+
+
+def test_connector_prompts_do_not_put_the_key_on_a_command_line_and_names_agree():
+    guide = " ".join(read("docs/quickstart.md").split())
+    assert "hidden-prompt block" in guide and "<your chat API key>" not in guide
+    for path in ("docs/quickstart.md", "docs/chat-operator.md", "skills/agent-factory/references/setup.md"):
+        text = " ".join(read(path).split())
+        assert "claude mcp list" in text and "agent-factory" in text, path
+
+
+def test_secret_storage_wording_names_the_sdk_not_a_cli_flag_for_the_bootstrap():
+    guide = " ".join(read("docs/quickstart.md").split())
+    assert "stored with `flyte create secret --from-file`" not in guide
+    assert "through the Flyte SDK" in guide
+
+
+def test_workspace_template_repository_is_not_described_as_existing():
+    for path in ("docs/architecture-repos.md", "docs/standards.md"):
+        text = " ".join(read(path).split())
+        assert "not published" in text, path
+
+
+def test_profiles_readme_points_guided_setup_users_at_the_root_profile():
+    text = " ".join(read("profiles/README.md").split())
+    assert "`profile.toml` at the root of your workspace" in text
+    assert "ops/bootstrap.py" in text
+
+
+def test_workspace_template_readme_covers_app_board_and_bootstrap():
+    text = " ".join(read("src/flyte_agent_factory/_assets/workspace_template/README.md").split())
+    for needle in ("GitHub App", "Projects board", "Default repository", "ops/bootstrap.py"):
+        assert needle in text, needle
+    assert "Replace `OWNER`" not in text or "the bootstrap sets" in text
+
+
+def test_every_doc_that_gives_the_redeploy_command_gives_the_one_that_runs_the_bootstrap():
+    # The bootstrap's own flag, with the exact download prefix of the first command (fail-closed), and the
+    # first-run command itself must not carry the flag.
+    assert "--redeploy" not in FIRST_COMMAND
+    for path in SETUP_FILES:
+        assert REDEPLOY in read(path), path
+
+
+def test_the_setup_doc_does_not_promise_that_engine_merges_deploy_themselves_for_a_public_engine_user():
+    text = " ".join(read("docs/setup.md").split())
+    assert "every merge to the engine repository deploys itself" not in text
+    assert "a merge ships on the next tick plus build time." not in text.replace(
+        "tick plus build time. For", "X"
+    )
+    assert APP_ERROR not in text and all(words in text for words in ANONYMOUS) and "--redeploy" in text
+
+
+def test_what_the_docs_say_about_an_uninstalled_deploy_repo_is_what_the_deployer_does():
+    source = " ".join(read("src/flyte_agent_factory/_deployer.py").split())
+    # The deployer falls back to anonymous reads where the App is not installed, instead of failing.
+    assert "return _github.PublicGithub()" in source
+    for path in (*SETUP_FILES, "docs/setup.md"):
+        text = " ".join(read(path).split())
+        assert "App not installed on" not in text, path
+        assert APP_ERROR not in text and all(words in text for words in ANONYMOUS), path
+
+
+def test_the_skill_reference_does_not_call_a_reordered_list_the_owners_order():
+    text = read("skills/agent-factory/references/setup.md")
+    assert (
+        "in the owner's order\n" not in text
+        and "## What the bootstrap sets up, in the command's order" in text
+    )
+    section = text.split("## What the bootstrap sets up, in the command's order", 1)[1].split("\n## ", 1)[0]
+    for exception in ("`signin`", "`project`", "`ruleset`", "`engine-token`", "Flyte secrets", "factory-URL"):
+        assert exception in section, f"the forced reordering is not explained: {exception}"
+
+
+def test_the_template_readme_and_architecture_docs_say_main_not_a_pinned_release():
+    for path in (
+        "src/flyte_agent_factory/_assets/workspace_template/README.md",
+        "docs/architecture-repos.md",
+        "docs/architecture.md",
+    ):
+        assert "pinned release" not in read(path), path
+    assert "public `unionai-oss/flyte-agent-factory`" in read(
+        "src/flyte_agent_factory/_assets/workspace_template/README.md"
+    )
+
+
+def test_the_chat_verifies_the_ruleset_through_its_connector_or_the_status_line():
+    for path in ("skills/agent-factory/references/setup.md", "docs/quickstart.md"):
+        text = " ".join(read(path).split())
+        assert re.search(r"GitHub connector[^.]{0,60}read (the workspace's )?rulesets", text), path
+        assert "the `ruleset` line of" in text and "`--status`" in text, path
+
+
+def test_board_click_count_is_the_same_in_code_and_docs():
+    from flyte_agent_factory._bootstrap_steps import BOARD_CLICKS
+
+    assert BOARD_CLICKS in read("src/flyte_agent_factory/_bootstrap_steps.py")
+    count = BOARD_CLICKS.split()[0]
+    quickstart = read("docs/quickstart.md")
+    assert f'"{BOARD_CLICKS}"' in quickstart and f"these {count} clicks" in quickstart
+    assert f"the {count} clicks above" in quickstart and "two board settings" not in quickstart
+    assert f'"{BOARD_CLICKS}"' in read("skills/agent-factory/references/setup.md")
+    template = read("src/flyte_agent_factory/_assets/workspace_template/README.md")
+    assert f"so {BOARD_CLICKS}:" in " ".join(template.split()) and "**Workflows**" in template
+
+
+def test_setup_reference_does_not_ask_for_the_endpoint_twice():
+    reference = read("skills/agent-factory/references/setup.md")
+    assert "the backend endpoint is that URL's host" in reference
+    assert "the backend endpoint, project" not in reference

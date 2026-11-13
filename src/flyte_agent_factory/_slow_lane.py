@@ -19,6 +19,12 @@ that read git see the repository they see locally), builds the locked environmen
 installs a pinned Terraform when the image has none (its tests skip without it), uses the gitleaks and tflint
 the image bakes, and runs pytest. Any child failure, or a setup failure inside the container, ends in the
 local run, except a tree that could not be uploaded after its retries: that lane fails (`UPLOAD_FAILED`).
+
+Any project can use it for any command: `python -m flyte_agent_factory._slow_lane [--junit PATH] -- <command>`
+runs the command in the child instead of pytest (the pre-review hands `checks.sh` a launcher for it, as
+`AGENT_FACTORY_TEST_LANE`). The child runs `uv sync --frozen` first only when the tree has a `uv.lock`, puts
+the venv's `bin` on `PATH`, and exports the junit path as `AGENT_FACTORY_LANE_JUNIT` for a command that
+writes one.
 """
 
 from __future__ import annotations
@@ -74,6 +80,9 @@ UPLOAD_BACKOFF_S = 5.0
 #: child succeeded at 13:41 while its launcher waited until checks.sh's 900 s ran out at 13:48.
 POLL_S = 30.0
 GRACE_S = 30.0
+#: What the container is asked to run: the project's pytest lane, or the command after `--`.
+MODE_PYTEST = "pytest"
+MODE_COMMAND = "command"
 #: Trees are never packed from these, whatever git lists.
 _EXCLUDED_DIRS = {".git", ".venv"}
 
@@ -90,6 +99,8 @@ TERRAFORM_URL = f"https://releases.hashicorp.com/terraform/{TERRAFORM_VERSION}/t
 #: A task input arrives as the file /var/inputs/<name>, an output is the file /var/outputs/<name>.
 _LANE_SCRIPT = f"""
 in=$1 out=$2 tf_url=$3 tf_sha=$4 tail_bytes=$5
+mode=pytest
+[[ ! -s $in/mode ]] || mode=$(<"$in/mode")
 mkdir -p "$out"
 work=$(mktemp -d "${{TMPDIR:-/tmp}}/test-lane-XXXXXX")
 export PATH="$work/bin:$PATH" UV_CACHE_DIR="$work/uv-cache" UV_PYTHON_DOWNLOADS=never
@@ -130,17 +141,28 @@ commit_packed_tree() {{
 setup() {{
   mkdir "$work/tree" && tar xzf "$in/tree" -C "$work/tree" && cd "$work/tree" &&
     {{ if [[ -s $in/history ]]; then restore_history; else commit_packed_tree; fi; }} &&
-    uv sync --frozen && install_terraform
+    {{
+      if [[ $mode == pytest ]]; then
+        uv sync --frozen && install_terraform
+      elif [[ -f uv.lock ]]; then
+        uv sync --frozen
+      fi
+    }}
 }}
 
-# Null-separated, so an argument with a space or a quote reaches pytest as it was given.
+# Null-separated, so an argument with a space or a quote reaches pytest (or the command) as it was given.
 mapfile -d '' args < <(
   python3 -c 'import json, sys; sys.stdout.write(chr(0).join(json.load(open(sys.argv[1]))))' "$in/pytest_args"
 )
 {{
   setup || {{ echo "test-lane: setup failed" >&2; exit {SETUP_FAILED}; }}
-  PYTHONPATH=src .venv/bin/python -m pytest tests "${{args[@]}}" -n auto -p no:cacheprovider \\
-    "--junitxml=$out/junit"
+  if [[ $mode == pytest ]]; then
+    PYTHONPATH=src .venv/bin/python -m pytest tests "${{args[@]}}" -n auto -p no:cacheprovider \\
+      "--junitxml=$out/junit"
+  else
+    [[ ! -d .venv/bin ]] || export PATH="$PWD/.venv/bin:$PATH" VIRTUAL_ENV="$PWD/.venv"
+    AGENT_FACTORY_LANE_JUNIT="$out/junit" "${{args[@]}}"
+  fi
 }} 2>&1 | tee "$work/log"
 code=${{PIPESTATUS[0]}}
 printf '%s' "$code" >"$out/code"
@@ -164,7 +186,8 @@ def _make_lane_task(name: str, interruptible: bool) -> ContainerTask:
             TERRAFORM_SHA256,
             str(TAIL_CHARS),
         ],
-        inputs={"tree": File, "history": File, "pytest_args": str},
+        # `pytest_args` is the JSON list of pytest's arguments, or of the command's when `mode` is "command".
+        inputs={"tree": File, "history": File, "pytest_args": str, "mode": str},
         # The junit XML is a File: a large suite's report would not fit a scalar output.
         # A scalar output is capped at 1 KiB on the platform, so the tail is a file like the junit.
         outputs={"code": str, "tail": File, "junit": File},
@@ -210,10 +233,19 @@ def pack_tree(root: Path) -> bytes:
 
 
 def pack_history(root: Path) -> bytes:
-    """Return a git bundle of the repository's HEAD, or nothing when it has no commit."""
+    """Return a git bundle of the repository's HEAD, or nothing when it has no commit.
+
+    Nothing too when `root` is a subdirectory of the repository: HEAD holds the other paths as well, and the
+    container commits the packed tree instead (`commit_packed_tree`).
+    """
     if subprocess.run(
         ["git", "-C", str(root), "rev-parse", "-q", "--verify", "HEAD"], capture_output=True
     ).returncode:
+        return b""
+    top = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    if Path(top).resolve() != root.resolve():
         return b""
     with tempfile.TemporaryDirectory(prefix="slow-lane-") as tmp:
         bundle = Path(tmp) / "history.bundle"
@@ -374,7 +406,7 @@ async def _poll_child_outputs(names: list[str]) -> tuple[str, File, File] | None
 
 
 async def _submit_async(
-    pytest_args: list[str], interruptible: bool, result: Path | None = None
+    pytest_args: list[str], interruptible: bool, result: Path | None = None, mode: str = MODE_PYTEST
 ) -> tuple[int, str, str]:
     from flyte_agent_factory import _slow_lane, child
 
@@ -391,7 +423,7 @@ async def _submit_async(
     uploaded_history = File.from_existing_remote(history_uri)
 
     # A lane that names no marker is the slow lane, as in the local run; a later `-m` wins in pytest.
-    args = json.dumps(["-m", "slow", *pytest_args])
+    args = json.dumps(pytest_args if mode == MODE_COMMAND else ["-m", "slow", *pytest_args])
     names: list[str] = []
     with child.track_submissions(names.append):
         try:
@@ -399,7 +431,7 @@ async def _submit_async(
             code, tail, junit = cast(
                 tuple[str, File, File],
                 await _settle(
-                    lane.aio(tree=uploaded, history=uploaded_history, pytest_args=args),
+                    lane.aio(tree=uploaded, history=uploaded_history, pytest_args=args, mode=mode),
                     lambda: _poll_child_outputs(names),
                 ),
             )
@@ -416,8 +448,10 @@ async def _submit_async(
         return int(code), (Path(tmp) / "tail").read_text(errors="replace"), (Path(tmp) / "junit").read_text()
 
 
-def _submit(pytest_args: list[str], interruptible: bool, result: Path | None = None) -> tuple[int, str, str]:
-    return asyncio.run(_submit_async(pytest_args, interruptible, result))
+def _submit(
+    pytest_args: list[str], interruptible: bool, result: Path | None = None, mode: str = MODE_PYTEST
+) -> tuple[int, str, str]:
+    return asyncio.run(_submit_async(pytest_args, interruptible, result, mode))
 
 
 def _write_result(result: Path | None, code: int) -> None:
@@ -446,12 +480,24 @@ def _run_local(junit: Path | None, pytest_args: Sequence[str], result: Path | No
     return code
 
 
+def _run_local_command(junit: Path | None, command: Sequence[str], result: Path | None = None) -> int:
+    env = {**os.environ, **({"AGENT_FACTORY_LANE_JUNIT": str(junit)} if junit is not None else {})}
+    try:
+        code = subprocess.run(command, env=env).returncode
+    except OSError as exc:
+        print(f"slow lane: cannot run {command[0]}: {exc}", file=sys.stderr)
+        code = 127
+    _write_result(result, code)
+    return code
+
+
 def _run_remote(
     junit: Path | None,
     pytest_args: list[str],
     submit: Submit,
     on_demand: bool = False,
     result: Path | None = None,
+    write_empty_junit: bool = True,
 ) -> int | None:
     """Run the lane in a child action; return its exit code, or None if it could not be placed."""
     # Spot first: on-demand capacity is the scarce pool here, so it is tried only when asked for.
@@ -485,7 +531,8 @@ def _run_remote(
         print(f"slow lane: setup failed in the child action, running locally\n{tail}", file=sys.stderr)
         return None
     _write_result(result, code)
-    if junit is not None:
+    # A command that writes no junit leaves an empty file in the child: not worth a file here.
+    if junit is not None and (junit_xml or write_empty_junit):
         junit.parent.mkdir(parents=True, exist_ok=True)
         junit.write_text(junit_xml)
     print(tail, end="" if tail.endswith("\n") else "\n")
@@ -505,7 +552,19 @@ def main(argv: Sequence[str] | None = None, submit: Submit | None = None) -> int
         help=f"when the lane cannot run in a child action, exit {NOT_RUN} instead of running it here",
     )
     parser.add_argument("--on-demand", action="store_true", help="try on-demand when spot has no capacity")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Everything after `--` is a command to run instead of pytest; argparse would hand it back mixed in with
+    # the pytest arguments.
+    command: list[str] = []
+    mode = MODE_PYTEST
+    if "--" in argv:
+        split = argv.index("--")
+        argv, command, mode = argv[:split], argv[split + 1 :], MODE_COMMAND
+        if not command:
+            parser.error("-- needs a command")
     args, pytest_args = parser.parse_known_args(argv)
+    if mode == MODE_COMMAND:
+        pytest_args = command
 
     if os.environ.get(ENV_VAR) == "child":
         try:
@@ -514,8 +573,10 @@ def main(argv: Sequence[str] | None = None, submit: Submit | None = None) -> int
         except (ImportError, OSError, RuntimeError, ValueError) as exc:
             print(f"slow lane: running locally, cannot attach to a Flyte run ({exc})", file=sys.stderr)
         else:
-            runner = submit or (lambda pytest_args, spot: _submit(pytest_args, spot, args.result))
-            code = _run_remote(args.junit, pytest_args, runner, args.on_demand, args.result)
+            runner = submit or (lambda pytest_args, spot: _submit(pytest_args, spot, args.result, mode))
+            code = _run_remote(
+                args.junit, pytest_args, runner, args.on_demand, args.result, mode == MODE_PYTEST
+            )
             if code is not None:
                 return code
             print("slow lane: running locally, the child action could not be placed", file=sys.stderr)
@@ -523,6 +584,8 @@ def main(argv: Sequence[str] | None = None, submit: Submit | None = None) -> int
         # The messages above say "running locally", the default; with this flag the caller decides.
         print(f"slow lane: --no-local, so it was not run here (exit {NOT_RUN})", file=sys.stderr)
         return NOT_RUN
+    if mode == MODE_COMMAND:
+        return _run_local_command(args.junit, command, args.result)
     return _run_local(args.junit, pytest_args, args.result)
 
 

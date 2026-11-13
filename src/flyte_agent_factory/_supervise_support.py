@@ -247,6 +247,12 @@ async def _run_declared_checks(
     if junit_dir is not None:
         env[_gate_tests.PYTEST_JUNIT_ENV] = str(junit_dir)
         env[_gate_tests.SLOW_LANE_ENV] = "child"
+        # In a subdirectory of the junit directory, which is removed with it. The same for every project.
+        # The same lookup as the gate's own lanes: the run's image, since FLYTE_INTERNAL_IMAGE here lacks git.
+        image = await asyncio.to_thread(
+            _gate_tests._run_image, workspace, _gate_tests._launcher_command(Path(), [])[1]
+        )
+        env[_gate_tests.TEST_LANE_ENV] = str(_gate_tests.write_lane_launcher(junit_dir / "lane", image))
     try:
         proc = await asyncio.create_subprocess_exec(
             "bash",
@@ -431,6 +437,46 @@ _preflight_resumes = 0
 
 #: The least a review stopped by the usage limit waits before it runs again.
 _REVIEW_RETRY_MIN_S = 600.0
+
+#: Added to the time a limit lifts (the router's retry time or the account's reset) before the re-run:
+#: both are estimates, and asking the instant before the limit lifts only earns another deferral.
+_REVIEW_RETRY_SLACK_S = 120.0
+
+#: How long a review that came back incomplete (a judge gave no verdict) waits before asking the
+#: missing judges again, and how many times per DONE. The other judges' verdicts are kept, so a re-run
+#: is cheap; a judge that is still missing after these is a problem for a human.
+_REVIEW_INCOMPLETE_RETRY_S = 180.0
+_REVIEW_INCOMPLETE_MAX_RERUNS = 2
+
+#: How long ago a router's `retry at` may be and still be today's: longer than a review round takes.
+_ROUTER_RETRY_PAST_S = 3600.0
+_ROUTER_RETRY = re.compile(r"\bretry at (\d{1,2}):(\d{2}) UTC\b")
+
+
+def _parse_router_retry_at(text: str, now: float) -> float | None:
+    """Return the wall time of the router's `retry at HH:MM UTC` in `text`.
+
+    For a deferral that reached the supervisor as text only: `_usage` reads the account's am/pm
+    resets, not the router's 24-hour wording. A time up to `_ROUTER_RETRY_PAST_S` ago passed while the
+    round ran (a judge deferred early) and is returned as is, for the caller's minimum wait to apply; an
+    earlier one is tomorrow's.
+    """
+    found = _ROUTER_RETRY.search(text or "")
+    if not found or int(found[1]) > 23 or int(found[2]) > 59:
+        return None
+    midnight = now - now % 86400
+    at = midnight + int(found[1]) * 3600 + int(found[2]) * 60
+    return at if at > now - _ROUTER_RETRY_PAST_S else at + 86400
+
+
+def describe_rejection(qa_round: int, timeline: _timeline._Timeline) -> str:
+    """Return the PR status for a rejected round, naming apart from FAIL the judges with no verdict."""
+    unheard = sorted(
+        j for j, o in timeline.judges.items() if o.get("outcome") in ("NO_VERDICT", "DEFERRED", "NOT_RUN")
+    )
+    return f"review rejected round {qa_round}" + (
+        f"; no verdict from {', '.join(unheard)}" if unheard else ""
+    )
 
 
 _DONE_LINE = re.compile(r"^\s*DONE\b", re.IGNORECASE | re.MULTILINE)

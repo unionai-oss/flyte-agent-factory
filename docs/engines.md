@@ -31,6 +31,35 @@ The same holds for the other roles. With no pin the builders (delegate workers, 
 Claude, and the judges run on Codex when the profile has a `codex_token` and `QA_DIFFERENT_ENGINE` is on (the default);
 `JUDGE_ENGINE` pins all three judges, and a per-judge key wins over it.
 
+## Pins and usage limits
+
+A pin is **hard** unless `ENGINE_FALLBACK = "allow"`: when the pinned engine hits its usage limit, the role
+waits for that limit to reset rather than moving to the other engine. The explicit pins are
+`COORDINATOR_ENGINE` (profile, slot, launch or environment), its alias `AUTHOR_ENGINE`, the `project` task's
+`engine` input, `DELEGATE_ENGINE`, and an engine direction sent to a paused project (see
+[operating.md](operating.md#while-it-waits-on-a-usage-limit)). `ADMITTED_ENGINE` and the built-in role defaults
+are not pins: they only say which engine to prefer, and a limited preferred engine is passed over.
+
+- `ENGINE_FALLBACK = "allow"` (`[policy]`, per slot or per launch) makes the explicit pins soft again: a
+  limited pinned engine hands over to the other one. Unset or `"wait"` keeps them hard; any other value is a
+  profile error. A direction pin and the benchmark's `hard_pin` stay hard either way.
+- A hard pin waits only for a usage limit. A pinned engine with no credential, or whose login is broken,
+  is not waited for: the run asks a human, naming the fix.
+- Delegate workers do **not** inherit the coordinator's pin. Their only pin is `DELEGATE_ENGINE`, and an
+  explicit `DELEGATE_ENGINE` is hard like any other. An unpinned delegate never goes to an engine whose
+  known limit has not reset, and a limited delegate waits (pinned) or re-routes (unpinned). A worker cut
+  off by a usage limit hands back its partial patch and `plan.md`, as at a turn-limit end.
+- Judge and reviewer pins (`JUDGE_ENGINE` and the per-judge keys) are unchanged by this: they still fall back.
+  Making them hard too is a follow-up.
+
+While the coordinator waits, the timeline row, the dashboard's phase label and `factory.status`'s `paused`
+field all say which engine it waits for, until when (UTC), and why each other engine was not used.
+
+**Migration.** Before this change a pinned coordinator moved to the other engine on a usage limit. A profile
+or slot that sets `COORDINATOR_ENGINE` (for example `profiles/example-codex-personal.toml`) or
+`DELEGATE_ENGINE` now **waits** for that engine's reset instead. To keep the old behaviour, add
+`ENGINE_FALLBACK = "allow"` beside the pin.
+
 ## What each engine supports as coordinator
 
 | | Claude Code | Codex CLI |
@@ -47,7 +76,7 @@ Claude, and the judges run on Codex when the profile has a `codex_token` and `QA
 | Compaction between rounds (`COMPACT_BETWEEN_ROUNDS`) | yes, `/compact` | **no.** Skipped, with a timeline row; `codex exec` takes no slash commands |
 | Resume after a restart | the conversation in the checkpointed config dir (`--resume`) | the thread id saved in the checkpoint, plus queued messages |
 | Usage metering | the setup-token's meter feeds routing, and the author's token totals are summed from its transcript | **partial.** The meter comes from the usage Codex reports in `exec` events and feeds routing; per-round author token totals are read from Claude transcripts only, so none are reported for Codex |
-| Handoff on a usage limit | to Codex, when the profile has both a `claude_token` and a `codex_token` and the run is not hard-pinned | to Claude, likewise. An unusable Codex token is handed over or ends the run |
+| Handoff on a usage limit | to Codex, when the profile has both a `claude_token` and a `codex_token` and the coordinator is unpinned or `ENGINE_FALLBACK = "allow"`; a pinned coordinator waits for the reset. The checkpoint is taken first, and the new engine is told what happened and to commit and push first | to Claude, likewise, resuming the earlier Claude thread when there is one. An unusable Codex token is handed over or ends the run |
 
 A Codex coordinator is told in its instructions what it lacks.
 

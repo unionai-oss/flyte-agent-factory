@@ -215,6 +215,7 @@ async def test_signed_webhook_submits_board_work_when_intake_and_deploy_are_off(
 
     profile = dataclasses.replace(
         intake.profile,
+        repo="https://github.com/acme/workspace.git",  # the board's issues live in the workspace
         board=board_profile().board,
         deploy=_profile.Deploy(auto=False),
         github=dataclasses.replace(intake.profile.github, maintainers=()),
@@ -232,7 +233,7 @@ async def test_signed_webhook_submits_board_work_when_intake_and_deploy_are_off(
             run=SimpleNamespace(aio=submit),
         ),
     )
-    response = await deliver(intake, commits=[{"id": "abc", "message": "board #49"}])
+    response = await deliver(intake, repo="acme/workspace", commits=[{"id": "abc", "message": "board #49"}])
     assert response.status_code == 202
     assert submitted[0][0]["name"] == _webhook.ISSUES_TASK
     assert json.loads(submitted[0][1]["payload"])["commits"][0]["message"] == "board #49"
@@ -806,3 +807,16 @@ def test_an_unchanged_flagged_set_is_not_republished_when_main_advances(world):
     app.issues[49] = "closed"  # the flagged set changes: one new status, on the new head
     _board_events.drift(profile, "token", app, lambda ref: None)
     assert len(app.statuses) == 2 and app.statuses[-1][1] == "bbb"
+
+
+def test_board_issues_live_in_the_workspace_whatever_the_factory_repo(world):
+    # The engine is just another target: `[repo] factory` does not move the board's home off the workspace.
+    profile, _, app = world
+    profile = dataclasses.replace(
+        profile, repos={**profile.repos, "factory": "https://github.com/acme/engine.git"}
+    )
+    assert _board_events.repository(profile) == REPO
+    assert _board_events.eligible(profile, "push", event())
+    assert not _board_events.eligible(
+        profile, "push", {**event(), "repository": {"full_name": "acme/engine"}}
+    )

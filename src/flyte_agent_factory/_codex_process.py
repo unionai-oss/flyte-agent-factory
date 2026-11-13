@@ -6,7 +6,7 @@ process that prints JSONL events and exits, and the conversation lives in a thre
 later turn is `codex exec resume <id>`. Keeping `thread_id` readable and settable is what lets a
 restarted pod (same `$CODEX_HOME`, id from the checkpoint) carry on in the same conversation.
 
-The attributes the supervisor reads (`tail`, `returncode`, `limit_hit_at`, `limit_text`,
+The attributes the supervisor reads (`tail`, `returncode`, `limit_hit_at`, `limit_seen_wall`, `limit_text`,
 `last_output`, `output_count`) and the methods it calls (`submit`, `wait`, `stop`) keep the names
 `ClaudeProcess` gives them. Unlike a TUI session, "no process running" is the normal idle state here,
 so `returncode` is set only by a crash, never by a turn that finished.
@@ -94,6 +94,7 @@ class CodexProcess:
         self.output_count = 0
         #: `time.monotonic()` of the last usage refusal and the message Codex gave with it.
         self.limit_hit_at: float | None = None
+        self.limit_seen_wall: float | None = None  # wall-clock time of the same refusal
         self.limit_text = ""
         #: Why the latest turn crashed when Codex could not authenticate (see `_codex_auth`), else ''.
         #: Retrying the same login cannot help, so the supervisor treats it differently from a crash.
@@ -193,6 +194,7 @@ class CodexProcess:
                             refusal = self._refusal([event])
                             if refusal:
                                 self.limit_hit_at = time.monotonic()
+                                self.limit_seen_wall = time.time()
                                 self.limit_text = refusal
         code = await proc.wait()
         # Adapt the meter's list[dict] annotation, maintained in another chunk.

@@ -1,13 +1,15 @@
 """What a project that delivers to another repo must pass: that repo's own CI, found in its checkout.
 
 The factory's checks run the factory's ruff and mypy configs, so a patch can pass review and still fail
-the target's `make mypy`. This module reads the brief's `Delivers to:` line and finds, in the checkout,
-the commands the target's CI runs. `_gates` runs them. Parsing only: nothing here runs a command.
+the target's `make mypy`. This module reads the brief's `Delivers to:` line and finds, in a checkout of the
+target (`_delivery.target_checkout`, or a legacy nested one), the commands the target's CI runs. `_gates`
+runs them. Parsing only: nothing here runs a command.
 """
 
 import dataclasses
 import itertools
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -40,12 +42,19 @@ _STAND_INS = {
     "github.token": "",
     "runner.os": "Linux",
 }
+#: The contexts that are paths of the job running the step, and the variable holding each. Discovery leaves
+#: the expression as written, so a report shows it as the workflow does; `job_paths` puts the job's own path
+#: in its place when the step runs.
+JOB_PATHS = {"runner.temp": "RUNNER_TEMP", "github.workspace": "GITHUB_WORKSPACE"}
+_STAND_INS.update({context: f"${{{{ {context} }}}}" for context in JOB_PATHS})
 #: The actions that install a Rust toolchain: group 1 the action, group 2 its ref.
 _RUST_ACTION = re.compile(
     r"^(dtolnay/rust-toolchain|actions-rs/toolchain|actions-rust-lang/setup-rust-toolchain)(?:@(.*))?$"
 )
 #: The actions that put a uv or a Python on the job's PATH, and a local action (which may do either).
 _TOOL_ACTION = re.compile(r"^(astral-sh/setup-uv|actions/setup-python)(?:@.*)?$|^\./")
+#: The actions that pass files between the jobs of a run, which the gate does itself (`_target_run`).
+_ARTIFACT_ACTION = re.compile(r"^actions/(upload-artifact|download-artifact)(?:@.*)?$")
 _EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 _TOKEN = re.compile(
     r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>-?\d+(?:\.\d+)?)|(?P<name>[A-Za-z_][\w.-]*)|(?P<op>==|!=|&&|\|\||[!(),]))"
@@ -66,6 +75,18 @@ _COVERAGE_STEP = re.compile(r"--cov\b|coverage run")
 _TRIGGERS = {"pull_request", "push"}
 #: Run when the target has no coverage command of its own; the data file is read with `coverage json`.
 FALLBACK_COVERAGE = "python -m pytest --cov --cov-branch"
+#: How the gate reads a data file, as `python -m` arguments. `--ignore-errors` skips a measured file with no
+#: source (code a test compiled under a made-up name); a changed file left out of the report still counts
+#: as uncovered.
+COVERAGE_JSON = ("coverage", "json", "--ignore-errors")
+#: The fallback for a uv project (a `uv.lock`): its own environment, with pytest-cov installed into it since
+#: the project need not declare it (named by its interpreter: `uv pip` would follow `UV_PYTHON` or an active
+#: venv elsewhere). Not `uv run --with`: that overlay splits the environment in two, which
+#: breaks tests that build a venv from its site-packages (the engine's do).
+FALLBACK_COVERAGE_UV = (
+    "uv sync && uv pip install --python \"$(uv run --no-sync python -c 'import sys; print(sys.executable)')\""
+    " pytest-cov && uv run --no-sync python -m pytest --cov --cov-branch"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +112,12 @@ class Command:
     on a runner they are what installs the toolchain the check uses). `uv` is the version an earlier
     `astral-sh/setup-uv` step (or a local action) installs: "latest" with no version, "" if none; `python`
     is the `actions/setup-python` version.
+
+    `timeout` is the step's `timeout-minutes`, else its job's, in seconds; None leaves the gate's default.
+    `needs` are the jobs (of the same workflow) the job waits for; `job_runs_after_failure` is whether its
+    `if:` runs it when one of them failed (`always()`), and `runs_after_failure` the same for the step after
+    an earlier step of its job failed. `action` is `upload-artifact` or `download-artifact` for a step that
+    uses that action, which the gate does itself, with `inputs` its `with:` (expressions expanded).
     """
 
     command: str
@@ -106,6 +133,12 @@ class Command:
     toolchain_steps: tuple[str, ...] = ()
     uv: str = ""
     python: str = ""
+    timeout: int | None = None
+    needs: tuple[str, ...] = ()
+    runs_after_failure: bool = False
+    job_runs_after_failure: bool = False
+    action: str = ""
+    inputs: tuple[tuple[str, str], ...] = ()
 
 
 def parse_target(brief: str) -> Target | None:
@@ -115,7 +148,12 @@ def parse_target(brief: str) -> Target | None:
 
 
 def find_checkout(project: Path, target: Target) -> Path | None:
-    """Return the target's checkout inside `project`: the named path, else the one nested git checkout."""
+    """Return the target's nested git checkout inside `project`: the named path, else the only one.
+
+    The layout from before `promote.toml`: a project that imported the target's files has no nested
+    checkout, and `_delivery.target_checkout` makes one for the gates. Such a checkout still passes the gates
+    but cannot be delivered.
+    """
     if target.path:
         path = (project / target.path).resolve()
         # The brief is a task input: a path out of the project would run commands anywhere.
@@ -124,9 +162,30 @@ def find_checkout(project: Path, target: Target) -> Path | None:
     return nested[0] if len(nested) == 1 else None
 
 
-def _line_of(text: str, needle: str) -> int:
-    """Return the 1-based line of `text` holding `needle`; PyYAML does not keep line numbers."""
-    return next((i for i, row in enumerate(text.splitlines(), 1) if needle in row), 1)
+def _step_lines(text: str) -> dict[tuple[str, int], int]:
+    """Return the 1-based line of each step's `run:` (else of the step), by (job id, index in its steps).
+
+    `safe_load` keeps no positions, so the workflow is composed again for its nodes' marks. Searching the
+    text for the script instead finds the first step with the same text, in whichever job.
+    """
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    lines: dict[tuple[str, int], int] = {}
+    for jobs in _children(root, "jobs"):
+        if not isinstance(jobs, yaml.MappingNode):
+            continue
+        for job_id, job in jobs.value:
+            for steps in _children(job, "steps"):
+                for index, step in enumerate(steps.value if isinstance(steps, yaml.SequenceNode) else []):
+                    run = next(iter(_children(step, "run")), step)
+                    lines[(str(job_id.value), index)] = run.start_mark.line + 1
+    return lines
+
+
+def _children(node: yaml.Node | None, key: str) -> list[yaml.Node]:
+    """Return the values under `key` of a mapping node; none if it is not a mapping."""
+    if not isinstance(node, yaml.MappingNode):
+        return []
+    return [value for name, value in node.value if name.value == key]
 
 
 def _mapping(node: Any, what: str) -> dict[str, Any]:
@@ -182,11 +241,13 @@ class _Expression:
     A value is a str or a bool; None is "cannot be decided offline", with the first cause in `why`.
     Only what a pull request check needs is implemented (see `_condition` for the list): anything else,
     including a syntax error, is undecidable rather than guessed. Written here because no maintained
-    Python package evaluates workflow expressions; the grammar is small.
+    Python package evaluates workflow expressions; the grammar is small. `failed` is what the status
+    functions see: whether an earlier step of the job (or a job it needs) failed.
     """
 
-    def __init__(self, text: str, scope: dict[str, str]) -> None:
+    def __init__(self, text: str, scope: dict[str, str], *, failed: bool = False) -> None:
         self.scope = scope
+        self.failed = failed
         self.why = ""
         self.tokens: list[tuple[str, str]] = []
         position = 0
@@ -291,10 +352,10 @@ class _Expression:
         return None
 
     def _call(self, name: str, args: list[str | bool | None]) -> str | bool | None:
-        if name in ("success", "always"):
-            return True
-        if name in ("failure", "cancelled"):
-            return False
+        if name in ("success", "failure"):
+            return self.failed == (name == "failure")
+        if name in ("always", "cancelled"):
+            return name == "always"
         if name in ("startswith", "endswith", "contains") and len(args) == 2:
             if args[0] is None or args[1] is None:
                 return None
@@ -329,10 +390,10 @@ def _same(left: str | bool, right: str | bool) -> bool:
         return a == b
 
 
-def _evaluate(text: str, scope: dict[str, str]) -> tuple[str | bool | None, str]:
+def _evaluate(text: str, scope: dict[str, str], *, failed: bool = False) -> tuple[str | bool | None, str]:
     """Return the value of the expression `text` and, when it is None, why it cannot be decided."""
     try:
-        parsed = _Expression(text, scope)
+        parsed = _Expression(text, scope, failed=failed)
         return parsed.value(), parsed.why or "it is not an expression this check reads"
     except ValueError as exc:
         return None, str(exc)
@@ -364,13 +425,40 @@ def _condition(node: dict[str, Any], scope: dict[str, str]) -> str:
     """
     if "if" not in node:
         return ""
-    text = str(node["if"]).strip()
-    if text.startswith("${{") and text.endswith("}}") and text.count("${{") == 1:
-        text = text[3:-2]
-    value, why = _evaluate(text, scope)
+    value, why = _evaluate(_if_text(node), scope)
     if value is None:
         return f"its if cannot be decided offline: {why}"
     return "" if _truthy(value) else "its if is false for a pull request"
+
+
+def _if_text(node: dict[str, Any]) -> str:
+    """Return the expression of a step's or job's `if:`, without the optional `${{ }}` around it."""
+    text = str(node["if"]).strip()
+    if text.startswith("${{") and text.endswith("}}") and text.count("${{") == 1:
+        text = text[3:-2]
+    return text
+
+
+#: A status function in an `if:`; without one GitHub adds `success() &&`.
+_STATUS_CALL = re.compile(r"\b(?:success|failure|always|cancelled)\s*\(", re.I)
+
+
+def _runs_after_failure(node: dict[str, Any], scope: dict[str, str]) -> bool:
+    """Whether a step (or job) still runs once an earlier step of its job (or a job it needs) failed."""
+    if "if" not in node or not _STATUS_CALL.search(text := _if_text(node)):
+        return False
+    value, _ = _evaluate(text, scope, failed=True)
+    return value is not None and _truthy(value)
+
+
+def _timeout_of(node: dict[str, Any]) -> int | None:
+    """Return a step's or job's `timeout-minutes` in seconds; None when absent or only known at run time."""
+    value = node.get("timeout-minutes")
+    if isinstance(value, str) and re.fullmatch(r"\s*\d+(?:\.\d+)?\s*", value):
+        value = float(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return round(value * 60)
 
 
 def _continues_on_error(node: dict[str, Any]) -> bool:
@@ -429,7 +517,13 @@ def _matrix_of(job: dict[str, Any], job_id: str) -> tuple[list[dict[str, str]], 
 
 
 def _steps_of(
-    document: dict[str, Any], text: str, where: str, repo: str, checkout: Path | None, *, coverage: bool
+    document: dict[str, Any],
+    lines: dict[tuple[str, int], int],
+    where: str,
+    repo: str,
+    checkout: Path | None,
+    *,
+    coverage: bool,
 ) -> list[Command]:
     """Return the steps of the workflow `document` that are checks, or (`coverage`) measure coverage.
 
@@ -454,13 +548,13 @@ def _steps_of(
         rust: tuple[str, ...] = ()
         toolchain_steps: tuple[str, ...] = ()
         tool_steps: list[dict[str, Any]] = []
-        for step in steps:
+        for index, step in enumerate(steps):
             step = _mapping(step, f"a step of job {job_id}")
             rust = _rust_setup(step) or rust
             if _TOOL_ACTION.match(str(step.get("uses") or "")):
                 tool_steps.append(step)
             script = str(step.get("run") or "").strip()
-            if not script:
+            if not script and not _ARTIFACT_ACTION.match(str(step.get("uses") or "")):
                 continue
             # A step runs in every combination whose conditions hold: judge it in the first such one.
             chosen: tuple[dict[str, str], Command] | None = None
@@ -482,8 +576,9 @@ def _steps_of(
                 continue
             matrix, command = chosen
             combination = ",".join(f"{key.removeprefix('matrix.')}={value}" for key, value in matrix.items())
-            line = _line_of(text, script.splitlines()[0].strip())
-            origin = f"{where}:{line}" + (f" [{combination}]" if combination else "")
+            origin = f"{where}:{lines.get((str(job_id), index), 1)}" + (
+                f" [{combination}]" if combination else ""
+            )
             uv, python = _tools_of(tool_steps, {**base_scope, **matrix}, checkout)
             in_job.append(
                 dataclasses.replace(
@@ -592,12 +687,21 @@ def _judge_step(step: dict[str, Any], job: _Job, scope: dict[str, str], *, cover
         for key, value in {**job.env, **_env_of(step, f"env of a step of job {job.id}")}.items()
     }
     step_scope = {**scope, **{f"env.{k.lower()}": v for k, v in env.items() if v is not None}}
+    action = _ARTIFACT_ACTION.match(str(step.get("uses") or ""))
+    inputs: dict[str, str | None] = {}
+    if action:
+        if coverage:
+            return None
+        given = _mapping(step.get("with"), f"with of a step of job {job.id}")
+        inputs = {str(k).lower(): _expand(_env_value(v), step_scope) for k, v in given.items()}
+        # What a report calls the step; the gate runs `inputs`, not this.
+        script = f"actions/{action[1]} " + str(given.get("name") or given.get("pattern") or "*")
     expanded = _expand(script, step_scope)
     directory = str(step.get("working-directory") or "") or job.directory or ""
     expanded_directory = _expand(directory, step_scope)
-    if _is_setup(name, expanded or script):
+    if not action and _is_setup(name, expanded or script):
         return None
-    is_check = bool(
+    is_check = not action and bool(
         _COVERAGE_STEP.search(script) if coverage else _CHECK.search(f"{name} {expanded or script}")
     )
     if coverage and not is_check:
@@ -607,7 +711,9 @@ def _judge_step(step: dict[str, Any], job: _Job, scope: dict[str, str], *, cover
     if not skipped and (_continues_on_error(step) or _continues_on_error(job.node)):
         skipped = "continue-on-error: it cannot fail CI"
     unrunnable = ""
-    unresolved = expanded is None or expanded_directory is None or None in env.values()
+    unresolved = (
+        expanded is None or expanded_directory is None or None in env.values() or None in inputs.values()
+    )
     if unresolved and job.dynamic_matrix and not skipped:
         # What the step needs may be a value only the generated matrix has: nothing to run offline.
         skipped = "its matrix cannot be decided offline"
@@ -625,6 +731,12 @@ def _judge_step(step: dict[str, Any], job: _Job, scope: dict[str, str], *, cover
         skipped,
         str(job.id),
         is_check,
+        timeout=_timeout_of(step) or _timeout_of(job.node),
+        needs=tuple(_listed(job.node.get("needs"))),
+        runs_after_failure=_runs_after_failure(step, step_scope),
+        job_runs_after_failure=_runs_after_failure(job.node, scope),
+        action=action[1] if action else "",
+        inputs=tuple((k, v) for k, v in inputs.items() if v is not None),
     )
 
 
@@ -728,7 +840,8 @@ def _workflow_commands(
             # YAML 1.1 reads the bare key `on` as the boolean True.
             if not _is_pull_request_check(document.get("on", document.get(True)), changed):
                 continue
-            found.extend(_steps_of(document, text, where, repo, checkout, coverage=coverage))
+            lines = _step_lines(text)
+            found.extend(_steps_of(document, lines, where, repo, checkout, coverage=coverage))
         except (yaml.YAMLError, ValueError) as exc:
             found.append(Command(f"read {where}", where, unrunnable=f"cannot read {where}: {exc}"))
     return found
@@ -820,7 +933,30 @@ def coverage_command(checkout: Path) -> Command:
         _makefile_targets(checkout, _MAKE_COVERAGE) + _workflow_commands(checkout, None, coverage=True)
     )
     own = [c for c in own if not c.unrunnable]
-    return own[0] if own else Command(FALLBACK_COVERAGE, "default")
+    if own:
+        return own[0]
+    workflow = _workflow_commands(checkout, None, coverage=False)
+    # The fallback reruns the target's pytest under --cov: it gets the longest limit the target's CI gives a
+    # pytest step, not the gate's per-step default (the engine's suite outruns that default).
+    limits = [c.timeout for c in workflow if c.timeout and re.search(r"\bpytest\b", c.command)]
+    timeout = max(limits, default=None)
+    if (checkout / "uv.lock").is_file():
+        # The uv the workflows install: the pod's own may be too old for the lock file.
+        return _with_uv_of(workflow, [Command(FALLBACK_COVERAGE_UV, "default", timeout=timeout)])[0]
+    return Command(FALLBACK_COVERAGE, "default", timeout=timeout)
+
+
+def coverage_report_command(measured: Command, out: Path) -> Command | None:
+    """Return how to write `measured`'s data file as JSON to `out` when the python on PATH cannot.
+
+    None: `python -m coverage json` from PATH reads it. The uv fallback measured in the project's own
+    environment, where it installed pytest-cov (and so coverage), so its report is written there too, with
+    the same uv.
+    """
+    if measured.command != FALLBACK_COVERAGE_UV:
+        return None
+    report = f"uv run --no-sync python -m {' '.join(COVERAGE_JSON)} -o {shlex.quote(str(out))}"
+    return dataclasses.replace(measured, command=report)
 
 
 def parse_env_file(text: str) -> dict[str, str]:
@@ -852,3 +988,10 @@ def parse_listed_lines(summary: str) -> set[str]:
         elif inside and (entry := re.match(r"^\s*(?:[-*]\s*)?`?(\S+?:\d+)`?\s+--\s+\S", row)):
             listed.add(entry[1])
     return listed
+
+
+def job_paths(text: str, env: dict[str, str]) -> str:
+    """Put the job's own paths (`RUNNER_TEMP`, `GITHUB_WORKSPACE` in `env`) in place of their expressions."""
+    for context, variable in JOB_PATHS.items():
+        text = text.replace(_STAND_INS[context], env[variable])
+    return text

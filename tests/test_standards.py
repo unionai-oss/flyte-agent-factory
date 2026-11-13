@@ -486,3 +486,31 @@ def test_path_origin_brand_uses_repository_compatibility_candidate(tmp_path):
     (tmp_path / "brand.md").write_text("repository brand")
     files = _standards.capture(_standards.Standards(brand="brand.md"), base, root=tmp_path)
     assert files == {"brand.md": "repository brand"}
+
+
+def test_a_file_two_language_packs_detect_is_checked_against_upstream_once(tmp_path, monkeypatch):
+    from flyte_agent_factory import _vendored
+
+    loads = []
+
+    class Upstreams:
+        def unchanged(self, path):
+            return False
+
+    def load(*args, **kwargs):
+        loads.append(args)
+        return Upstreams()
+
+    monkeypatch.setattr(_vendored, "load", load)
+    project = tmp_path / "app"
+    project.mkdir()
+    (project / "main.py").touch()
+    files = {
+        "languages/python.md": "detect: **/*.py\n",
+        "languages/scripting.md": "detect: *.py\n",
+        "languages/rust.md": "detect: **/*.rs\n",
+    }
+    selected = _standards.select(files, _standards.Standards(), project, fetch=False)
+    assert {"languages/python.md", "languages/scripting.md"} <= selected.keys()
+    assert "languages/rust.md" not in selected
+    assert len(loads) == 1

@@ -118,20 +118,6 @@ class Facts:
     #: item's node id). Admission keeps a pin unless it is exhausted, and says so in the launch reason; an
     #: engine with no credential waits with a reason rather than launch on the other.
     pins: Mapping[str, str] = field(default_factory=dict)
-    #: The factory's own repository (`[repo] factory`). At most `engine_projects` projects on it run at once
-    #: (`[repo] factory_projects`); overlapping files are held back separately by `file_conflict`. Empty:
-    #: no such rule.
-    engine_repo: str = ""
-    engine_projects: int = 1
-
-
-def _engine_busy_text(holders: Sequence[str], limit: int) -> str:
-    """Name the engine-repo projects holding the limit; the limit is stated only when it is not the default 1.
-
-    `_factory_policy.word_engine_busy` words the dispatcher's log line the same way.
-    """
-    names = ", ".join(holders)
-    return f"{names} (limit {limit})" if limit > 1 else names
 
 
 @dataclass(frozen=True)
@@ -142,9 +128,6 @@ class Reason:
     detail: str = ""
     #: For `low_priority_waits`: how many runnable requests it waits behind (not in its identity).
     behind: int = field(default=0, compare=False)
-    #: For `engine_busy`: the engine-repo projects holding the lane, and its limit (not in its identity).
-    holders: tuple[str, ...] = field(default=(), compare=False)
-    limit: int = field(default=0, compare=False)
 
 
 @dataclass(frozen=True)
@@ -468,8 +451,6 @@ def plan(facts: Facts) -> Plan:
             issue = f"{safe_repo(issue_repo) if issue_repo else repo}#{number}"
         return issue_ids.get((repo, issue), issue)
 
-    engine_repo = safe_repo(facts.engine_repo)
-    engine_holders: list[str] = []  # engine-repo projects running or admitted in this pass
     project_runs: dict[str, str] = {}  # project name -> its live run, by the queue's label
     for repo, paths in facts.tracked_paths.items():
         tracked.setdefault(safe_repo(repo), set()).update(paths)
@@ -481,8 +462,6 @@ def plan(facts: Facts) -> Plan:
             project_runs[project] = run.name
         repo = safe_repo(run.repo)
         occupied.append((repo, _occupied_files(run.predicted_files, run.observed_files), run.name))
-        if engine_repo and repo == engine_repo:
-            engine_holders.append(run.name)
         issue = run.issue or run.labels.get("factory-issue", "")
         if issue:
             running[repo, resolve_issue(repo, issue)] = run.name
@@ -547,13 +526,6 @@ def plan(facts: Facts) -> Plan:
         )
         if conflict:
             return Reason("file_conflict", conflict, _scope_detail(source))
-        if engine_repo and repo == engine_repo and len(engine_holders) >= facts.engine_projects:
-            return Reason(
-                "engine_busy",
-                _engine_busy_text(engine_holders, facts.engine_projects),
-                holders=tuple(engine_holders),
-                limit=facts.engine_projects,
-            )
         pin = facts.pins.get(identity_of(item), "")
         if pin and free and not any(slot.engine == pin for slot in free):
             return Reason("pin_unconfigured", pin)
@@ -599,8 +571,6 @@ def plan(facts: Facts) -> Plan:
             other for other in free if other is not slot and not (slot.slot and other.slot == slot.slot)
         ]
         occupied.append((repo, scope, identity_of(entry)))
-        if engine_repo and repo == engine_repo:
-            engine_holders.append(identity_of(entry))
         if issue:
             running[repo, issue] = identity_of(entry)
     return Plan(tuple(launches), tuple(waiting), unusable)

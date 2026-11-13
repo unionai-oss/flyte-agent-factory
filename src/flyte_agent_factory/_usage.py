@@ -14,7 +14,17 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
-from flyte_agent_factory import _meter, _names, _policy, _profile, _router, _session_config, _timeline
+from flyte_agent_factory import (
+    _limit_reset,
+    _meter,
+    _names,
+    _pins,
+    _policy,
+    _profile,
+    _router,
+    _session_config,
+    _timeline,
+)
 
 #: The supervisor's meter record (None outside `project`), and the guard that keeps two
 #: callers from reading at once.
@@ -426,6 +436,11 @@ def _route(
     carries them.
     """
     static, pinned = _static_engine(purpose)
+    # The builder roles take their pin, and whether it is hard, from `_pins`; the rest keep the run-wide flag.
+    hard = _hard_pins
+    if role_pin := {"author": _pins.author_pin, "delegate": _pins.delegate_pin}.get(purpose):
+        found = role_pin()
+        pin, hard = pin or found.engine, found.hard
     available = _author_engines()
     decision = _router.route(
         purpose,
@@ -434,7 +449,7 @@ def _route(
         now=time.time(),
         preferred=pin or static,
         pin=pin or (static if pinned else ""),
-        hard_pin=_hard_pins,
+        hard_pin=hard,
         builders=(_author_engine,) if purpose in _QA_ROLES and _qa_differs() else (),
         exclude=exclude,
     )
@@ -448,7 +463,7 @@ def _route(
 
 def _deferred(decision: _router.Decision) -> _router.RouterDeferred:
     # The limit mark is what `_one_judge` and the review loop already wait on.
-    return _router.RouterDeferred(f"{USAGE_LIMIT_MARK} {decision.row()}")
+    return _router.RouterDeferred(f"{USAGE_LIMIT_MARK} {decision.row()}", retry_at=decision.retry_at)
 
 
 def _delegation_engine(timeline: _timeline._Timeline) -> Callable[[], Awaitable[str]]:
@@ -493,9 +508,19 @@ def _note_engine_limit(engine: str, refusal: str) -> None:
         _note_codex_broken(refusal)
         return
     if _meters:
+        until = _refusal_until(refusal)
+        if until is None:
+            _timeline._log_line(f"[meter] {_unknown_reset_note(engine, refusal)}")
         _meters.note_limit(
-            engine, _reset_at(refusal) or time.time() + _session_config.LIMIT_RETRY_S, _limit_account(engine)
+            engine, until or time.time() + _session_config.LIMIT_RETRY_S, _limit_account(engine)
         )
+
+
+def _unknown_reset_note(engine: str, text: str) -> str:
+    """Say the reset is not known, so a 30-minute poll is not mistaken for the real limit."""
+    minutes = round(_session_config.LIMIT_RETRY_S / 60)
+    shown = f' ("{" ".join(text.split())[:120]}")' if text.strip() else ""
+    return f"{engine} reset time unknown{shown}; retrying after {minutes} minutes"
 
 
 def _limit_account(engine: str) -> str:
@@ -517,13 +542,18 @@ def _same_limit_notice(text: str, earlier: str) -> bool:
 
 
 def _note_session_limit(
-    reset_at: float | None, timeline: _timeline._Timeline, codex_meter: _meter.Meter | None = None
+    reset_at: float | None,
+    timeline: _timeline._Timeline,
+    codex_meter: _meter.Meter | None = None,
+    text: str = "",
 ) -> None:
     """Record a refusal of the headless session's own credential as a meter.
 
     Without a usage endpoint for setup-tokens nothing else reads this account, so slots and the
     router would never learn that the credential is exhausted. A Codex author's refusal is recorded
-    as a child's is, on top of the rate limits its last turn reported (`codex_meter`).
+    as a child's is, on top of the rate limits its last turn reported (`codex_meter`). `reset_at` is a
+    fresh future reset or None; with none, the refusal is remembered for `LIMIT_RETRY_S` and the row
+    quotes `text`, the notice that gave no usable time.
     """
     if _author_engine == "codex":
         if not _meters:
@@ -540,6 +570,8 @@ def _note_session_limit(
                     if pct is not None and pct >= 100 and at is not None and at > time.time()
                 ]
                 reset_at = reset_at or (max(blocking_resets) if blocking_resets else None)
+            if reset_at is None:
+                timeline.row("⏳", _unknown_reset_note("codex", text))
             _meters.note_limit(
                 "codex", reset_at or time.time() + _session_config.LIMIT_RETRY_S, _limit_account("codex")
             )
@@ -551,6 +583,8 @@ def _note_session_limit(
         return
     account = _session_config._claude_account()
     try:
+        if reset_at is None:
+            timeline.row("⏳", _unknown_reset_note("claude", text))
         _meters.note_limit("claude", reset_at or time.time() + _session_config.LIMIT_RETRY_S, account)
         _show_meter(_meters, _meters.readings[account], timeline)
     except _METER_ERRORS as exc:  # meters must not fail the work
@@ -598,43 +632,35 @@ def _ingest_subagent_usage(
 #: A sub-agent turned away by the usage limit says so in its result (HTTP 429). Marked so the
 #: supervisor waits for the reset instead of asking a human (seen in a past run).
 USAGE_LIMIT_MARK = "USAGE_LIMIT:"
-_RESET_DAY = re.compile(
-    r"\b(mon|tue|wed|thu|fri|sat|sun)[a-z]*\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*\d"
-    r"|\d{1,2}/\d{1,2}",
-    re.IGNORECASE,
-)
-_RESET_CLOCK = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(?\s*UTC", re.IGNORECASE)
 
 
 def _reset_at(text: str, now: float | None = None) -> float | None:
-    """Unix time of the next "resets 1:50am (UTC)" after `now`, or None if not given in UTC."""
-    # Failed Flyte actions have no outputs. Reuse the meter report format to carry
-    # a header reset through their exception text to the supervisor's refusal cache.
-    resets: list[float] = [
-        meter.limited_until for meter in _meter.from_report(text) if meter.limited_until is not None
-    ]
-    if resets:
-        return max(resets)
-    m = _RESET_CLOCK.search(text or "")
-    if not m or _RESET_DAY.search(text or ""):
-        # A weekday or date ("resets Mon 9am", weekly limits) cannot be placed from the clock
-        # alone; reading it as today swallowed a real weekly limit (qa).
-        return None
-    import datetime as _dt
+    """Unix time the limit in `text` reopens, judged at `now`; None if the text does not say.
 
-    hour = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)
-    minute = int(m.group(2) or 0)
-    base = _dt.datetime.fromtimestamp(time.time() if now is None else now, tz=_dt.timezone.utc)
-    try:
-        at = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    except ValueError:
-        return None
-    # The nearest of yesterday/today/tomorrow that is not more than an hour past: a notice
-    # handled a minute after the minute it names has reset already (rolling it a day ahead
-    # turned a 3 h idle into 24 h), including across midnight (11:30pm seen at 00:10).
-    day = _dt.timedelta(days=1)
-    floor = base.timestamp() - 3600
-    return min(c.timestamp() for c in (at - day, at, at + day) if c.timestamp() >= floor)
+    A stale notice (its time has passed) returns that past time, so a caller can tell "already reset"
+    from "unknown".
+    """
+    reset = _limit_reset.parse_reset(text or "", time.time() if now is None else now)
+    return reset.at if reset else None
+
+
+def _refusal_until(text: str, observed_at: float | None = None) -> float | None:
+    """Return the future reset to record for a fresh refusal; None when unknown or stale (callers fall back).
+
+    Goes through `_reset_at`, which tests stub to None.
+    """
+    at = _reset_at(text, observed_at)
+    return at if at is not None and at > time.time() else None
+
+
+def _keep_later_reset(text: str, known: float | None) -> float | None:
+    """Return the later of a reset already known (headers, meter) and a future one `text` names.
+
+    A notice's clock time never shortens what the headers said: a stale "resets 2:50am" beside a weekly
+    reset five days out keeps the five days.
+    """
+    said = _refusal_until(text)
+    return max(known, said) if known and said else known or said
 
 
 def _author_engines() -> tuple[str, ...]:

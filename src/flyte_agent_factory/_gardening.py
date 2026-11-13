@@ -1,8 +1,8 @@
 """Gardening: a weekly, low-priority project that tidies the repos the owner lists in `gardening.toml`.
 
 `gardening.toml` sits at the workspace root and is the owner's, like `waivers.toml`: `_gates` always
-blocks a session's change to it, so the factory never adds or removes a target. Without the file the
-engine (`[repo] factory`) is the only target; a file with no `[[target]]` opts out. This module reads it,
+blocks a session's change to it, so the factory never adds or removes a target. Gardening is opt-in: a
+workspace without the file, or with no `[[target]]`, has nothing to tend. This module reads it,
 and decides how urgently a queued gardening launch should take a slot (`priority`, a pure function).
 """
 
@@ -60,7 +60,7 @@ def _target(index: int, raw: object, repos: Mapping[str, str]) -> Target:
     if unknown := [c for c in checks if c not in CHECKS]:
         raise bad(f"unknown check(s) {', '.join(unknown)}; known: {', '.join(CHECKS)}")
     repo = raw.get("repo", "")
-    # `repo = "factory"` names the profile's `[repo] factory` entry, so the file carries no URL.
+    # `repo = "factory"` names that entry of the profile's `[repo]` table, so the file carries no URL.
     return Target(repos.get(repo, repo), raw.get("path", ""), cadence, tuple(checks))
 
 
@@ -73,18 +73,6 @@ def load(workspace: Path, repos: Mapping[str, str]) -> list[Target]:
         return parse(path.read_text(), repos)
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"{FILE}: {exc}") from exc
-
-
-def default_targets(repos: Mapping[str, str]) -> list[Target]:
-    """Return the targets of a workspace without `gardening.toml`: the engine, when the profile names it."""
-    return [Target(repos["factory"])] if "factory" in repos else []
-
-
-def load_or_default(workspace: Path, repos: Mapping[str, str]) -> list[Target]:
-    """`load`, except that a workspace without the file gets `default_targets`."""
-    if not (workspace / FILE).is_file():
-        return default_targets(repos)
-    return load(workspace, repos)
 
 
 def parse(text: str, repos: Mapping[str, str]) -> list[Target]:

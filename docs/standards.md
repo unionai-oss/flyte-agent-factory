@@ -4,8 +4,9 @@ The factory checks every project against **your** standards: the rules in your w
 directory. The engine ships no rules of its own. It knows how to run a few kinds of check and how to hand the
 rest to its reviewers, and your standards say which rule is checked which way.
 
-The workspace template (`unionai-oss/flyte-agent-workspace`, shipped in the engine at
-`src/flyte_agent_factory/_assets/workspace_template/`) carries one complete set as the worked example. Copy it,
+The workspace template, shipped in the engine at
+`src/flyte_agent_factory/_assets/workspace_template/` (a separate `unionai-oss/flyte-agent-workspace` repository is not published
+yet), carries one complete set as the worked example. Copy it,
 then rename, rewrite or delete any rule: nothing in the engine depends on its IDs or wording.
 
 ## Where the factory reads them
@@ -139,6 +140,9 @@ from `languages/configs/`. A missing tool is reported as tool unavailable (an im
 
 For a rule in a language pack, a failure that the starting tree already had passes as pre-existing debt: only
 new findings block.
+The starting tree is the branch head with the project's own commits undone. When a merge from main joined
+upstream lines to a project change so that it no longer undoes, it is the upstream side of the branch's newest
+merge.
 
 ### `Enforced: lint <linter> <codes>`: a linter rule selection
 
@@ -188,6 +192,64 @@ QA-12: FAIL ruff check --isolated --select BLE001 . ...
 ```
 
 A waiver (`waivers.toml`) may name the check (`factory:fail-to-pass`) or any rule ID mapped to it (`QA-7`).
+
+## Vendored upstream trees
+
+A project that builds a cross-repository patch may keep byte-identical copies of other repositories in its
+directory. Those files are upstream's, not the project's, so `factory:module-size`, `factory:fail-to-pass` and
+language detection judge only what the project changed in them. A copy that is a git checkout (has `.git`)
+needs nothing: its own history says what changed. A copy committed without `.git` is declared in
+`vendored.toml` at the project's root:
+
+```toml
+[[tree]]
+path = "flyte-agent-factory"   # the copy's directory, relative to the project, inside it
+repo = "https://github.com/example/flyte-agent-factory"
+commit = "<full 40-hex sha the copy was taken from>"
+```
+
+The copy's root is upstream's repository root. An invalid entry (a path that is absolute, has `..`, is not a
+directory or is the project itself, a `repo` that is not `https://`, a `commit` that is not 40 hex digits) or
+invalid TOML is reported in the rule's output and ignored: its files count as the project's.
+
+**Where the gate gets upstream.** From the git repository that holds the project only when the commit is in the
+history of the project's trusted base, the commit the supervisor recorded when the project was created (after a
+restart, `.claude-flyte/<name>/base-commit`, the base waivers are read against): any later local commit, and any
+ref such as `refs/remotes/origin/*`, may be one the session made, and declaring it would let a project call its
+own code upstream's. Otherwise by a shallow `https` fetch of that one commit into a cache under
+`$XDG_CACHE_HOME/factory-gate/vendored` (or `~/.cache/factory-gate/vendored`), made once per repository and
+reused. A fetched commit must also be in the history of the declared repository's default branch (checked by a
+fetch of that branch's history without trees): a repository serves a commit of any branch by its id, so a commit
+pushed to a side branch of upstream is not upstream's. The cache is not left a promisor remote, so a missing object
+is an error, never an on-demand fetch. The fetch has no credentials and never
+prompts, so a private repository, an unreachable host or a missing commit leaves the tree "unavailable": its
+files are judged as the project's and the output names the tree, repository, commit and the error. The gate
+never passes silently on a tree it could not read. A fetch that failed is not tried again for ten minutes.
+Every git call ignores replace refs (`GIT_NO_REPLACE_OBJECTS`) and user and system git config. The gate runs in
+the session's workspace, so these checks are as strong as that workspace's recorded base and the cache under
+`$HOME`, which the session can write: the same limit waivers have.
+
+The gate fetches; the dashboard's standards snapshot and the selection made on the supervisor's event loop never
+do. They read only the cache, which the supervisor fills off the loop before the gate runs, and until then judge
+a vendored tree as the project's.
+
+**What changes.** A file identical to upstream's at the same path (compared by git blob id) is skipped by
+`factory:module-size`, is not one of the project's changed tests for `factory:fail-to-pass`, and is left out of
+language detection (a vendored Django `package.json` does not select the TypeScript pack).
+
+**What still fails.** Judgement is against upstream's version, not against nothing: growing an over-limit
+module (`... lines, was N`), adding a skip to a vendored test or removing a test from it
+("tests removed, deleted or skipped"), a new module over the limit, and any new or changed file in the copy,
+which counts as the project's. A file the project's start tree already had is judged against the start tree,
+whatever upstream commit it matches. No waiver is needed for upstream's own files.
+`vendored.toml` does not change the scope of a language pack's `mypy` rule: a project with vendored trees gives mypy a
+project-level configuration that excludes them; that is a configuration, not a waiver.
+
+**What is not judged.** A copy may be partial: a project vendors what it builds against, so a directory upstream
+has and the copy leaves out entirely (a whole `tests/` included) is not a removal; the copy's tests are upstream's,
+and they run in upstream's CI against the delivered patches. A test file upstream has, missing from a directory the
+copy does have, is a removed test: `factory:fail-to-pass` fails naming it ("tests removed, deleted or skipped"),
+unless the brief permits removing tests, and the rule output lists such files (the first ten, then a count).
 
 ## Demos
 

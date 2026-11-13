@@ -381,19 +381,17 @@ def _ended_at(run: remote.Run) -> float | None:
 def _gardening_targets() -> list[_gardening.Target] | None:
     """Return the owner's targets from the workspace's default branch, or None when they cannot be read.
 
-    A workspace without `gardening.toml` gardens the engine only.
+    A workspace without `gardening.toml` has no targets: gardening is opt-in.
     """
     profile = _factory_base.PROFILE
-    if not (
-        profile.github.configured and _deploy.GITHUB_KEY_ENV in os.environ and "factory" in profile.repos
-    ):
+    if not (profile.github.configured and _deploy.GITHUB_KEY_ENV in os.environ and profile.repo):
         return None
     app = _github.GithubApp(profile.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV])
     try:
         text = app.read_file(_github.parse_repo(profile.repo), _gardening.FILE)
     except _github.GithubError as exc:
         if exc.status == 404:
-            return _gardening.default_targets(profile.repos)
+            return []
         raise
     return _gardening.parse(text, profile.repos)
 
@@ -410,12 +408,10 @@ def gardening_decision(now: float | None = None) -> tuple[str, list[str]]:
     if (
         _factory_base.PROFILE.github.configured
         and _deploy.GITHUB_KEY_ENV in os.environ
-        and "factory" in _factory_base.PROFILE.repos
+        and _factory_base.PROFILE.repo
     ):
         app = _github.GithubApp(_factory_base.PROFILE.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV])
-        open_issues = len(
-            app.open_issues(_github.parse_repo(_factory_base.PROFILE.repos["factory"]), _gardening.LABEL)
-        )
+        open_issues = len(app.open_issues(_github.parse_repo(_factory_base.PROFILE.repo), _gardening.LABEL))
     regression = (
         _gardening.regressed(_gardening.read_counts(_factory_base.PROFILE.state.uri))
         if _factory_base.PROFILE.state.uri
@@ -427,7 +423,7 @@ def gardening_decision(now: float | None = None) -> tuple[str, list[str]]:
     except (*REMOTE_ERRORS, _github.GithubError) as exc:
         return "low", [f"gardening targets unknown: {type(exc).__name__}: {exc}"]
     if targets is None:
-        return "low", ["gardening targets unknown: GitHub or [repo] factory is not configured"]
+        return "low", ["gardening targets unknown: GitHub or the workspace repository is not configured"]
     return _gardening.priority(
         now, runs, regression, open_issues, _factory_base.PROFILE.gardening, len(targets)
     )
@@ -454,30 +450,6 @@ def gardening_status() -> str:
         return f"gardening: priority unknown ({type(exc).__name__})"
 
 
-def _is_engine_repo(repo: str) -> bool:
-    """Whether `repo` is the factory's own repository (`[repo] factory`), whose changes run one at a time."""
-    profile = _factory_base.PROFILE
-    engine = profile.repos.get("factory", "")
-    return bool(engine and repo and profile.canonical_repo(repo) == profile.canonical_repo(engine))
-
-
-def _engine_holders(live: Sequence[remote.Run]) -> list[str]:
-    """Return the names of the live runs on the factory's repository.
-
-    At most `[repo] factory_projects` of them run at once; a deploy leaves them on the version they
-    started with, and the planner holds back overlapping files separately.
-    """
-    holders = []
-    for run in live:
-        try:
-            inputs = run.inputs()
-        except REMOTE_ERRORS:  # unreadable inputs say nothing about its repo; the run is not held up by it
-            continue
-        if inputs is not None and _is_engine_repo(str(inputs.get("repo") or _factory_base.PROFILE.repo)):
-            holders.append(run.name)
-    return holders
-
-
 def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str) -> list[str]:
     waiting = [e for e in waiting if not _reconcile(queue, e)]
     waits = _factory_policy.Waits()
@@ -495,13 +467,11 @@ def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str)
     demand = any("factory-loop" not in _factory_base.run_labels(r) for r in live)
     started: list[str] = []
     launched: dict[str, str] = {}  # engine of each run started in this sweep, by run name
-    engine_holders = _engine_holders(live)
     headroom: dict[str, float | None] | None = None
     for i in admission.order:
         entry = waiting[i]
         request = cast(_queue.Request, entry.request)  # `dispatch` passed only readable requests
         if levels[i] == "low" and kept_for:  # other projects may take that slot, `low` ones may not
-            engine_holders += _engine_holders(kept_for)  # and for `low` work it still holds its lane
             live, busy, kept_for = live + kept_for, _factory_policy.keep_slots(busy, kept_for), []
         if admission.held(i):
             break  # sorted last: a request that is not low is still waiting, and it keeps the slots
@@ -524,12 +494,6 @@ def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str)
             free = [s for s in _factory_base.SLOTS if s not in busy]
             if len(busy) >= _factory_base.cap() or not free:
                 break
-        is_engine = _is_engine_repo(request.repo)
-        limit = _factory_base.PROFILE.factory_projects
-        if is_engine and len(engine_holders) >= limit:
-            text = _factory_policy.word_engine_busy(engine_holders, limit)
-            waits.hold(entry, i, admission, "engine_busy", text, holders=list(engine_holders), limit=limit)
-            continue
         if headroom is None:
             headroom = _factory_meters.slot_headroom(free)
         engine = None if _factory_base.PROFILE.shared else _factory_policy.read_engine_pin(request)
@@ -627,8 +591,7 @@ def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str)
         keeper = _factory_recreate._keep_oldest(entry, run)
         if keeper.name != run.name:  # lost to a run of the same request; its dispatcher reports it
             _started(queue, entry, keeper.name, keeper.url, _factory_base._task_name(keeper))
-            if _factory_policy.retain_live_run(keeper, live, busy):
-                engine_holders.extend(_engine_holders([keeper]))
+            _factory_policy.retain_live_run(keeper, live, busy)
             admission.mark_unrunnable(i)
             continue
         # The dedupe took time: look once more, so only a cancel landing after this line is left to
@@ -642,8 +605,6 @@ def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str)
         busy.add(slot)
         live.append(run)
         launched[run.name] = _factory_policy.pick_launch_engine(request)
-        if is_engine:
-            engine_holders.append(run.name)
         demand = demand or not loop_issue
         started.append(run.name)
         admission.admitted(i)
@@ -995,7 +956,7 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
     result.update(
         name=data.get("project") or result["name"],
         run_phase=_factory_base._phase(run),
-        phase=_dashboard.phase_label(phase),
+        **_factory_status.phase_fields(phase),
         goal=data.get("goal", ""),
         verdict=data.get("verdict") or _dashboard.verdict(data),
         activity=data.get("activity") or _factory_status._html_activity(page),
@@ -1355,7 +1316,7 @@ async def list_targets(workspace_repo: str) -> str:
         raise ValueError(f"cannot read {_gardening.FILE}: {reason}")
     with tempfile.TemporaryDirectory(prefix="gardening-targets-") as tmp:
         await _git.clone(workspace_repo, "", Path(tmp) / "repo")
-        targets = _gardening.load_or_default(Path(tmp) / "repo", _factory_base.PROFILE.repos)
+        targets = _gardening.load(Path(tmp) / "repo", _factory_base.PROFILE.repos)
     return json.dumps([t.name if t.repo else f"path:{t.path}" for t in targets])
 
 
@@ -1422,9 +1383,9 @@ async def garden_weekly() -> str:
     The scan records the standards-gate findings that `dispatch` weighs (`gardening_decision`) when it
     decides whether the launch takes a slot early.
     """
-    if "factory" not in _factory_base.PROFILE.repos:
+    if not _factory_base.PROFILE.repo:
         # A weekly trigger that raised would only fail every week; a skip says why and costs nothing.
-        return "skip: gardening tends the factory repo: the profile needs a [repo] factory entry"
+        return "skip: gardening runs in the workspace repository: the profile needs one ([direction] repo)"
     # A name that is still waiting from last week has its request replaced and keeps its place; one
     # that is still running is refused, which is the right answer for a run that overran its week.
     live = await asyncio.to_thread(
@@ -1456,7 +1417,7 @@ async def garden_weekly() -> str:
         launch_project,
         GARDENING_BRIEF,
         _gardening.NAME,
-        repo=_factory_base.PROFILE.repos["factory"],
+        repo=_factory_base.PROFILE.repo,
         priority="low",
     )
     return json.dumps({**result, "unscanned": unscanned})

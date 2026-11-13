@@ -987,6 +987,7 @@ def test_no_personal_literal_is_left_in_shareable_files():
         "src/flyte_agent_factory/_assets/workspace_template/standards/security.md",
         "pyproject.toml",
         "skills/agent-factory/SKILL.md",
+        "skills/since/SKILL.md",
         "AGENTS.md",
         "LICENSE",
     ):
@@ -1462,9 +1463,53 @@ def test_app_id_must_be_ascii_digits(value):
 def test_auto_deploy_requires_a_factory_repo():
     text = _auto_text().replace('factory = "git@github.com:you/factory.git"', "", 1)
     with pytest.raises(
-        _profile.ProfileError, match=re.escape("[deploy] auto = true requires [repo] factory")
+        _profile.ProfileError,
+        match=re.escape("[deploy] auto = true requires [deploy] repo or [repo] factory"),
     ):
         _profile.parse(text)
+
+
+def test_deploy_repo_defaults_to_the_factory_repo():
+    deploy = _profile.parse(_auto_text()).deploy
+    assert (deploy.repo, deploy.webhook) == ("git@github.com:you/factory.git", False)
+
+
+def test_auto_deploy_from_a_repo_that_is_not_the_factory_repo_parses_without_one():
+    text = _auto_text().replace('factory = "git@github.com:you/factory.git"', "", 1)
+    text = text.replace(
+        "[deploy]\nauto = true",
+        '[deploy]\nauto = true\nrepo = "https://github.com/org/engine"\nwebhook = true',
+        1,
+    )
+    deploy = _profile.parse(text).deploy
+    assert (deploy.repo, deploy.webhook) == ("https://github.com/org/engine", True)
+
+
+def test_deploy_repo_wins_over_the_factory_repo():
+    text = _auto_text().replace("auto = true\n", 'auto = true\nrepo = "https://github.com/org/engine"\n', 1)
+    assert _profile.parse(text).deploy.repo == "https://github.com/org/engine"
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        ('repo = "git@gitlab.com:org/engine.git"', "[deploy] repo must be a github.com repository"),
+        # A URL with more than owner and repo, or with spaces, names no repository the deployer can read.
+        ('repo = "https://github.com/org/engine/tree/main"', "[deploy] repo must be a github.com repository"),
+        ('repo = "https://github.com/org/engine/extra"', "[deploy] repo must be a github.com repository"),
+        ('repo = "https://github.com/ org/engine"', "[deploy] repo must be a github.com repository"),
+        ("repo = 3", "[deploy] repo must be a string"),
+        ("repo = 0", "[deploy] repo must be a string"),
+        ("repo = false", "[deploy] repo must be a string"),
+        ('repo = ""', "[deploy] repo, when given, must name a repository"),
+        ('repo = "  "', "[deploy] repo, when given, must name a repository"),
+        ('webhook = "yes"', "[deploy] webhook must be true or false"),
+        ("typo = 1", "unknown key(s) in [deploy]: typo"),
+    ],
+)
+def test_invalid_deploy_settings_are_refused(line, message):
+    with pytest.raises(_profile.ProfileError, match=re.escape(message)):
+        _profile.parse(_auto_text().replace("auto = true\n", f"auto = true\n{line}\n", 1))
 
 
 @pytest.mark.parametrize(
@@ -1473,6 +1518,17 @@ def test_auto_deploy_requires_a_factory_repo():
 def test_auto_deploy_factory_repo_must_be_on_github(url):
     text = _auto_text().replace("git@github.com:you/factory.git", url, 1)
     with pytest.raises(_profile.ProfileError, match=r"\[repo\] factory.*github.com"):
+        _profile.parse(text)
+
+
+def test_a_malformed_deploy_repo_is_refused_without_auto_deploy_too():
+    # Bench reads `[deploy] repo` as a candidate source whether or not the deployer runs.
+    text = _auto_text().replace(
+        "auto = true\n", 'auto = false\nrepo = "https://github.com/org/engine/tree/main"\n', 1
+    )
+    with pytest.raises(
+        _profile.ProfileError, match=re.escape("[deploy] repo must be a github.com repository")
+    ):
         _profile.parse(text)
 
 
@@ -1671,37 +1727,27 @@ def test_a_profile_without_a_claude_token_says_how_to_get_one():
     assert "claude setup-token" in message and "Flyte secret" in message
 
 
-def test_factory_projects_defaults_to_one():
-    assert _profile.parse(_example_with_factory_repo('factory = "k"'), "example.toml").factory_projects == 1
-
-
-def test_factory_projects_is_read_beside_the_factory_repo():
-    text = _example_with_factory_repo('factory = "k"').replace(
-        f'factory = "{_FACTORY_URL}"\n', f'factory = "{_FACTORY_URL}"\nfactory_projects = 3\n', 1
-    )
-    profile = _profile.parse(text, "example.toml")
-    assert profile.factory_projects == 3
-    assert "factory_projects" not in profile.repos  # [repo] holds URLs only
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "1.5", '"2"', "true"])
-def test_factory_projects_must_be_a_positive_integer(value):
+@pytest.mark.parametrize("value", ["1", "2", "0", '"two"'])
+def test_factory_projects_is_retired_and_ignored_with_one_warning(value, monkeypatch, capsys):
+    """The live profile and pods from before the retirement carry it: any value loads, once, loudly."""
+    monkeypatch.setattr(_profile, "_warned", set())
     text = _example_with_factory_repo('factory = "k"').replace(
         f'factory = "{_FACTORY_URL}"\n', f'factory = "{_FACTORY_URL}"\nfactory_projects = {value}\n', 1
     )
-    with pytest.raises(_profile.ProfileError, match=re.escape("[repo] factory_projects must be an integer")):
-        _profile.parse(text, "example.toml")
+    profile = _profile.parse(text, "example.toml")
+    _profile.parse(text, "example.toml")
+    warned = [line for line in capsys.readouterr().err.splitlines() if "was retired and is ignored" in line]
+    assert len(warned) == 1 and "[repo] factory_projects" in warned[0]
+    assert not hasattr(profile, "factory_projects")
+    assert "factory_projects" not in profile.repos  # [repo] holds URLs only
 
 
-def test_factory_projects_requires_the_factory_repo():
+def test_factory_projects_without_the_factory_repo_is_ignored_too():
     text = _example_with(
         'project = "git@github.com:you/my-sandbox.git"\n',
         'project = "git@github.com:you/my-sandbox.git"\nfactory_projects = 2\n',
     )
-    with pytest.raises(
-        _profile.ProfileError, match=re.escape("[repo] factory_projects requires [repo] factory")
-    ):
-        _profile.parse(text, "example.toml")
+    assert "factory" not in _profile.parse(text, "example.toml").repos
 
 
 @pytest.mark.parametrize("directory", [None, "../standards", "standards"])

@@ -18,12 +18,12 @@ from typing import Protocol, TypedDict, cast
 
 import flyte
 
-from . import _policy, _secret_env, child
+from . import _pins, _policy, _secret_env, _session_config, child
 from ._bridge import ANSWERS, REQUESTS, _write_atomic, redact_tokens
 from ._bridge import PARTIAL_PATCH as PARTIAL_PATCH  # re-exported: workers and agent read it here
 from ._bridge import PLAN as PLAN
 from ._errors import REMOTE_ERRORS
-from ._router import RouterDeferred
+from ._router import RouterDeferred, _reset_text
 
 Emit = Callable[[str, str], None]
 
@@ -257,6 +257,12 @@ class Delegations:
         self.drained: dict[str, str] = {}
         self.seen: set[str] = set()
         self.pending: set[asyncio.Task[None]] = set()
+        #: How a job waiting for an engine's reset sleeps; a test replaces it to skip the wait.
+        self.sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        #: The wall clock a wait is measured on; a test replaces it so the wait is exact.
+        self.clock: Callable[[], float] = time.time
+        #: Jobs that were waiting for an engine when the last supervisor died; `scan` serves them again.
+        waiting: set[str] = set()
         # A notice is kept in its job folder until delivered, so a pod restart between a job
         # finishing and the session being idle does not leave the coordinator waiting forever.
         for notice in self.jobs.glob("*/notice.txt"):
@@ -269,7 +275,11 @@ class Delegations:
                 state = "running"
             job = self.jobs / path.stem
             completed_answer = (job / "answer-only").exists() and (job / "summary.md").exists()
-            if state == "running":
+            if state == "waiting":
+                # Nothing ran: dropping the answer lets `scan` route the request afresh.
+                answer.unlink()
+                waiting.add(path.stem)
+            elif state == "running":
                 if completed_answer:
                     _write_atomic(answer, {"state": "done", "summary": (job / "summary.md").read_text()})
                 elif self.can_reattach(job):
@@ -281,6 +291,7 @@ class Delegations:
             if (
                 job.is_dir()
                 and job.name not in self.resuming
+                and job.name not in waiting
                 and not (job / "factory.patch").exists()
                 and not (job / PARTIAL_PATCH).exists()
                 and not ((job / "answer-only").exists() and (job / "summary.md").exists())
@@ -382,85 +393,110 @@ class Delegations:
         job_id = request["id"]
         job = self.jobs / job_id
         job.mkdir(exist_ok=True)
+        # A job that was waiting for an engine when the supervisor restarted already has its folder.
+        if not (job / "brief.md").exists():
+            self.total += 1
         (job / "brief.md").write_text(request["brief"])
-        self.total += 1
         answer_only = request.get("answer_only", False)
         if answer_only:
             (job / "answer-only").touch()
-        async with self.slots:
-            _write_atomic(self.root / ANSWERS / f"{job_id}.json", {"state": "running"})
-            started = time.monotonic()
+        while True:
             try:
-                chosen = self.engine()
-                engine = await chosen if inspect.isawaitable(chosen) else chosen
-            except RouterDeferred as exc:
-                # Every engine is out of allowance. Say so and let the coordinator resubmit after the reset.
-                self.fail(job_id, f"deferred: {exc}", "no engine")
-                self.emit("⏸️", f"delegate {job_id} deferred: {exc}")
+                async with self.slots:
+                    await self.attempt(job_id, request, answer_only)
                 return
-            self.active[job_id] = {
-                "id": job_id,
-                "engine": engine,
-                "setting": self.setting(engine) if self.setting else "",
-                "started_at": time.time(),
-            }
-            self.emit("🔧", f"delegate {job_id} started ({engine})")
+            except RouterDeferred as exc:
+                # Every permitted engine is at its limit. Failing here lost the job (and, mid-task, its
+                # work); waiting is what a hard pin means. The wait is outside the slot, so jobs that can
+                # run are not held back by one that cannot.
+                await self.wait_deferred(job_id, exc)
 
-            def on_engine(actual_engine: str, setting: str) -> None:
-                nonlocal engine
-                engine = actual_engine
-                self.active[job_id].update({"engine": engine, "setting": setting})
+    async def wait_deferred(self, job_id: str, exc: RouterDeferred) -> None:
+        """Record that `job_id` waits for an engine's reset, and sleep until it may be routed again."""
+        until = exc.retry_at if exc.retry_at is not None else self.clock() + _session_config.LIMIT_RETRY_S
+        # The deferral does not name its engine; a pinned delegate can only be waiting for its pin.
+        awaited = _pins.delegate_pin().engine or "any engine"
+        _write_atomic(
+            self.root / ANSWERS / f"{job_id}.json", {"state": "waiting", "engine": awaited, "until": until}
+        )
+        self.emit("⏸️", f"delegate {job_id} waits for {awaited} until {_reset_text(until)}")
+        await self.sleep(max(0.0, until - self.clock()))
 
-            ok = False
-            try:
-                with tempfile.TemporaryDirectory(prefix="delegate-") as tmp:
-                    target = Path(tmp)
-                    base = await asyncio.to_thread(snapshot, self.workspace, target)
-                    (job / "base").write_text(base + "\n")
-                    # The worker diffs against it if it runs out of turns.
-                    (target / "base").write_text(base + "\n")
+    async def attempt(self, job_id: str, request: DelegateRequest, answer_only: bool) -> None:
+        """Route and run one job in a slot the caller holds. Raises `RouterDeferred` to wait for a reset."""
+        job = self.jobs / job_id
+        _write_atomic(self.root / ANSWERS / f"{job_id}.json", {"state": "running"})
+        started = time.monotonic()
+        chosen = self.engine()
+        engine = await chosen if inspect.isawaitable(chosen) else chosen
+        self.active[job_id] = {
+            "id": job_id,
+            "engine": engine,
+            "setting": self.setting(engine) if self.setting else "",
+            "started_at": time.time(),
+        }
+        self.emit("🔧", f"delegate {job_id} started ({engine})")
+
+        def on_engine(actual_engine: str, setting: str) -> None:
+            nonlocal engine
+            engine = actual_engine
+            self.active[job_id].update({"engine": engine, "setting": setting})
+
+        ok = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="delegate-") as tmp:
+                target = Path(tmp)
+                base = await asyncio.to_thread(snapshot, self.workspace, target)
+                (job / "base").write_text(base + "\n")
+                # The worker diffs against it if it runs out of turns.
+                (target / "base").write_text(base + "\n")
+                brief = (
+                    "First run `tar xzf repo.tar.gz && cd repo`. Work inside repo.\n\n"
+                    + request["brief"]
+                    + "\n\nRun the repository's tests and lint if present. Never weaken a test. "
+                    "Read DESIGN.md if present. Write ../factory.patch with "
+                    f"`git add -N . && git diff --binary {base} > ../factory.patch`. "
+                    "Finish with a short summary: files changed, commands run and results."
+                )
+                if answer_only:
                     brief = (
                         "First run `tar xzf repo.tar.gz && cd repo`. Work inside repo.\n\n"
                         + request["brief"]
-                        + "\n\nRun the repository's tests and lint if present. Never weaken a test. "
-                        "Read DESIGN.md if present. Write ../factory.patch with "
-                        f"`git add -N . && git diff --binary {base} > ../factory.patch`. "
-                        "Finish with a short summary: files changed, commands run and results."
+                        + "\n\nThis is read-only research. Do not change repository files. "
+                        "Your final message is the entire answer; no patch is required."
                     )
-                    if answer_only:
-                        brief = (
-                            "First run `tar xzf repo.tar.gz && cd repo`. Work inside repo.\n\n"
-                            + request["brief"]
-                            + "\n\nThis is read-only research. Do not change repository files. "
-                            "Your final message is the entire answer; no patch is required."
-                        )
 
-                    # The sub-agent is a child of the same root action as every other delegate, so the
-                    # job folder is the only place that says which action is this one's.
-                    def record_action(name: str) -> None:
-                        _append_line(job / "actions.txt", name)
-                        # What a restarted supervisor needs to find this worker again; the latest
-                        # submission is the live one (a spot attempt that missed its queue bound is replaced).
-                        _write_atomic(
-                            job / "action.json", {"name": name, "run_name": _run_name(), "engine": engine}
-                        )
-
-                    with child.track_submissions(record_action):
-                        summary = await (
-                            self.worker(target, brief, engine, answer_only=True, on_engine=on_engine)
-                            if answer_only
-                            else self.worker(target, brief, engine, on_engine=on_engine)
-                        )
-                    ok = await asyncio.to_thread(
-                        self.hand_back, job_id, target, summary, engine, answer_only, started
+                # The sub-agent is a child of the same root action as every other delegate, so the
+                # job folder is the only place that says which action is this one's.
+                def record_action(name: str) -> None:
+                    _append_line(job / "actions.txt", name)
+                    # What a restarted supervisor needs to find this worker again; the latest
+                    # submission is the live one (a spot attempt that missed its queue bound is replaced).
+                    _write_atomic(
+                        job / "action.json", {"name": name, "run_name": _run_name(), "engine": engine}
                     )
-            except _WORKER_ERRORS as exc:
-                self.fail(job_id, f"{type(exc).__name__}: {exc}", engine)
-                self.emit(
-                    "⚠️", f"delegate {job_id} ({engine}) failed after {time.monotonic() - started:.0f}s: {exc}"
+
+                with child.track_submissions(record_action):
+                    summary = await (
+                        self.worker(target, brief, engine, answer_only=True, on_engine=on_engine)
+                        if answer_only
+                        else self.worker(target, brief, engine, on_engine=on_engine)
+                    )
+                ok = await asyncio.to_thread(
+                    self.hand_back, job_id, target, summary, engine, answer_only, started
                 )
-            finally:
-                self.retire(job_id, ok, started)
+        except RouterDeferred:
+            # Before `_WORKER_ERRORS`, which holds RuntimeError: a worker deferred for a limit has
+            # not failed. Dropped from the running list without an ended entry: it has not ended.
+            self.active.pop(job_id, None)
+            raise
+        except _WORKER_ERRORS as exc:
+            self.fail(job_id, f"{type(exc).__name__}: {exc}", engine)
+            self.emit(
+                "⚠️", f"delegate {job_id} ({engine}) failed after {time.monotonic() - started:.0f}s: {exc}"
+            )
+        finally:
+            self.retire(job_id, ok, started)
 
     async def reattach(self, job_id: str) -> None:
         """Pick up a job whose worker action outlived the supervisor, and finish it as `service` would."""
@@ -559,8 +595,10 @@ class Delegations:
             if answer_only
             else sum(line.startswith("diff --git ") for line in patch.read_text().splitlines())
         )
+        # A worker hands back partial work when it runs out of turns or hits its engine's usage limit.
+        limit = "a usage limit" if summary.startswith("PARTIAL: usage limit") else "the turn limit"
         if partial:
-            status = f"partial: hit the turn limit, {files} files so far"
+            status = f"partial: hit {limit}, {files} files so far"
             pointer = "the summary, partial patch path and plan.md of what remains"
         else:
             status = "answer ready" if answer_only else f"ok: {files} files"
@@ -568,7 +606,7 @@ class Delegations:
         self.queue_notice(job_id, f"{job_id} ({engine}, {status}) — `delegate wait {job_id}` for {pointer}.")
         self.emit(
             "🟡" if partial else "✅",
-            f"delegate {job_id} ({engine}) {'hit its turn limit' if partial else 'finished'} in "
+            f"delegate {job_id} ({engine}) {f'hit {limit}' if partial else 'finished'} in "
             f"{time.monotonic() - started:.0f}s ({files} files)",
         )
         return not partial

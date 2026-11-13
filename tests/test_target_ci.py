@@ -1,5 +1,6 @@
 """A project that delivers to another repo is held to that repo's own CI and patch coverage."""
 
+import contextlib
 import json
 import os
 import shutil
@@ -9,7 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from flyte_agent_factory import _contract, _gates, _instructions, _session_config, _target_ci, _timeline
+from flyte_agent_factory import (
+    _contract,
+    _delivery,
+    _gate_base,
+    _gates,
+    _instructions,
+    _session_config,
+    _target_ci,
+    _target_run,
+    _timeline,
+)
 
 pytestmark = pytest.mark.real_factory_gates
 
@@ -242,6 +253,21 @@ def test_fully_covered_change_passes_coverage(delivery):
     assert rules["factory:target-coverage"]["status"] == "PASS"
 
 
+# A test that execs code compiled under a made-up filename (as a docs test does) leaves coverage a file with
+# no source; the report must still be read, and the change judged on its own lines.
+PHANTOM = "\n\ndef test_phantom():\n    exec(compile('x = 1', 'phantom-probe', 'exec'), {})\n"
+
+
+def test_a_test_that_execs_a_phantom_file_does_not_break_the_coverage_report(delivery):
+    workspace, checkout = delivery
+    test = CLAMP_TEST.replace("import sign", "import clamp, sign") + "    assert clamp(9, 5) == 5\n" + PHANTOM
+    change(checkout, COVERED_CLAMP, test)
+    assert coverage(workspace, checkout)["status"] == "PASS"
+    change(checkout, COVERED_CLAMP, CLAMP_TEST.replace("import sign", "import clamp, sign") + PHANTOM)
+    result = coverage(workspace, checkout)
+    assert result["status"] == "FAIL" and "calc.py:9" in result["output"]
+
+
 UNIMPORTED = "def pick(x):\n    if x:\n        return 1\n    return 2\n"
 
 
@@ -311,6 +337,44 @@ def test_contract_prompt_names_the_discovered_commands(delivery, monkeypatch):
     prompt = _contract._contract_prompt(BRIEF, "")
     assert "`make lint`" in prompt and "`make typecheck`" in prompt and "`make test`" in prompt
     assert "make lint" not in _contract._contract_prompt("An ordinary brief.\n", "")
+
+
+def _as_project(monkeypatch, workspace):
+    monkeypatch.setattr(_session_config, "WORKSPACE", workspace)
+    monkeypatch.setattr(_session_config, "_project_name", "app")
+    monkeypatch.setattr(_session_config, "_project_brief", BRIEF)
+
+
+def test_contract_facts_come_from_the_scratch_checkout_of_a_delivery_project(delivery, monkeypatch):
+    workspace, checkout = delivery
+    _as_project(monkeypatch, workspace)
+    (workspace / "app/promote.toml").write_text('repo = "acme/widgets"\n')
+    used = []
+
+    @contextlib.contextmanager
+    def scratch(project, delivery_):
+        used.append((project, delivery_.repo))
+        yield checkout
+
+    monkeypatch.setattr(_delivery, "target_checkout", scratch)
+    facts = _contract._target_ci_facts(BRIEF)
+    assert used == [(workspace / "app", "acme/widgets")]
+    assert "this project delivers to acme/widgets" in facts
+    assert "`make lint`" in facts and "`make test`" in facts
+
+
+def test_contract_facts_are_left_out_when_the_manifest_names_another_repo(delivery, monkeypatch):
+    workspace, _ = delivery
+    _as_project(monkeypatch, workspace)
+    (workspace / "app/promote.toml").write_text('repo = "acme/elsewhere"\n')
+    assert _contract._target_ci_facts(BRIEF) == ""
+
+
+def test_contract_facts_are_left_out_when_the_target_has_no_checkout(delivery, monkeypatch):
+    workspace, checkout = delivery
+    _as_project(monkeypatch, workspace)
+    shutil.rmtree(checkout)
+    assert _contract._target_ci_facts(BRIEF) == ""
 
 
 def _only_workflow(checkout, steps, *, job_extra=""):
@@ -688,6 +752,15 @@ def test_if_operators(delivery, condition, runs):
     assert result["status"] == ("FAIL" if runs else "not applicable")
 
 
+def test_coverage_command_ignores_an_artifact_step_beside_the_coverage_run(delivery):
+    _, checkout = delivery
+    upload = _uses("actions/upload-artifact@v4", name="coverage", path="coverage.xml")
+    _only_steps(checkout, upload + _named("cov", ["pytest --cov=calc"]))
+    assert _target_ci.coverage_command(checkout).command == "pytest --cov=calc"
+    _only_steps(checkout, upload)
+    assert _target_ci.coverage_command(checkout).command == _target_ci.FALLBACK_COVERAGE
+
+
 def test_coverage_command_skips_an_unrunnable_step(delivery):
     _, checkout = delivery
     unrunnable = _named("cov", ["pytest --cov ${{ steps.x.outputs.y }}"])
@@ -778,3 +851,271 @@ def test_a_step_whose_if_is_false_in_every_combination_is_skipped(delivery):
     result = _ci_status(delivery, steps, job_extra=job_extra)
     assert result["status"] == "not applicable"
     assert "its if is false for a pull request" in result["output"]
+
+
+def test_runner_temp_and_workspace_expressions_are_the_jobs_own_paths(delivery):
+    # The engine's own CI writes pytest's junit under `${{ runner.temp }}` and reads it from `$RUNNER_TEMP`.
+    steps = (
+        "      - name: pytest\n        env:\n          OUT: ${{ runner.temp }}/junit/fast.xml\n"
+        "        working-directory: ${{ github.workspace }}\n"
+        + _block('mkdir -p "$(dirname "$OUT")" && echo ok > "$OUT" && test -f a.txt')
+        + _named("lint the junit", ['test "$(cat "$RUNNER_TEMP/junit/fast.xml")" = ok'])
+        + _named("ruff", ['test "${{ runner.temp }}" = "$RUNNER_TEMP" && test "$PWD" = "$GITHUB_WORKSPACE"'])
+    )
+    _, checkout = delivery
+    (checkout / "a.txt").write_text("x\n")
+    status = _ci_status(delivery, steps)
+    assert status["status"] == "PASS", status["output"]
+    assert "cannot run offline" not in status["output"]
+
+
+# -- jobs: their order, their timeouts, and the files they pass on --
+
+
+def _job(name, steps, extra=""):
+    return f"  {name}:\n    runs-on: ubuntu-latest\n{extra}    steps:\n{steps}"
+
+
+def _jobs(checkout, *jobs):
+    """Replace the target's CI with one pull-request workflow of the complete `jobs` texts."""
+    _workflow(checkout, "name: ci\non:\n  pull_request:\njobs:\n" + "".join(jobs))
+
+
+def _uses(action, **inputs):
+    rows = "".join(f"          {key}: {value}\n" for key, value in inputs.items())
+    return f"      - uses: {action}\n" + (f"        with:\n{rows}" if rows else "")
+
+
+def test_a_step_runs_under_its_own_or_its_jobs_timeout_minutes(delivery):
+    _, checkout = delivery
+    _jobs(
+        checkout,
+        _job("a", _named("lint", ["true"], "        timeout-minutes: 2\n"), "    timeout-minutes: 45\n"),
+        _job("b", _named("lint", ["true; true"]), "    timeout-minutes: 45\n"),
+        _job("c", _named("lint", ["true; true; true"])),
+        _job("d", _named("lint", [":"], "        timeout-minutes: ${{ matrix.t }}\n")),
+    )
+    assert [c.timeout for c in _target_ci.discover(checkout)] == [120, 2700, None, None]
+
+
+def test_a_fractional_timeout_minutes_written_as_a_string_is_read(delivery):
+    _, checkout = delivery
+    _jobs(
+        checkout,
+        _job("a", _named("lint", ["true"], "        timeout-minutes: '1.5'\n")),
+        _job("b", _named("lint", ["true; true"], "        timeout-minutes: 'soon'\n")),
+    )
+    assert [c.timeout for c in _target_ci.discover(checkout)] == [90, None]
+
+
+def test_the_timeout_minutes_is_the_limit_a_command_runs_under(delivery, monkeypatch):
+    monkeypatch.setattr(_target_run, "TARGET_CI_TIMEOUT", 1)
+    steps = _named("lint", ["sleep 2"])
+    assert _ci_status(delivery, steps, job_extra="    timeout-minutes: 1\n")["status"] == "PASS"
+    assert "command timed out after 1 seconds" in _ci_status(delivery, steps)["output"]
+
+
+def _junit_job(lane):
+    write = (
+        f'mkdir -p "$RUNNER_TEMP/junit" && echo {lane} > "$RUNNER_TEMP/junit/{lane}.xml"'
+        f' && echo sha > "$RUNNER_TEMP/junit/head"'
+    )
+    upload = _uses(
+        "actions/upload-artifact@v4",
+        name=f"junit-{lane}",
+        path="${{ runner.temp }}/junit/",
+        **{"if-no-files-found": "error"},
+    )
+    return _job(lane, _named("pytest", [write]) + upload)
+
+
+def test_artifacts_pass_between_jobs_as_github_lays_them_out(delivery):
+    # The engine's own CI: two test jobs upload their junit, the standards job downloads both, merged.
+    _, checkout = delivery
+    downloads = (
+        _uses(
+            "actions/download-artifact@v4",
+            pattern="junit-*",
+            path="${{ runner.temp }}/junit",
+            **{"merge-multiple": "true"},
+        )
+        + _uses("actions/download-artifact@v4", pattern="junit-*", path="apart")
+        + _uses("actions/download-artifact@v4", name="junit-slow", path="one")
+    )
+    check = _named(
+        "lint",
+        [
+            'test -f "$RUNNER_TEMP/junit/fast.xml" && test -f "$RUNNER_TEMP/junit/slow.xml"',
+            'test -f "$RUNNER_TEMP/junit/head"',
+            "test -f apart/junit-fast/fast.xml && test -f apart/junit-slow/slow.xml",
+            "test -f one/slow.xml && test ! -e one/fast.xml",
+        ],
+    )
+    # The gate comes first in the file: jobs run in `needs` order, not in the order they are written.
+    _jobs(
+        checkout,
+        _job("gate", downloads + check, "    needs: [fast, slow]\n"),
+        _junit_job("fast"),
+        _junit_job("slow"),
+    )
+    result = _gates.target_ci_result(checkout)
+    assert result.status is _gate_base.Status.PASS, result.output
+
+
+def test_an_upload_of_nothing_fails_only_when_it_says_error(delivery):
+    _, checkout = delivery
+    upload = _uses("actions/upload-artifact@v4", name="out", path="missing/")
+    _jobs(checkout, _job("a", _named("lint", ["true"]) + upload))
+    assert _gates.target_ci_result(checkout).status is _gate_base.Status.PASS
+    _jobs(checkout, _job("a", _named("lint", ["true"]) + upload + "          if-no-files-found: error\n"))
+    result = _gates.target_ci_result(checkout)
+    assert result.status is _gate_base.Status.FAIL
+    assert "missing" in result.output
+
+
+def test_a_job_whose_needed_job_failed_is_skipped_not_failed(delivery):
+    _, checkout = delivery
+    _jobs(
+        checkout,
+        _job("report", _named("lint", ["exit 7"]), "    needs: build\n"),
+        _job("build", _named("test", ["exit 1"])),
+        _job("cleanup", _named("lint", ["exit 5"]), "    needs: [build]\n    if: always()\n"),
+        # Not a check: discovery leaves the job out, and a job that needs it still runs.
+        _job("changes", _named("lanes", ["echo lint=true"])),
+        _job("after", _named("lint", ["exit 9"]), "    needs: changes\n"),
+    )
+    result = _gates.target_ci_result(checkout)
+    assert result.status is _gate_base.Status.FAIL
+    assert "`exit 1`" in result.output and "exited 1" in result.output
+    assert "exited 7" not in result.output
+    assert "skipped job `report`" in result.output and "`build` failed" in result.output
+    assert "exited 5" in result.output
+    assert "exited 9" in result.output
+
+
+def test_steps_after_a_failed_step_do_not_run_unless_their_if_says_so(delivery):
+    steps = (
+        _named("lint", ["exit 1"])
+        + _named("test", ["exit 3"])
+        + _named("test again", ["exit 4"], "        if: always()\n")
+        + _named("test once more", ["exit 6"], "        if: ${{ success() || failure() }}\n")
+        + _named("tests on success", ["exit 8"], "        if: success()\n")
+    )
+    result = _ci_status(delivery, steps)
+    assert result["status"] == "FAIL"
+    assert "exited 1" in result["output"]
+    assert "exited 3" not in result["output"] and "exited 8" not in result["output"]
+    assert "skipped `exit 3`" in result["output"] and "an earlier step failed" in result["output"]
+    assert "exited 4" in result["output"] and "exited 6" in result["output"]
+
+
+def test_a_steps_origin_is_its_own_line_not_the_first_with_the_same_text(delivery):
+    _, checkout = delivery
+    keep = _named("keep", ["git rev-parse HEAD > head.txt"])
+    folded = "      - name: lint\n        run: >-\n          echo\n          b\n"
+    _jobs(checkout, _job("a", _named("lint", ["echo a"]) + keep), _job("b", folded + keep))
+    rows = (checkout / ".github/workflows/ci.yml").read_text().splitlines()
+    runs = [number for number, row in enumerate(rows, 1) if row.strip().startswith("run:")]
+    found = {(c.job, c.command): c.origin for c in _target_ci.discover(checkout)}
+    assert found == {
+        ("a", "echo a"): f".github/workflows/ci.yml:{runs[0]}",
+        ("a", "git rev-parse HEAD > head.txt"): f".github/workflows/ci.yml:{runs[1]}",
+        ("b", "echo b"): f".github/workflows/ci.yml:{runs[2]}",
+        ("b", "git rev-parse HEAD > head.txt"): f".github/workflows/ci.yml:{runs[3]}",
+    }
+
+
+def fake_uv(bin_dir, log):
+    """Put a stand-in uv first on PATH's `bin_dir`; it logs each call to `log`.
+
+    It runs the project's tests only after `uv sync` and `uv pip install pytest-cov` put pytest-cov into the
+    project's own environment, and never as an overlay (`--with`): the engine's own tests build venvs from
+    that one environment's site-packages, which an overlay splits in two. It measures with `coverage run`,
+    since this test env has coverage but not pytest-cov.
+    """
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "uv").write_text(
+        "#!/bin/bash\n"
+        f'echo "$*" >> {log}\n'
+        "venv_python=$PWD/.venv/bin/python\n"
+        'case "$1 $2" in\n'
+        "  'sync '*) touch .synced; exit 0 ;;\n"
+        "  'pip install')\n"
+        '    [[ -f .synced && "$3 $4 $5" == "--python $venv_python pytest-cov" ]] || exit 6\n'
+        "    touch .has-cov; exit 0 ;;\n"
+        "  'run --no-sync') [[ -f .synced ]] || exit 8; shift 2 ;;\n"
+        "  *) exit 9 ;;\n"
+        "esac\n"
+        'if [[ "$*" == "python -c "*sys.executable* ]]; then echo "$venv_python"; exit 0; fi\n'
+        "[[ -f .has-cov ]] || exit 7\n"
+        f'if [[ "$*" == *pytest* ]]; then exec {sys.executable} -m coverage run --branch -m pytest -q; fi\n'
+        f'exec {sys.executable} "${{@:2}}"\n'
+    )
+    (bin_dir / "uv").chmod(0o755)
+
+
+def assert_measured_in_the_project_env(log):
+    """The fake uv's calls: sync, pytest-cov into that env's python, then measure and read, no re-sync."""
+    runs = log.read_text().splitlines()
+    assert runs[0] == "sync", runs
+    installs = [row for row in runs if row.startswith("pip install ")]
+    assert installs and all(row.endswith("/.venv/bin/python pytest-cov") for row in installs), runs
+    assert any(row.startswith("run --no-sync python -m pytest --cov --cov-branch") for row in runs), runs
+    assert any(row.startswith("run --no-sync python -m coverage json") for row in runs), runs
+    assert not any("--with" in row for row in runs), runs
+
+
+def test_the_fallback_coverage_run_gets_the_time_the_target_gives_its_own_pytest(delivery):
+    # The fallback reruns the suite under --cov: a suite the target's CI gives 30 minutes must not be cut
+    # off at the gate's per-step default. A target whose pytest sets no limit leaves the default.
+    _, checkout = delivery
+    _only_steps(checkout, _named("lint", ["ruff check"]) + _named("tests", ["pytest -q"]))
+    assert _target_ci.coverage_command(checkout).timeout is None
+    tests = _named("tests", ["python -m pytest -q"], "        timeout-minutes: 30\n")
+    _only_steps(checkout, _named("lint", ["ruff check"], "        timeout-minutes: 60\n") + tests)
+    assert _target_ci.coverage_command(checkout).timeout == 30 * 60
+    (checkout / "uv.lock").write_text("version = 1\n")
+    assert _target_ci.coverage_command(checkout).timeout == 30 * 60
+
+
+def test_a_uv_target_measures_coverage_in_its_own_env_with_pytest_cov(delivery):
+    # A uv project need not declare pytest-cov: the fallback installs it into the project's own environment
+    # (not an overlay), with the uv its workflow installs (an older uv may not parse the lock file).
+    _, checkout = delivery
+    setup = "      - uses: astral-sh/setup-uv@v6\n        with:\n          version: 0.9.2\n"
+    _only_steps(checkout, setup + _named("lint", ["uv run ruff check"]))
+    assert _target_ci.coverage_command(checkout).command == _target_ci.FALLBACK_COVERAGE
+    (checkout / "uv.lock").write_text("version = 1\n")
+    command = _target_ci.coverage_command(checkout)
+    assert command.command == _target_ci.FALLBACK_COVERAGE_UV
+    assert "--with" not in command.command
+    assert command.uv == "0.9.2"
+
+
+def test_a_uv_targets_coverage_gate_reads_the_report_in_its_own_env(delivery, tmp_path, monkeypatch):
+    # The gate's coverage rule, like promotion, measures and reads a uv target in the project's own env
+    # with pytest-cov installed there: the python on PATH has no pytest-cov and may not be the project's.
+    workspace, checkout = delivery
+    (checkout / "uv.lock").write_text("version = 1\n")
+    _only_steps(checkout, _named("lint", ["true"]))
+    change(checkout, COVERED_CLAMP, CLAMP_TEST.replace("import sign", "import clamp, sign"))
+    log = tmp_path / "uv.log"
+    fake_uv(tmp_path / "fake-bin", log)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'fake-bin'}{os.pathsep}{os.environ['PATH']}")
+    result = coverage(workspace, checkout)
+    assert result["status"] == "FAIL", result
+    assert "calc.py:9" in result["output"]
+    assert_measured_in_the_project_env(log)
+
+
+def test_a_failure_report_keeps_pytests_failed_lines_that_stderr_noise_pushed_out_of_its_tail():
+    # stdout comes first and the report keeps its tail: an installer's stderr hid which test failed.
+    stdout = "x" * 50 + "\nFAILED tests/test_a.py::test_one - assert 1 == 2\n= 1 failed, 9 passed in 3s =\n"
+    stderr = "".join(f" + package-{n}==1.0\n" for n in range(400))
+    item = _target_ci.Command("pytest", "ci.yml:9")
+    report = _target_run.report(item, _target_run.Run(1, stdout + stderr))
+    assert "FAILED tests/test_a.py::test_one - assert 1 == 2" in report
+    assert "= 1 failed, 9 passed in 3s =" in report
+    assert report.endswith(" + package-399==1.0\n")
+    short = _target_run.report(item, _target_run.Run(1, stdout))
+    assert short.count("FAILED tests/test_a.py::test_one") == 1

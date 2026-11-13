@@ -649,38 +649,50 @@ def test_a_parked_item_never_launches_even_with_capacity():
     assert launched(p.plan(facts(item(1, ["a"], status="Backlog"), slots=3))) == []
 
 
-# --- engine changes run one at a time ------------------------------------------------------------------
+# --- projects on one repository share the slots ---------------------------------------------------------
 
 
-def engine_facts(*items, active=(), **kwargs):
-    return replace(facts(*items, **kwargs), engine_repo="example/engine", active_runs=tuple(active))
+def repo_item(number_, files=None, repo="example/engine"):
+    return replace(item(number_, files), repo=repo)
 
 
-def engine_item(number_, files=None):
-    return replace(item(number_, files), repo="example/engine")
-
-
-def test_an_engine_item_waits_while_another_engine_project_runs():
-    run = p.ActiveRun("engine-run", "example/engine", predicted_files=("src/a.py",))
-    result = p.plan(engine_facts(engine_item(1, ["docs/x.md"]), active=[run]))
-    assert launched(result) == []
-    assert result.waiting[0].reason == p.Reason("engine_busy", "engine-run")
-
-
-def test_a_second_engine_item_in_one_pass_waits_for_the_first():
-    result = p.plan(engine_facts(engine_item(1, ["a"]), engine_item(2, ["b"])))
+@pytest.mark.parametrize("repo", ["example/engine", "example/other"])
+def test_a_running_project_does_not_hold_another_project_on_the_same_repo(repo):
+    run = p.ActiveRun("repo-run", repo, predicted_files=("src/a.py",))
+    result = p.plan(facts(repo_item(1, ["docs/x.md"], repo), active_runs=(run,)))
     assert launched(result) == [1]
-    assert result.waiting[0].reason == p.Reason("engine_busy", "I1")
+    assert not result.waiting
 
 
-def test_other_repos_are_not_held_by_a_running_engine_project():
-    run = p.ActiveRun("engine-run", "example/engine")
-    assert launched(p.plan(engine_facts(item(1, ["a"]), active=[run]))) == [1]
+@pytest.mark.parametrize("repo", ["example/engine", "example/other"])
+def test_projects_on_one_repo_start_together_while_slots_are_free(repo):
+    result = p.plan(facts(repo_item(1, ["a"], repo), repo_item(2, ["b"], repo), repo_item(3, ["c"], repo)))
+    assert launched(result) == [1, 2, 3]
 
 
-def test_a_finished_engine_run_does_not_hold_the_next_engine_item():
-    run = p.ActiveRun("engine-run", "example/engine", phase="SUCCEEDED")
-    assert launched(p.plan(engine_facts(engine_item(1, ["a"]), active=[run]))) == [1]
+def test_projects_on_one_repo_wait_for_a_slot_not_for_each_other():
+    result = p.plan(facts(repo_item(1, ["a"]), repo_item(2, ["b"]), slots=1))
+    assert launched(result) == [1]
+    assert result.waiting[0].reason.code == "no_capacity"
+
+
+def test_a_finished_run_does_not_hold_the_next_item_on_its_repo():
+    run = p.ActiveRun("repo-run", "example/engine", phase="SUCCEEDED", predicted_files=("src/a.py",))
+    assert launched(p.plan(facts(repo_item(1, ["src/a.py"]), active_runs=(run,)))) == [1]
+
+
+@pytest.mark.parametrize("repo", ["example/engine", "example/other"])
+def test_overlapping_files_on_one_repo_wait_for_the_running_project(repo):
+    run = p.ActiveRun("repo-run", repo, predicted_files=("src/a.py",))
+    result = p.plan(facts(repo_item(1, ["src/a.py"], repo), active_runs=(run,)))
+    assert launched(result) == []
+    assert result.waiting[0].reason.code == "file_conflict"
+
+
+def test_overlapping_files_in_one_pass_wait_for_the_first_item():
+    result = p.plan(facts(repo_item(1, ["src/a.py"]), repo_item(2, ["src/a.py"]), repo_item(3, ["b"])))
+    assert launched(result) == [1, 3]
+    assert result.waiting[0].reason == p.Reason("file_conflict", "I1")
 
 
 def test_a_manual_request_waits_while_a_run_of_its_project_is_live():
@@ -696,27 +708,3 @@ def test_a_manual_request_waits_while_a_run_of_its_project_is_live():
     assert [
         launch.item for launch in p.plan(facts(manual_requests=(manual,), active_runs=(ended,))).launches
     ] == [manual]
-
-
-def test_engine_projects_admits_up_to_the_limit_in_one_pass():
-    two = replace(
-        engine_facts(engine_item(1, ["a"]), engine_item(2, ["b"]), engine_item(3, ["c"])), engine_projects=2
-    )
-    result = p.plan(two)
-    assert launched(result) == [1, 2]
-    assert result.waiting[0].reason == p.Reason("engine_busy", "I1, I2 (limit 2)")
-
-
-def test_engine_projects_counts_running_and_admitted_runs():
-    run = p.ActiveRun("engine-run", "example/engine", predicted_files=("src/a.py",))
-    two = replace(engine_facts(engine_item(1, ["a"]), engine_item(2, ["b"]), active=[run]), engine_projects=2)
-    result = p.plan(two)
-    assert launched(result) == [1]
-    assert result.waiting[0].reason == p.Reason("engine_busy", "engine-run, I1 (limit 2)")
-
-
-def test_engine_projects_still_hold_back_overlapping_files():
-    run = p.ActiveRun("engine-run", "example/engine", predicted_files=("src/a.py",))
-    two = replace(engine_facts(engine_item(1, ["src/a.py"]), active=[run]), engine_projects=2)
-    assert launched(p.plan(two)) == []
-    assert p.plan(two).waiting[0].reason.code == "file_conflict"

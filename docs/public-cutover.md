@@ -32,38 +32,20 @@ repository's history (operational notes, review rounds, owner identifiers in old
 
   The list this run was built with is the one `tests/test_profile.py` held as `_LITERALS` until #110: take it
   from the private repository's history before archiving it.
-- [ ] The dry run passes on main's head, from a clean checkout:
+- [ ] The tree builds and scans clean from main's head, from a clean checkout:
 
   ```bash
   git switch main && git pull --ff-only
-  python ops/public_tree.py dry-run /tmp/public/flyte-agent-factory
+  python ops/public_tree.py build /tmp/public/flyte-agent-factory
+  python ops/scan_public.py /tmp/public/flyte-agent-factory
   ```
 
   Run it with `FACTORY_OWNER_LITERALS` set, so the scan looks for your identifiers as well as the generic
-  shapes (it prints which it used). It builds the tree (`git archive HEAD` minus `PRIVATE` and whatever the
-  tree's own `.gitignore` excludes, such as the generated skill archive; one commit, a neutral author, no
-  remote), runs `ops/scan_public.py` (gitleaks over the files and the one-commit history, and the
-  personal-literal list) inside it, then `factory-improvement/checks.sh`, then the slow lane after it, and ends
-  `dry run PASSED`. It needs `uv`, `gitleaks` and `terraform` on `PATH` (without Terraform the Terraform tests
-  skip rather than run).
-  Last run, 2026-11-08, on 674f2db (this paragraph's commit differs from it only by this paragraph), from a
-  relative destination (`dry-run relative-public`, resolved to an absolute path before anything runs): 485 files,
-  one commit, neutral author, no remote; `scan_public` read all 485 files and was clean on the generic shapes only
-  (`FACTORY_OWNER_LITERALS` was not available to that run; gitleaks 8.30.1 over the files and the history); the
-  checks ran in a temporary clone of the tree: the fast checks 6153 passed (28 skipped: the owner's private
-  profiles, live and billed calls, and the harness `checks.sh` tests, which have no harness script in the public
-  tree), ruff clean; the slow lane 160 passed, 1 xpassed; `dry run PASSED: scan_public=0 checks=0 slow_lane=0
-  tree_as_built=0`, and afterwards the tree held exactly its commit (`git status --porcelain --ignored` empty, no
-  `__pycache__`). A second dry run into the same directory stopped before touching it (`is not empty`, exit 2).
-  With the owner list: CI's `Scan the public tree` step on 674f2db (`Tests (not slow)`, job 128802734840) printed
-  `built ... (485 files)`, loaded 13 owner literals from the repository secret, read all 485 files, clean. An
-  earlier local run used a list of 27; check that the secret holds the whole list, and rerun with it before
-  publishing. The scan refuses a root that is not a directory, or a non-empty one in which it read no file, so a
-  wrong path cannot pass as clean.
-  Two timing tests can fail while both lanes share four CPUs and pass alone:
-  `test_limit_resume.py::test_stale_notice_after_carry_on_does_not_repeat_resume[20000]` and
-  `test_codex_author.py::test_stop_drains_final_output_and_acknowledges_with_detached_stdout[True-False]`;
-  rerun before reading a failure there as a real one.
+  shapes (it prints which it used). `build` makes the tree (`git archive HEAD` minus `PRIVATE` and whatever the
+  tree's own `.gitignore` excludes; one commit, a neutral author, no remote); `ops/scan_public.py` runs gitleaks over
+  the files and the history, and the personal-literal list. It needs `gitleaks` on `PATH`. CI runs the same scan
+  (`Scan the public tree`). The tests run in the public repository's own CI.
+
 - [ ] Read the tree once by eye: `git -C /tmp/public/flyte-agent-factory ls-files | less`. Anything you would not
       put on a slide, take out of the engine first and rerun.
 
@@ -86,22 +68,44 @@ repository's history (operational notes, review rounds, owner identifiers in old
   - "Require approval for all outside collaborators" for fork pull-request workflows.
   - Private vulnerability reporting enabled (Security tab), which [SECURITY.md](../SECURITY.md) points to.
   - Branch protection or a ruleset on `main` once you want it: [branch-protection.md](branch-protection.md).
-    Required checks, if any: `Changes`, `Tests (not slow)`, `Tests (slow)`, `Lint` (a skipped job counts as
-    passing).
+    The required checks are listed there (they follow the jobs of `.github/workflows/checks.yml`).
 - [ ] Tag the first release (`v0.1.0` or as decided) so deployments can pin it.
 
 ## 3. Point the factory at it
 
-- [ ] The GitHub App: install it on `unionai-oss/flyte-agent-factory` (Contents, Pull requests, Issues, Checks:
-      read and the permissions [setup.md](setup.md) lists), or create an App owned by the organisation.
-      `[github] app_id` and `private_key_secret` change if the App does.
-- [ ] Your profile: `[repo] factory` (and any `[repo_keys]` entry) to `git@github.com:unionai-oss/flyte-agent-factory.git`;
-      a new deploy key for it (`[repo_keys]`), added to the new repository with write access only if the factory
-      is to open pull requests there.
-- [ ] The deployer: it deploys the engine's main from `[repo] factory`; check `[deploy]` and, with a direction
-      repository, `[direction]`, then let one tick run and read its log (`ops/deploy_status.py`).
-- [ ] The webhook, if deployed: add the App's webhook events for the new repository
-      ([deploy-webhook.md](deploy-webhook.md)).
+The public repository is a target like any other: **no App, deploy key or webhook is installed or added on it**,
+and the owner is not asked to administer it. Changes reach it as promotion PRs that the owner merges
+([Promotion](architecture-repos.md#promotion)). The deployer reads it anonymously and deploys its default branch
+once its CI has passed.
+
+1. Deploy this release from the current repository as today, with the profile unchanged (no `[deploy] repo` yet).
+   An older deployer rejects the new key.
+2. Bootstrap the public repository from this one, as a dry run and then for real; the owner merges the PR:
+
+   ```bash
+   PYTHONPATH=src python ops/public_tree.py build /tmp/pub
+   PYTHONPATH=src python ops/promote.py deliver /tmp/pub engine-as-target --base ab86dc3 \
+       --to https://github.com/unionai-oss/flyte-agent-factory.git --dry-run
+   ```
+
+   Then the same command without `--dry-run` (add `--fork <your fork>` if you cannot push branches to it).
+3. Import it into the workspace. `import` makes the commit itself (the tree and `promote.toml`, one commit in the
+   workspace). Then add the one-line harness `checks.sh` (`exec bash "$(dirname "$0")/factory-improvement/checks.sh" "$@"`),
+   commit it, and push the workspace; the file must be committed and pushed, or the project has no declared checks:
+
+   ```bash
+   PYTHONPATH=src python ops/promote.py import https://github.com/unionai-oss/flyte-agent-factory.git projects/flyte-agent-factory
+   ```
+
+4. **Operator action** (check a tick in `ops/deploy_status.py`): in the
+   private workspace's `profile.toml` set `[deploy] repo` to `https://github.com/unionai-oss/flyte-agent-factory`
+   and `webhook = false` (pushes to a repository without the App never reach the webhook, so the deployer polls).
+   The deploy lock lives in `[direction] repo`, which the App is already installed on. This switch is made by the
+   chat operator, not by the engine, and is not done until the status line shows the public head deployed:
+   record that line.
+5. From then on: project in the workspace, review, `deliver`, PR CI green, the owner merges, the deployer deploys.
+   Evidence for each change: the PR URL, its CI run and the `ops/deploy_status.py` line, in a `flyte-note`.
+
 - [ ] Confirm the public URLs used by the guided setup resolve for an unauthenticated reader:
       `https://github.com/unionai-oss/flyte-agent-factory` and
       `https://github.com/unionai-oss/flyte-agent-workspace`. The template repository must also be populated

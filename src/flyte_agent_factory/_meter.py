@@ -260,7 +260,8 @@ def from_claude_events(
             limited or exhausted_headers or headers.get("anthropic-ratelimit-unified-status") == "rejected"
         )
         if limited:
-            # A refusal without a reset still needs a bounded backoff, not invented utilization.
+            # A refusal without a reset still needs a bounded backoff, not invented utilization. The 300 s is
+            # only a floor: every caller lets the notice's own later reset replace it (`_keep_later_reset`).
             try:
                 retry = float(headers.get("retry-after", 0))  # type: ignore[arg-type]  # Caught below.
             except (TypeError, ValueError):
@@ -795,7 +796,9 @@ class MeterStore:
 
         With `account`, the refusal belongs to that credential alone: another login's reading of the
         same engine is never marked for it. `error` says the credential is unusable rather than full
-        (a token that must be replaced); the router treats both as out until `until`.
+        (a token that must be replaced); the router treats both as out until `until`. A known future
+        `limited_until` is never shortened: a repeat refusal that carries a guess (or a stale time) must not
+        make a weekly limit look over (#125).
         """
         if account:
             meter = self.readings.get(account) or Meter(account, "limit-text", self.clock())
@@ -805,7 +808,8 @@ class MeterStore:
                 or self.latest.get(engine)
                 or Meter(engine, "limit-text", self.clock())
             )
-        meter.limited_until = until
+        known = meter.limited_until or 0.0
+        meter.limited_until = max(until, known) if known > self.clock() else until
         if error:
             meter.error = error
         self.update(meter)

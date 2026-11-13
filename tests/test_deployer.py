@@ -79,8 +79,13 @@ class GitRefs:
         self.ref = None
         self.commits = {}
         self.race = False
+        self.requests: list[tuple[str, str]] = []
+
+    def installation_token(self, repo):
+        return "token"  # the App is installed everywhere this model is used
 
     def _call(self, repo, method, path, **kwargs):
+        self.requests.append((method, path))
         if method == "GET" and "/ref/" in path:
             if self.ref is None:
                 raise _github.GithubError("not found", 404)
@@ -231,6 +236,9 @@ class World:
                 return SimpleNamespace(name="follow-up")
             return self.add_run("RUNNING", labels=labels, inputs=inputs)
 
+        # `git ls-remote` would reach the network: no anonymous head, so the App reads it unless set.
+        self.public_heads: dict[str, str] = {}
+        monkeypatch.setattr(_deploy, "public_head", lambda repo: self.public_heads.get(repo, ""))
         monkeypatch.setattr(_deployer, "SETTLE", 0)
         monkeypatch.setattr(_deployer, "RUN_LISTING_CONSISTENT", consistent)
         monkeypatch.setattr(_deployer, "_say", say)
@@ -517,11 +525,12 @@ async def test_green_runs_with_a_running_actions_suite_skip_this_tick(world):
     assert not world.deployed and world.last is None
 
 
-async def test_no_statuses_at_all_deploys(world):
+async def test_no_statuses_at_all_is_not_deployed(world):
+    # A repository whose commits report no CI at all: deploying it would deploy untested code silently.
     world.gh.statuses, world.gh.check_runs = [], []
-    await world.tick()
-    assert len(world.slot_calls) == len(world.factory_calls) == 1
-    assert world.last["sha"] == SHA
+    message = await world.tick()
+    assert "no CI reported on" in message and "must run CI" in message
+    assert not world.slot_calls and not world.factory_calls and not world.submissions
 
 
 async def test_without_checks_permission_the_deploy_line_says_check_runs_were_not_read(world, capsys):
@@ -533,11 +542,10 @@ async def test_without_checks_permission_the_deploy_line_says_check_runs_were_no
     assert "deploying" in out and "check-runs unreadable" in out
 
 
-async def test_a_factory_repo_is_required(world):
+async def test_a_deploy_repo_is_required(world):
     # The profile refuses this at parse time; the tick still checks, for a profile built another way.
-    repos = {k: v for k, v in world.profile.repos.items() if k != "factory"}
-    world.profile = dataclasses.replace(world.profile, repos=repos)
-    with pytest.raises(DeployError, match=r"needs a \[repo\] factory"):
+    world.profile = dataclasses.replace(world.profile, deploy=_profile.Deploy(auto=True))
+    with pytest.raises(DeployError, match=r"needs a \[deploy\] repo or a \[repo\] factory"):
         await world.tick()
 
 
@@ -1370,6 +1378,18 @@ async def test_a_head_that_keeps_moving_is_followed_at_most_three_times(world, m
 
 
 @both_paths
+@pytest.mark.parametrize("state", ["failure", "pending"])
+async def test_a_queued_pair_whose_ci_turned_bad_before_it_ran_does_not_deploy(world, state):
+    # The tick saw green and queued the pair; CI on the same sha changed before the run executed.
+    message = await _deployer.run_once(world.profile, "run-me", world.app, world.clock())
+    assert message.startswith("submitted")
+    world.gh.statuses = [{"context": "factory/verifier", "state": state}]
+    await world.attempt(world.runs[-1])
+    assert not world.deployed and not world.fetched
+    assert world.last is None
+
+
+@both_paths
 async def test_a_moved_head_with_failing_ci_is_left_for_the_tick(world, monkeypatch):
     # A follow-up passes the tick's own checks: here the new head's CI is failing.
     def push_during_deploy(profile, src, **kw):
@@ -1944,3 +1964,148 @@ def test_direction_capture_log_and_bundle_survive_fetched_tree(tmp_path, monkeyp
     assert "private direction rules" not in captured.out
     assert "private security rules" not in captured.out
     assert "unused-token" not in captured.out
+
+
+# --- a deploy repo the App is not installed on: anonymous reads, a lock held elsewhere ---------
+
+
+@pytest.fixture
+def public(world, monkeypatch):
+    """A world whose deploy repo is public, without the App; its head is read by `git ls-remote`."""
+    world.gh.installed = False
+    world.public_heads["acme/factory"] = SHA
+    world.anonymous = []
+
+    def anonymous_client() -> _github.PublicGithub:
+        def handler(request: httpx.Request) -> httpx.Response:
+            world.anonymous.append(request)
+            response: httpx.Response = world.handler(request)
+            return response
+
+        return real_public(client=httpx.Client(base_url=_github.API, transport=httpx.MockTransport(handler)))
+
+    real_public = _github.PublicGithub
+    monkeypatch.setattr(_github, "PublicGithub", anonymous_client)
+    return world
+
+
+async def test_an_uninstalled_deploy_repo_is_read_anonymously_and_cloned_by_its_public_url(public):
+    public.profile = make_direction_profile(f"file://{public.state}")
+    public.ship_direction_profile()
+    await public.tick()
+    assert public.last["sha"] == SHA
+    assert ("https://github.com/acme/factory.git", SHA) in public.fetched
+    # The head came from git, the health from the anonymous client: no credential reached the deploy repo.
+    assert public.anonymous and all("authorization" not in r.headers for r in public.anonymous)
+
+
+async def test_the_lock_of_an_uninstalled_deploy_repo_is_held_in_the_direction_repo(public):
+    public.profile = make_direction_profile(f"file://{public.state}")
+    public.ship_direction_profile()
+    await public.tick()
+    # The lock commit is made of the direction repo's own head, not of the deployed commit it does not have.
+    gets = [path for method, path in public.refs.requests if method == "GET" and "/commits/" in path]
+    assert any(path == "/repos/acme/direction/git/commits/" + DIRECTION_SHA for path in gets)
+    assert not any(SHA in path for path in gets)
+    (lock,) = public.refs.commits.values()
+    assert lock["parents"] == [DIRECTION_SHA]
+
+
+async def test_an_uninstalled_deploy_repo_without_a_direction_repo_refuses_naming_both_options(public):
+    with pytest.raises(DeployError) as err:
+        await public.tick()
+    message = str(err.value)
+    assert "acme/factory" in message and "Install the App" in message and "[direction] repo" in message
+    assert not public.deployed and not public.submissions
+
+
+@pytest.mark.parametrize("installed", [True, False])
+async def test_an_up_to_date_head_makes_no_rest_call(public, installed):
+    public.gh.installed = installed
+    public.record(SHA)
+    assert (await public.tick()).startswith("up to date")
+    assert public.gh.requests == [] and public.direction_gh.requests == [] and public.anonymous == []
+
+
+@pytest.mark.parametrize(
+    ("statuses", "deploys"),
+    [
+        ([{"context": "ci", "state": "success"}], True),
+        ([{"context": "ci", "state": "pending"}], False),
+        ([{"context": "ci", "state": "failure"}], False),
+        ([], False),
+    ],
+    ids=["ok", "pending", "failing", "none"],
+)
+async def test_only_a_commit_whose_ci_passed_deploys(world, statuses, deploys):
+    world.gh.statuses, world.gh.check_runs = statuses, []
+    message = await world.tick()
+    assert world.deployed is deploys
+    if not statuses:
+        assert "no CI reported" in message
+
+
+def test_the_deploy_reader_does_not_go_anonymous_on_an_error_other_than_not_installed():
+    class App:
+        def installation_token(self, repo):
+            raise _github.GithubError("server error", status=500)
+
+    with pytest.raises(_github.GithubError, match="server error"):
+        _deployer._deploy_reader(cast(_github.GithubApp, App()), "acme/factory")
+
+
+async def test_a_head_that_moves_while_waiting_for_the_lock_is_left_for_the_next_tick(world, monkeypatch):
+    submitted = await _deployer.run_once(world.profile, "run-me", world.app, world.clock())
+    assert submitted.startswith("submitted")
+    run = world.runs[-1]
+    heads = _deployer._heads
+    calls = []
+
+    def moved_after_the_first_look(profile, app):
+        calls.append(1)
+        repo, sha, direction_repo, direction_sha = heads(profile, app)
+        return (repo, sha if len(calls) == 1 else OLD_SHA, direction_repo, direction_sha)
+
+    monkeypatch.setattr(_deployer, "_heads", moved_after_the_first_look)
+    assert await world.attempt(run) == f"{SHA} is no longer the head; leaving it for the next tick"
+    assert len(calls) == 2 and not world.deployed
+    assert run.output == {"deployed": False}
+
+
+def _ls_remote(monkeypatch, run):
+    monkeypatch.setattr(
+        _deploy, "subprocess", SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired)
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [
+        (0, f"{SHA}\tHEAD\n", SHA),
+        (128, f"{SHA}\tHEAD\n", ""),
+        (0, "", ""),
+        (0, "not-a-sha\tHEAD\n", ""),
+    ],
+    ids=["head", "git-failed", "empty", "garbled"],
+)
+def test_public_head_is_the_sha_git_ls_remote_prints(monkeypatch, returncode, stdout, expected):
+    asked = []
+
+    def run(argv, **kwargs):
+        asked.append((argv, kwargs))
+        return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    _ls_remote(monkeypatch, run)
+    assert _deploy.public_head("acme/factory") == expected
+    argv, kwargs = asked[0]
+    assert argv == ["git", "ls-remote", "https://github.com/acme/factory.git", "HEAD"]
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+@pytest.mark.parametrize("error", [OSError("no git"), subprocess.TimeoutExpired("git", 60)])
+def test_public_head_is_empty_when_git_cannot_run_or_hangs(monkeypatch, error):
+    def run(argv, **kwargs):
+        raise error
+
+    _ls_remote(monkeypatch, run)
+    assert _deploy.public_head("acme/factory") == ""

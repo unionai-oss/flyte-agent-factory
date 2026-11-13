@@ -49,8 +49,9 @@ def references(text: str, repo: str, *, plain: bool = False) -> dict[int, bool]:
 
 
 def repository(profile: Profile) -> str:
+    """Return the board's repository: the workspace (`[repo] project`), whatever repos projects target."""
     try:
-        return _github.parse_repo(profile.repos.get("factory", profile.repo)).lower()
+        return _github.parse_repo(profile.repo).lower()
     except _github.GithubError:
         return ""
 

@@ -574,7 +574,15 @@ async def test_a_delegation_is_routed_when_it_starts_and_logged(wired, monkeypat
     assert _session_config._routes[-1]["role"] == "delegate"
 
 
+class _StopWaiting(Exception):
+    """Raised by a test's injected sleep: what the job recorded before it would sleep is the result."""
+
+
 async def test_a_deferred_delegation_fails_the_job_with_the_retry_time(wired, tmp_path, monkeypatch):
+    # The name is from before #125, kept so the test stays traceable. #125 (D2, decision-001: an explicit
+    # pin is hard) reversed the failing half: a deferred delegation used to fail the job with the retry time
+    # in its error, and now waits for that time with its slot released, saying so in the answer
+    # `delegate wait` reads. Every other assertion of the original is kept; the reversed one is inverted.
     from flyte_agent_factory import _bridge
 
     wired.store.latest["claude"].limited_until = wired.now + 3600
@@ -590,10 +598,20 @@ async def test_a_deferred_delegation_fails_the_job_with_the_retry_time(wired, tm
 
     supervisor = Delegations(root, work, worker, _usage._delegation_engine(rows), lambda *a: None)
     monkeypatch.setattr(supervisor, "queue_notice", lambda *a, **k: None)
-    await supervisor.service({"id": "delegate-1", "brief": "do it"})
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+        raise _StopWaiting
+
+    supervisor.sleep = sleep
+    with pytest.raises(_StopWaiting):
+        await supervisor.service({"id": "delegate-1", "brief": "do it"})
     answer = json.loads((root / "answers/delegate-1.json").read_text())
-    assert answer["state"] == "failed"
-    assert "deferred" in (supervisor.jobs / "delegate-1/error.txt").read_text()
+    assert answer["state"] == "waiting"
+    assert answer["until"] == pytest.approx(wired.now + 3600)
+    assert len(slept) == 1 and slept[0] > 0
+    assert not (supervisor.jobs / "delegate-1/error.txt").exists()
     assert "deferred" in rows.routing()[0]
     assert _bridge  # the answer file is the same one `delegate wait` reads
 
@@ -611,7 +629,14 @@ async def test_the_delegation_service_asks_the_router_for_its_engine(tmp_path, m
 
     supervisor = Delegations(root, work, cast(Any, None), engine, lambda *a: None)
     monkeypatch.setattr(supervisor, "queue_notice", lambda *a, **k: None)
-    await supervisor.service({"id": "delegate-2", "brief": "x"})
+
+    async def sleep(seconds):
+        # A deferral now waits and asks the router again (#125); one question is all this test needs.
+        raise _StopWaiting
+
+    supervisor.sleep = sleep
+    with pytest.raises(_StopWaiting):
+        await supervisor.service({"id": "delegate-2", "brief": "x"})
     assert asked == [1]
 
 
@@ -1235,14 +1260,13 @@ async def test_a_failing_cross_check_engine_reviews_on_the_builders_engine(wired
 
     monkeypatch.setattr(_reviewer, "_call_reviewer_raw", raw)
     monkeypatch.setattr(_usage, "_author_engine", "claude")
-    monkeypatch.setattr(_reviewer, "_limited_reason", {})
-    unreviewed: list[str] = []
+    outcomes: dict[str, _review._JudgeOutcome] = {}
     timeline = _timeline._Timeline()
     _, passed, _ = await _review._one_judge(
-        "correctness", "i", cast(Any, None), "b", "", 1, timeline, unreviewed
+        "correctness", "i", cast(Any, None), "b", "", 1, timeline, outcomes=outcomes
     )
     assert calls == ["codex", "claude"]
-    assert passed and unreviewed == []
+    assert passed and outcomes["correctness"].outcome == _review.PASS
     rows = [text for _, _, text in timeline._rows]
     assert any("cross-check unavailable: codex failing; reviewed on claude" in row for row in rows), rows
 
@@ -1255,3 +1279,127 @@ async def test_a_failing_builder_engine_is_not_retried_as_a_cross_check(wired, m
     monkeypatch.setattr(_reviewer, "_call_reviewer_raw", raw)
     with pytest.raises(RuntimeError, match="claude service unavailable"):
         await _reviewer._call_reviewer(purpose="planner", timeline=Rows())
+
+
+# --------------------------------------------------------------------------- #
+# Pausing (#125): what a deferral means, for the timeline, status and human-needed text
+# --------------------------------------------------------------------------- #
+
+
+def test_deferred_carries_retry_at():
+    reset = NOW + 4 * 86400
+    decision = route(meters={"claude": claude(limited=reset), "codex": codex(limited=NOW + 86400)})
+    assert decision.deferred
+    exc = _usage._deferred(decision)
+    assert exc.retry_at == NOW + 86400 and _router.RouterDeferred("x").retry_at is None
+
+
+def test_paused_names_engine_until_and_reasons():
+    reset = NOW + 4 * 86400
+    decision = route(
+        "author",
+        meters={"claude": claude(limited=reset), "codex": codex(limited=NOW + 6 * 86400)},
+        preferred="claude",
+        pin="claude",
+        hard_pin=True,
+    )
+    paused = _router.paused(decision, now=NOW)
+    assert (paused.engine, paused.until, paused.needs_human) == ("claude", reset, "")
+    assert paused.others == {"codex": "pinned to claude (ENGINE_FALLBACK unset)"}
+    assert paused.as_dict() == {
+        "engine": "claude",
+        "until": reset,
+        "others": paused.others,
+        "needs_human": "",
+    }
+
+
+def test_paused_unpinned_waits_for_the_earliest_reset_and_says_why_the_other_is_out():
+    decision = route(meters={"claude": claude(limited=NOW + 7200), "codex": codex(limited=NOW + 86400)})
+    paused = _router.paused(decision, now=NOW)
+    assert (paused.engine, paused.until) == ("claude", NOW + 7200)
+    assert paused.others == {"codex": "limited until 2027-01-16 08:00 UTC"} and not paused.needs_human
+
+
+def test_paused_with_no_known_reset_waits_without_a_time():
+    decision = route(exclude=("claude", "codex"))
+    paused = _router.paused(decision, now=NOW)
+    assert paused.engine == "claude" and paused.until is None and paused.needs_human == ""
+
+
+def test_paused_needs_human_only_when_nothing_can_run():
+    # Not configured and a rejected login need someone to act ...
+    dead = _meter.Meter(
+        "codex", "limit-text", NOW, limited_until=NOW + 6 * 3600, error="codex login unusable"
+    )
+    decision = route(
+        "author", meters={"codex": dead}, available=("codex",), pin="codex", preferred="codex", hard_pin=True
+    )
+    paused = _router.paused(decision, now=NOW)
+    assert paused.engine == "" and paused.until is None
+    assert "codex: login rejected (codex login unusable) -- replace the [secrets] codex_token secret" in (
+        paused.needs_human
+    )
+    assert "claude: no credential" in paused.needs_human
+
+    unconfigured = route("author", available=("claude",), pin="codex", preferred="codex", hard_pin=True)
+    assert unconfigured.reason == "pin codex not configured"
+    text = _router.paused(unconfigured, now=NOW).needs_human
+    assert (
+        'codex: no credential -- add the [secrets] codex_token secret, or set ENGINE_FALLBACK="allow"' in text
+    )
+
+    nothing = _router.paused(route(available=()), now=NOW)
+    assert "claude: no credential" in nothing.needs_human and "codex: no credential" in nothing.needs_human
+
+    # ... an engine at its limit does not, whether or not its reset is known.
+    for meters in (
+        {"claude": claude(limited=NOW + 3600), "codex": codex(limited=NOW + 7200)},
+        {"claude": claude(limited=NOW + 3600)},
+    ):
+        assert _router.paused(route(meters=meters, exclude=("codex",)), now=NOW).needs_human == ""
+    # A Claude login that works leaves a configured, limited engine waitable even if Codex is dead.
+    waitable = route(meters={"claude": claude(limited=NOW + 3600), "codex": dead})
+    assert _router.paused(waitable, now=NOW).engine == "claude"
+
+
+def _deferred(*candidates, pin=""):
+    """A deferral built by hand, for the corners `route` does not produce."""
+    return _router.Decision("author", None, "deferred", NOW, candidates=candidates, pin=pin)
+
+
+def test_paused_describes_an_engine_that_is_neither_awaited_nor_out_of_the_way():
+    limited = _router.Candidate("claude", "exhausted", usable_at=NOW + 3600)
+    fine = _router.Candidate("codex", "usable", headroom=0.5, five_hour_pct=40.0, weekly_pct=10.0)
+    paused = _router.paused(_deferred(limited, fine), now=NOW)
+    assert paused.engine == "claude" and paused.until == NOW + 3600
+    assert paused.others == {"codex": "codex 5h 40% weekly 10%"}
+
+
+def test_paused_says_a_pin_to_an_unknown_engine_is_not_configured():
+    claude_ok = _router.Candidate("claude", "usable", headroom=1.0)
+    paused = _router.paused(_deferred(claude_ok, pin="gemini"), now=NOW)
+    assert paused.engine == ""
+    assert paused.others == {"claude": "pinned to gemini (ENGINE_FALLBACK unset)", "gemini": "not configured"}
+    assert paused.needs_human == 'claude: not used, pinned to gemini -- set ENGINE_FALLBACK="allow" to use it'
+
+
+def test_unblock_describes_a_usable_engine_the_pin_does_not_forbid():
+    usable = _router.Candidate("codex", "usable", headroom=0.5, five_hour_pct=40.0)
+    assert _router._unblock(usable, "codex", {"codex": usable}, "lift the pin") == "codex: codex 5h 40%"
+
+
+def test_a_candidate_carries_its_meter_error():
+    meter = _meter.Meter("codex", "refresh-failed", NOW, error="http 401")
+    decision = route(meters={"codex": meter}, available=("claude", "codex"))
+    assert {c.engine: c.error for c in decision.candidates}["codex"] == "http 401"
+
+
+@pytest.mark.parametrize("preferred", ["", "claude", "codex"])
+@pytest.mark.parametrize("pin", ["", "codex"])
+def test_exhausted_engine_never_chosen_across_attempts(preferred, pin):
+    """#125 criterion 13: with Codex out for days, every attempt, preferred or soft-pinned, takes Claude."""
+    meters = {"claude": claude(20), "codex": codex(limited=NOW + 5 * 86400)}
+    for attempt in range(5):
+        decision = route("author", meters=meters, now=NOW + attempt * 1800, preferred=preferred, pin=pin)
+        assert decision.engine == "claude", (attempt, decision.row())

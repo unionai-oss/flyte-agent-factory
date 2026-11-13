@@ -1,6 +1,7 @@
 """The loop's admission and decisions, independent of Flyte and GitHub."""
 
 import json
+import re
 from dataclasses import replace
 from typing import Any, cast
 
@@ -119,6 +120,20 @@ def test_loop_profile():
     for extra in ('merge = "yes"', "band = 0.1", 'enabled = "yes"'):
         with pytest.raises(_profile.ProfileError):
             _profile.parse(text + '\n[loop]\nrepo = "acme/factory"\n' + extra)
+
+
+def test_classify_reads_paths_relative_to_the_engine_subtree():
+    sub = "projects/engine"
+    assert _loop.classify([f"{sub}/src/flyte_agent_factory/_dashboard.py"], path=sub) == "benchmark"
+    assert _loop.classify([f"{sub}/docs/guide.md"], path=sub) == "docs_only"
+    # The owner's files are the engine's own, wherever the engine sits in the repository.
+    for owner in ("src/flyte_agent_factory/_bench_flow.py", "profiles/x.toml", "pyproject.toml"):
+        assert _loop.classify([f"{sub}/{owner}"], path=sub) == "needs_owner"
+    # What is not under the subtree is not the engine: the loop does not judge it.
+    assert _loop.classify([f"{sub}/docs/guide.md", "README.md"], path=sub) == "needs_owner"
+    assert _loop.classify([f"{sub}2/docs/guide.md"], path=sub) == "needs_owner"
+    renamed: _loop.ChangedFile = {"filename": f"{sub}/docs/a.md", "previous_filename": "elsewhere/a.md"}
+    assert _loop.classify([renamed], path=sub) == "needs_owner"
 
 
 def test_kill_switch_requires_trusted_label_and_owner_restart():
@@ -324,3 +339,62 @@ def test_loop_pull_rejects_everything_else(launched_for, app_issues, pull):
 def test_pr_body_text_is_not_a_link(launched_for):
     pull: Any = {**pr(ref="factory/other"), "body": "Closes #7"}
     assert not _loop.loop_pull(loop_app([loop_issue()]), "acme/factory", pull)
+
+
+def loop_profile(loop: str = "", *, factory: bool = True) -> _profile.Profile:
+    """The bench test profile (it has [deploy] and [direction]), with a [loop] table if `loop` is given."""
+    from tests.test_bench import BENCH, PROFILE_TEXT
+
+    text = PROFILE_TEXT
+    if not factory:
+        text = (
+            text.replace('factory = "git@github.com:example-org/factory.git"\n', "")
+            .replace('[repo_keys]\nfactory = "factory_key"\n', "")
+            .replace('[repo_aliases]\nfactory = ["git@github.com:example-org/old-factory.git"]\n', "")
+            .replace('repos = ["project", "factory"]', 'repos = ["project"]')
+            # Auto deploy needs the repository it deploys from named once it cannot default to factory.
+            .replace("[deploy]\n", '[deploy]\nrepo = "git@github.com:example-org/engine.git"\n')
+        )
+    return _profile.parse(text + BENCH + ("\n[loop]\n" + loop if loop else ""), "loop-test")
+
+
+@pytest.mark.parametrize(
+    "repo, path, expected",
+    [
+        ("example-org/direction", "projects/engine", "projects/engine"),
+        ("example-org/direction", "projects//engine/", "projects/engine"),
+        ("example-org/direction", "", ""),
+        ("example-org/factory", "engine", "engine"),
+        ("example-org/factory", "", ""),
+    ],
+)
+def test_loop_repo_is_any_profile_repo_with_an_optional_subtree(repo, path, expected):
+    parsed = loop_profile(f'enabled = true\nrepo = "{repo}"\npath = "{path}"\n').loop
+    assert (parsed.repo, parsed.path) == (repo, expected)
+
+
+def test_loop_path_defaults_to_the_repo_root():
+    assert loop_profile('repo = "example-org/factory"\n').loop.path == ""
+
+
+@pytest.mark.parametrize(
+    "loop, error",
+    [
+        ('repo = "example-org/elsewhere"\n', "must be one of the profile's repositories"),
+        ('repo = "example-org/direction"\npath = "../x"\n', "[loop] path"),
+        ('repo = "example-org/direction"\npath = "a/../../x"\n', "[loop] path"),
+        ('repo = "example-org/direction"\npath = "/etc"\n', "[loop] path"),
+        ('repo = "example-org/direction"\npath = 3\n', "[loop] path must be a string"),
+    ],
+)
+def test_a_bad_loop_repo_or_path_is_refused(loop, error):
+    with pytest.raises(_profile.ProfileError, match=re.escape(error)):
+        loop_profile("enabled = true\n" + loop)
+
+
+def test_a_bench_needs_the_factory_repo_unless_the_loop_names_the_engine():
+    # The loop's repo is then the bench's default source.
+    loop = 'enabled = true\nrepo = "example-org/direction"\npath = "projects/engine"\n'
+    assert loop_profile(loop, factory=False).bench is not None
+    with pytest.raises(_profile.ProfileError, match=r"requires \[repo\] factory"):
+        loop_profile(factory=False)

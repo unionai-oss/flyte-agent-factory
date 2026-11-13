@@ -420,6 +420,29 @@ def test_baseline_reuse_requires_the_same_model(origin, monkeypatch):
         )
 
 
+def test_baseline_reuse_requires_the_same_engine_source(origin, monkeypatch):
+    # The same SHA in another repo and subtree is another engine; a row without the field is the root engine.
+    monkeypatch.setattr(time, "time", lambda: NOW + 1)
+    source = "example-org/direction:projects/engine"
+    with _bench_store.Store(origin.as_uri()) as store:
+        sourced = record(engine_source=source)
+        store.append_case(sourced)
+        args: tuple[str, dict[str, str], str, str, int, int] = (
+            SHA,
+            {},
+            str(sourced["suite_digest"]),
+            str(sourced["task"]),
+            1,
+            100000,
+        )
+        assert store.baseline_records(*args) is None
+        assert store.baseline_records(*args, engine_source=source) == sourced
+        root = record(case_run="b-root-000001")
+        store.append_case(root)
+        assert store.baseline_records(*args) == root
+        assert store.baseline_records(*args, engine_source="example-org/other:") is None
+
+
 def test_history_survives_a_schema_change_and_a_corrupt_line(origin):
     # QA: reads validated every field, so the first schema change would make every old record unreadable.
     with _bench_store.Store(origin.as_uri()) as store:

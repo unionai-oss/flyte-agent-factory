@@ -60,7 +60,7 @@ _CRITERION_LINE = re.compile(rf"^[ \t>*_`-]*({_CRITERION_ID})[*_`]*([.):])?[*_`]
 _FINDING_LINE = re.compile(r"^[ \t]*(?:#{2,4}[ \t]+|\d+[.)][ \t]+|[-*][ \t]+\*\*)(.+)$")
 _NOT_A_FINDING = re.compile(
     r"^[\W_]*(?:blocking|non-blocking|verdict|findings?|summary|what'?s good|good|design "
-    r"conflicts)\b|.*\breviewer\s*$",
+    r"conflicts)\b|.*\breviewer\s*$|.*\breviewer: (?:no verdict|deferred|not run)\b",
     re.IGNORECASE,
 )
 _URL = re.compile(r"https?://[^\s<>)\]\"'`]+")
@@ -134,16 +134,21 @@ def finding_titles(report: str, limit: int = 8) -> list[str]:
 
 
 # Rows name a judge `judge-craft`; rows of older runs say `craft`. Either is keyed by the bare name.
-_VERDICT_ROW = re.compile(r"^(?:judge-)?(\w+): (PASS|FAIL)$")
+# A carried row says the verdict came from an earlier, undecided round on the same commit.
+_VERDICT_ROW = re.compile(r"^(?:judge-)?(\w+): (PASS|FAIL)(?: \(carried from round \d+, same commit\))?$")
+# Older runs counted a missing verdict as a FAIL and said so; newer ones say which way it is missing.
 _NO_VERDICT_ROW = re.compile(r"^(?:judge-)?(\w+): no verdict, treating as FAIL$")
+_MISSING_ROW = re.compile(r"^(?:judge-)?(\w+): (NO VERDICT|DEFERRED|NOT RUN)\b")
 _ROUND_ROW = re.compile(r"^QA round (\d+)\b")
 
 
 def latest_verdicts(timeline: Iterable[Snapshot]) -> tuple[int | None, dict[str, str]]:
-    """`(round, {judge: PASS|FAIL})` of the newest QA round in a snapshot's timeline rows, oldest first.
+    """`(round, {judge: PASS|FAIL|NO VERDICT|DEFERRED|NOT RUN})` of the newest QA round in the timeline rows.
 
-    "🔍 QA round 3: ..." starts a round; then "✅ correctness: PASS", "❌ craft: FAIL", or
-    "⚠️ craft: no verdict, treating as FAIL". `(None, {})` when no round is in the rows.
+    "🔍 QA round 3: ..." starts a round; then "✅ correctness: PASS", "❌ craft: FAIL",
+    "⚠️ craft: NO VERDICT (...)", "⏸️ craft: DEFERRED (...)" or "⚠️ craft: NOT RUN (...)"; a later row of
+    the same judge (a retry that got a verdict) replaces an earlier one. Rows of older runs say
+    "⚠️ craft: no verdict, treating as FAIL", which was a FAIL then. `(None, {})` when no round is in the rows.
     """
     verdicts: dict[str, str] = {}
     round_ = None
@@ -158,6 +163,8 @@ def latest_verdicts(timeline: Iterable[Snapshot]) -> tuple[int | None, dict[str,
             verdicts[found.group(1)] = found.group(2)
         elif row.get("icon") == "⚠️" and (missing := _NO_VERDICT_ROW.match(text)):
             verdicts[missing.group(1)] = "FAIL"
+        elif row.get("icon") in ("⚠️", "⏸️") and (absent := _MISSING_ROW.match(text)):
+            verdicts[absent.group(1)] = absent.group(2)
     return round_, verdicts
 
 
@@ -184,14 +191,25 @@ def _link(url: str, label: str | None = None) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{_e(label or url)}</a>'
 
 
-def phase_label(phase: Snapshot) -> str:
+def clock_or_date(ts: float, now: float) -> str:
+    """`14:50 UTC` on the same UTC date as `now`, else `Mon 16 Nov 00:40 UTC`: a weekly reset is days away."""
+    at = time.gmtime(ts)
+    if at[:3] == time.gmtime(now)[:3]:
+        return clock(ts)
+    return f"{time.strftime('%a', at)} {at.tm_mday} {time.strftime('%b %H:%M', at)} UTC"
+
+
+def phase_label(phase: Snapshot, now: float | None = None) -> str:
     kind: str = phase.get("kind", "starting")
     if kind == "review":
         total = phase.get("max_rounds")
         return f"review round {phase.get('round', '?')}" + (f" of {total}" if total else "")
     if kind == "limited":
         until = phase.get("limited_until")
-        return f"limited until {clock(until)}" if until else "limited (reset time not shown)"
+        now = time.time() if now is None else now
+        label = f"limited until {clock_or_date(until, now)}" if until else "limited (reset time not shown)"
+        awaited = (phase.get("paused") or {}).get("engine")
+        return f"{label}, waiting for {awaited}" if awaited else label
     return PHASE_LABELS.get(kind, kind)
 
 
@@ -382,7 +400,7 @@ def _status(data: Snapshot, header_html: str, activity: str, now: float) -> str:
     rows = [
         (
             "phase",
-            f'<span class="pill {cls}">{_e(phase_label(phase))}</span>'
+            f'<span class="pill {cls}">{_e(phase_label(phase, now))}</span>'
             + f' <span class="mute">for {_e(duration(now - phase["since"]))}</span>',
         ),
         (

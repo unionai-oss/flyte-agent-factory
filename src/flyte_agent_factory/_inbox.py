@@ -45,6 +45,21 @@ def _is_stop(text: str) -> bool:
     return text.strip().lower() in _STOP_WORDS
 
 
+#: A direction to run the author on another engine: `/engine X`, `/resume [on] X`, `resume [now] on X`,
+#: `switch to X`. Only the whole message counts, so "please resume on claude when you can" stays ordinary
+#: direction for the session rather than an instruction the harness acts on.
+ENGINE_DIRECTION = re.compile(
+    r"^\s*(?:/engine\s+|/resume\s+(?:on\s+)?|resume\s+(?:now\s+)?on\s+|switch\s+to\s+)(claude|codex)\s*[.!]?\s*$",
+    re.I,
+)
+
+
+def engine_direction(text: str) -> str | None:
+    """Return the engine `text` directs the author to, lower case, or None when it is not that command."""
+    match = ENGINE_DIRECTION.match(text)
+    return match[1].lower() if match else None
+
+
 class _Stoppable(Protocol):
     async def stop(self) -> None: ...
 
@@ -62,12 +77,16 @@ async def _inbox_loop(
     stop: asyncio.Event,
     grant_round: Callable[..., Awaitable[None]],
     credentials: Credentials | None = None,
+    *,
+    on_engine: Callable[[str], str] | None = None,
 ) -> None:
     """Deliver direction that arrives over Flyte conditions into the session.
 
     `grant_round` runs `/review-again`. It is passed in because it works on the review state that
     still lives in `agent`, which this module cannot import. `credentials` takes the owner's sealed
     credentials and `/revoke-credential` before anything else sees them (`Credentials.handle`).
+    `on_engine` takes an engine direction (`engine_direction`) and returns the timeline row saying what
+    was done. Without it, such a message is ordinary direction for the session.
 
     `proc` may be a future for a session that does not exist yet: the loop is started before the
     session so that `/stop` needs no author. Other messages wait for the session, then arrive once.
@@ -121,6 +140,13 @@ async def _inbox_loop(
                     continue
                 if message.split(None, 1)[0].lower() == "/review-again":
                     deliveries.put_nowait(functools.partial(grant_round, timeline=timeline, message=message))
+                    continue
+                if on_engine is not None and (engine := engine_direction(message)):
+                    # Acted on here, not delivered: a paused session would only queue it behind the very
+                    # limit it asks to leave. Recorded so the handoff prompt tells the next engine.
+                    _record_direction(message, "Union", timeline)
+                    if row := on_engine(engine):
+                        timeline.row("🔁", row)
                     continue
 
                 # Written to a file for the same reason as the brief: the TUI submits on
@@ -231,6 +257,9 @@ def _save_pass(
     timeline: _timeline._Timeline | None = None,
     passed: bool = True,
     in_review: bool = False,
+    review_retry_at: float | None = None,
+    review_retry_why: str = "",
+    incomplete_reruns: int = 0,
 ) -> None:
     """Keep a passed review across a pod restart, which would otherwise lose `passed_round`.
 
@@ -238,7 +267,10 @@ def _save_pass(
     pass, or of a pass that was withdrawn: the milestones and the board are derived from it, and a restart
     must not make the next round look like the first. `in_review` preserves a round that started but has
     no verdict yet. A file without `passed` is the previous version's,
-    which only ever wrote passes.
+    which only ever wrote passes. `review_retry_at` is the wall time a deferred or incomplete review
+    re-runs, and `review_retry_why` what it waits on: a restart while it waits would otherwise lose it, and
+    nothing would re-run the review. `incomplete_reruns` counts the automatic re-runs of an incomplete
+    review since the last DONE, so a restart does not reset their cap.
 
     Without it a restarted project never releases and holds its slot. Under STATE_ROOT so it rides
     the checkpoint, as `directions.json` does. `verdict_posted` is what makes the save-then-post order
@@ -262,6 +294,9 @@ def _save_pass(
                     "pr_at": timeline.pr_at if timeline else None,
                     "review_round": timeline.review_round if timeline else round_,
                     "review_started_at": timeline.review_started_at if timeline else None,
+                    "review_retry_at": review_retry_at,
+                    "review_retry_why": review_retry_why if review_retry_at else "",
+                    "incomplete_reruns": incomplete_reruns,
                 }
             )
         )
@@ -276,10 +311,30 @@ def _clear_pass_keep_history() -> None:
             _session_config._passed_path().write_text(json.dumps(record))
 
 
-def _unpass(round_: int, timeline: _timeline._Timeline) -> None:
-    """Return the work is no longer passed: a restart must not release it, but it keeps the review history."""
+def _unpass(
+    round_: int,
+    timeline: _timeline._Timeline,
+    review_retry_at: float | None = None,
+    review_retry_why: str = "",
+    incomplete_reruns: int = 0,
+) -> None:
+    """Return the work is no longer passed: a restart must not release it, but it keeps the review history.
+
+    `review_retry_at` (and what it waits on) is saved with it when the review is to re-run by itself; None
+    clears a saved one.
+    """
     timeline.passed_at = None
-    _save_pass(round_, "", timeline.pr_url, True, timeline=timeline, passed=False)
+    _save_pass(
+        round_,
+        "",
+        timeline.pr_url,
+        True,
+        timeline=timeline,
+        passed=False,
+        review_retry_at=review_retry_at,
+        review_retry_why=review_retry_why,
+        incomplete_reruns=incomplete_reruns,
+    )
 
 
 def _in_daemon_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> asyncio.Future[Any]:
