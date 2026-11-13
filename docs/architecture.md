@@ -586,7 +586,9 @@ the session role definitions, the browser image files and the workspace template
 | `_bench_flow.py` | `factory-bench.benchmark`, the launchable workflow |
 | `_bench_suite.py` | the task suite: each task, its start and its hidden check |
 | `_bench_check.py` | `factory-bench-check`: a hidden check run on the code a case pushed |
+| `_bench_expiry_hidden.py` | the hidden check source of the feature-expiry task |
 | `_bench_logstats_files.py` | golden inputs and outputs for the refactor-logstats check |
+| `_bench_mlpipe_files.py` | the hidden check source and holdout data of the ml-pipeline task |
 | `_bench_stats.py` | paired benchmark statistics |
 | `_bench_store.py` | results on the direction repository's orphan results branch |
 

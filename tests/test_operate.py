@@ -642,8 +642,8 @@ def test_every_package_module_loads_with_the_agent():
     # `_grant_page` is `_factory_mcp`'s (the factory side); `_grants_cli` is the `credential-grant` command,
     # run by name in the session, so it is in the slot env's `include` too.
     assert out.stdout.strip() == (
-        "_admission,_backlog,_bench,_bench_check,_bench_flow,_bench_logstats_files,_bench_stats,_bench_store,"
-        "_bench_suite,_board_events,_bootstrap,_bootstrap_base,_bootstrap_finish,_bootstrap_flyte,"
+        "_admission,_backlog,_bench,_bench_check,_bench_expiry_hidden,_bench_flow,_bench_logstats_files,"
+        "_bench_mlpipe_files,_bench_stats,_bench_store,_bench_suite,_board_events,_bootstrap,_bootstrap_base,_bootstrap_finish,_bootstrap_flyte,"
         "_bootstrap_github,_bootstrap_keys,_bootstrap_profile,_bootstrap_steps,_deploy,_deploy_apps,_deploy_child,_deployer,"
         "_factory,_factory_base,"
         "_factory_grants,_factory_live,_factory_mcp,_factory_meters,_factory_policy,_factory_recreate,"
