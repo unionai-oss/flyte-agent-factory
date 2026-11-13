@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import (
+    _delivery,
     _evidence,
     _gate_base,
     _gate_rules,
@@ -172,6 +173,7 @@ _TEST_HARNESS = re.compile(
     r"|sitecustomize\.py|usercustomize\.py|pytest\.py|py\.py|_slow_lane\.py)$"
     r"|(^|/)_pytest/|(^|/)(pytest|py)/__init__\.py$|\.pth$"
     r"|(^|/)src/flyte_agent_factory/(__init__|child|_names)\.py$"
+    r"|(^|/)ops/package_skill\.py$"  # checks.sh runs its --check on the skill zips
 )
 
 
@@ -623,8 +625,8 @@ def _check_suppressions(
 ) -> Result:
     # tokenize and ast avoid treating strings as directives or guessing handler structure from indentation.
     # No Ruff rule covers reason length, protected codes, and the loop-boundary exception together.
-    # `changed` limits reports to the project's own lines: a root-layout project is the whole engine repo,
-    # whose pinned boundary handlers and older suppression comments would fail every self-improvement.
+    # `changed` limits reports to the project's own lines: a root-layout project is a whole repository,
+    # whose pinned boundary handlers and older suppression comments would fail every change to it.
     protected = _suppression_codes(files)
     problems = []
     for relative in sorted(_gate_base._project_files(project)):
@@ -881,7 +883,7 @@ def standards_results(
         if any(rule.lint_codes for rule in must):
             results.append(_check_suppressions(project, files, changed))
         if ids := mapped.get(_standards.MODULE_SIZE):
-            code, output = _module_size.check(project, start or size_reference, _gate_tests._is_test)
+            code, output = _module_size.check(project, start or size_reference, _gate_tests._is_test, work)
             record(_standards.MODULE_SIZE, _gate_base.Status.from_exit(code), labelled(ids, output))
         # An evidence rule names no command of its own: the project may declare the one that satisfies it.
         declared, misdeclared = _evidence.declared(project, _standards.evidence_rules(must))
@@ -1015,44 +1017,23 @@ def target_ci_result(checkout: Path, repo: str = "", *, against_base: bool = Tru
             _gate_base.Status.NOT_APPLICABLE,
             "no lint, type, docstring or test commands found in CI" + skipped,
         )
-    jobs: dict[str, list[tuple[_target_ci.Command, _target_run.Run]]] = {}
-    with tempfile.TemporaryDirectory(prefix="factory-target-jobs-") as scratch:
-        copies: dict[str, Path] = {}
-        try:
-            for item in commands:
-                # The steps of one job share `$GITHUB_ENV` and one copy of the checkout, as on a runner;
-                # the origin starts with the workflow file. A formatter step edits that copy, not the
-                # session's files, and the next job starts from a fresh one.
-                job_key = re.sub(r"\W", "_", f"{item.origin.partition(':')[0]}-{item.job}")
-                job_state = Path(scratch) / job_key
-                job_state.mkdir(exist_ok=True)
-                if job_key not in copies:
-                    copy = Path(scratch) / f"{job_key}-checkout"
-                    code, output = _gate_base._run(
-                        ["git", "worktree", "add", "--detach", str(copy), "HEAD"], checkout
-                    )
-                    if code:
-                        return Result(
-                            rule,
-                            _gate_base.Status.FAIL,
-                            f"cannot copy the checkout to run the target's CI in:\n{output}",
-                        )
-                    copies[job_key] = copy
-                jobs.setdefault(job_key, []).append(
-                    (item, _target_run.execute(item, copies[job_key], job_state, repo))
-                )
-        finally:
-            # The worktrees are registered in the checkout's .git: leave nothing of them there.
-            for copy in copies.values():
-                _gate_base._run(["git", "worktree", "remove", "--force", str(copy)], checkout)
-            _gate_base._run(["git", "worktree", "prune"], checkout)
     judged = _target_run.Judged()
-    for steps in jobs.values():
-        one = _target_run.judge(checkout, steps, repo, against_base=against_base)
-        judged.failures += one.failures
-        judged.pre_existing += one.pre_existing
-        judged.not_run += one.not_run
-    return _target_verdict(rule, judged, "ran " + ", ".join(f"`{c.command}`" for c in commands), skipped)
+    with tempfile.TemporaryDirectory(prefix="factory-target-jobs-", ignore_cleanup_errors=True) as scratch:
+        try:
+            jobs, held = _target_run.run_jobs(checkout, commands, repo, Path(scratch))
+        except _target_run.WorktreeUnavailable as exc:
+            return Result(
+                rule, _gate_base.Status.FAIL, f"cannot copy the checkout to run the target's CI in:\n{exc}"
+            )
+        for steps in jobs:
+            one = _target_run.judge(
+                checkout, steps, repo, against_base=against_base, artifacts=Path(scratch) / "artifacts"
+            )
+            judged.failures += one.failures
+            judged.pre_existing += one.pre_existing
+            judged.not_run += one.not_run
+    ran = [f"`{item.command}`" for steps in jobs for item, run in steps if not run.skipped]
+    return _target_verdict(rule, judged, "ran " + ", ".join(ran), skipped + "".join(f"\n{h}" for h in held))
 
 
 def _is_test_file(relative: str) -> bool:
@@ -1073,16 +1054,17 @@ def uncovered_changed_lines(report: dict[str, Any], checkout: Path, changed: dic
     nothing ran in it: all its changed lines are uncovered.
     """
     uncovered: set[str] = set()
-    reported = {
-        str(Path(name).relative_to(checkout) if Path(name).is_absolute() else name)
-        for name in report.get("files", {})
+    # A file outside the checkout (imported from a PYTHONPATH directory or site-packages) is not the change.
+    files = {
+        str(path.relative_to(checkout) if path.is_absolute() else path): data
+        for name, data in report.get("files", {}).items()
+        if not (path := Path(name)).is_absolute() or path.is_relative_to(checkout)
     }
+    reported = set(files)
     for relative, lines in changed.items():
         if relative.endswith(".py") and relative not in reported and not _is_test_file(relative):
             uncovered.update(f"{relative}:{n}" for n in lines)
-    for name, data in report.get("files", {}).items():
-        path = Path(name)
-        relative = str(path.relative_to(checkout) if path.is_absolute() else path)
+    for relative, data in files.items():
         lines = changed.get(relative, set())
         missing = set(data.get("missing_lines", []))
         uncovered.update(f"{relative}:{n}" for n in missing & lines)
@@ -1095,10 +1077,13 @@ def uncovered_changed_lines(report: dict[str, Any], checkout: Path, changed: dic
     return uncovered
 
 
-def _target_coverage_result(project: Path, checkout: Path, repo: str = "") -> Result:
-    """Require every changed line of the target's checkout covered, or listed in SUMMARY.md with a reason."""
+def _target_coverage_result(project: Path, checkout: Path, repo: str = "", new: bool = False) -> Result:
+    """Require every changed line of the target's checkout covered, or listed in SUMMARY.md with a reason.
+
+    `new`: the target has no commits yet, so all its Python is the project's change (the empty tree).
+    """
     rule = "factory:target-coverage"
-    base = _target_base(checkout)
+    base = _target_base(checkout) or (_delivery.EMPTY_TREE if new else "")
     changed = changed_lines(checkout, base) if base else None
     if changed is None:
         return Result(
@@ -1114,9 +1099,15 @@ def _target_coverage_result(project: Path, checkout: Path, repo: str = "") -> Re
     if judged.failures or judged.not_run:
         return _target_verdict(rule, judged, "")
     old = "".join(f"\npre-existing: {p}" for p in judged.pre_existing)
-    with tempfile.TemporaryDirectory(prefix="factory-coverage-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="factory-coverage-", ignore_cleanup_errors=True) as scratch:
         report_path = Path(scratch) / "coverage.json"
-        code, output = _gate_base._run(["python", "-m", "coverage", "json", "-o", str(report_path)], checkout)
+        if reader := _target_ci.coverage_report_command(command, report_path):
+            read = _target_run.execute(reader, checkout, None, repo)
+            code, output = (read.code or 1, read.not_run) if read.not_run else (read.code, read.output)
+        else:
+            code, output = _gate_base._run(
+                ["python", "-m", *_target_ci.COVERAGE_JSON, "-o", str(report_path)], checkout
+            )
         if "No module named coverage" in output:
             return Result(rule, _gate_base.Status.TOOL_UNAVAILABLE, image_defect("coverage", [rule]))
         if code:
@@ -1140,66 +1131,23 @@ def _target_coverage_result(project: Path, checkout: Path, repo: str = "") -> Re
     )
 
 
-def _target_patches_result(project: Path, checkout: Path) -> Result:
-    """Require `patches/*.patch` that rebuild the checkout's work when applied to its base in a scratch clone.
-
-    `ops/promote.py` reads these files and nothing else, so a delivery that leaves none, or stale ones,
-    is not delivered. Comparing the tree after `git am` with the checkout's HEAD tree is what catches a
-    commit made after the patches were. The checkout itself is only read.
-    """
-    rule = "factory:target-patches"
-    patches = sorted((project / "patches").glob("*.patch"))
-    if not patches:
-        return Result(
-            rule,
-            _gate_base.Status.FAIL,
-            "no patches/*.patch in the project: in the target checkout run "
-            "`git format-patch <base>..HEAD -o <project>/patches`, <base> being the commit it started from",
-        )
-    base = _target_base(checkout)
-    if not base:
-        return Result(
-            rule, _gate_base.Status.FAIL, "the checkout has no merge-base with its default branch to apply to"
-        )
-    code, head_tree = _gate_base._run(["git", "rev-parse", "HEAD^{tree}"], checkout)
-    # `git am` needs a committer; the patches carry the authors.
-    env = _secret_env.child_env(
-        GIT_COMMITTER_NAME="Agent Factory", GIT_COMMITTER_EMAIL="agent-factory@localhost"
-    )
-    with tempfile.TemporaryDirectory(prefix="factory-patches-") as scratch:
-        clone = Path(scratch) / "clone"
-        for command in (
-            ["git", "clone", "--quiet", str(checkout), str(clone)],
-            ["git", "checkout", "--quiet", "--detach", base],
-            ["git", "am", "--3way", *(str(p) for p in patches)],
-            ["git", "rev-parse", "HEAD^{tree}"],
-        ):
-            code, output = _gate_base._run(
-                command, Path(scratch) if command[1] == "clone" else clone, env=env
-            )
-            if code:
-                return Result(
-                    rule,
-                    _gate_base.Status.FAIL,
-                    f"`{' '.join(command[:3])}` exited {code} (patches, base {base[:12]}):\n{output[-3000:]}",
-                )
-    if output.strip() != head_tree.strip():
-        return Result(
-            rule,
-            _gate_base.Status.FAIL,
-            f"the {len(patches)} patch(es) apply to {base[:12]} but do not rebuild the checkout's HEAD: "
-            "make them again with `git format-patch` after the last commit",
-        )
-    return Result(
-        rule, _gate_base.Status.PASS, f"{len(patches)} patch(es) apply with `git am --3way` onto {base[:12]}"
-    )
-
-
 def target_results(project: Path, brief: str) -> list[Result]:
-    """Return the target repo's CI and patch coverage for a project whose brief says `Delivers to:`."""
+    """Return the target repo's CI and changed-line coverage for a project whose brief says `Delivers to:`.
+
+    The target's tree is the project's imported files (`promote.toml`), checked in a scratch repo made from
+    the workspace history. A project from before imports works in a nested checkout of the target instead.
+    """
     target = _target_ci.parse_target(brief)
     if target is None:
         return []
+    try:
+        delivery = _delivery.load(project)
+        if delivery is not None:
+            _delivery.require_repo(delivery, target.repo)
+            with _delivery.target_checkout(project, delivery) as scratch:
+                return _target_results_in(project, scratch, target.repo, new=not delivery.base)
+    except _delivery.DeliveryError as exc:
+        return [Result("factory:target-ci", _gate_base.Status.FAIL, str(exc))]
     checkout = _target_ci.find_checkout(project, target)
     if checkout is None:
         where = f"at `{target.path}`" if target.path else "(the one nested git checkout)"
@@ -1207,14 +1155,16 @@ def target_results(project: Path, brief: str) -> list[Result]:
             Result(
                 "factory:target-ci",
                 _gate_base.Status.FAIL,
-                f"no checkout of {target.repo} {where} in the project",
+                f"no {_delivery.FILE} and no checkout of {target.repo} {where} in the project: "
+                f"the operator imports the target's files with `python ops/promote.py import {target.repo} "
+                "<this project's directory>`",
             )
         ]
-    return [
-        target_ci_result(checkout, target.repo),
-        _target_coverage_result(project, checkout, target.repo),
-        _target_patches_result(project, checkout),
-    ]
+    return _target_results_in(project, checkout, target.repo)
+
+
+def _target_results_in(project: Path, checkout: Path, repo: str, new: bool = False) -> list[Result]:
+    return [target_ci_result(checkout, repo), _target_coverage_result(project, checkout, repo, new)]
 
 
 _NAME_MAX = 255  # NAME_MAX on Linux: longer components make `stat` raise ENAMETOOLONG
@@ -1342,7 +1292,7 @@ def run(
         for rule in _standards.rules(files)
     )
     tested = mapped.get(_standards.FAIL_TO_PASS, [])
-    base = resolve_base(workspace, name) if in_repo else ""
+    base = work.trusted_base = resolve_base(workspace, name) if in_repo else ""
     uncommitted = _uncommitted(workspace, name, layout) if in_repo else []
     if base:
         _judge_project(workspace, name, base, brief, demo, note, uncommitted, record, layout, work, tested)
@@ -1367,7 +1317,7 @@ def run(
     )
     changed = changed_lines(project, base) if base else None
     with contextlib.ExitStack() as stack:
-        # A root-layout project is the whole engine repo: judge its language tools on regressions from
+        # A root-layout project is a whole repository: judge its language tools on regressions from
         # the starting tree, as the suppressions gate does on `changed`, not on debt it inherited.
         start = None
         if layout == "root" and base:

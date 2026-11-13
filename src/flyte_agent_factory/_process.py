@@ -252,6 +252,8 @@ class ClaudeProcess:
         self.output_count = 0
         #: `time.monotonic()` when a usage-limit notice last appeared, and its reset text.
         self.limit_hit_at: float | None = None
+        #: Wall-clock time of the same refusal: a clock-only reset in `limit_text` is read against it.
+        self.limit_seen_wall: float | None = None
         self.limit_text = ""
         self.last_submission: tuple[str, float, int] | None = None
         self.sent_texts: deque[str] = deque(maxlen=500)
@@ -406,6 +408,7 @@ class ClaudeProcess:
             # session walked into on its own, with no submit in between).
             if self._submitted_since_limit or self.limit_hit_at is None or (text and text != self.limit_text):
                 self.limit_hit_at = time.monotonic()
+                self.limit_seen_wall = time.time()
                 self.limit_text = text
                 self._submitted_since_limit = False
             self._limit_scan, self._limit_raw = "", ""

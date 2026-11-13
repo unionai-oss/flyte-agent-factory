@@ -831,6 +831,8 @@ async def test_a_new_review_clears_the_persisted_pass(rig):
     rig.review_gate = asyncio.Event()
     rig.start()
     await rig.advance(60)
+    # The DONE path hops through worker threads: under the gate's 16 workers it can land after this minute.
+    await settle(rig, lambda: bool((_session_config._load_pass_record() or {}).get("in_review")))
     record = _session_config._load_pass_record()
     assert record and not record["passed"] and record["in_review"]
     assert record["review_round"] == 2
@@ -1155,6 +1157,7 @@ async def test_a_pass_in_a_granted_round_restores_the_grants(rig, passed_in, gra
     await rig.advance(60)
     assert _session_config._granted_rounds == passed_in - _session_config._QA_MAX_ROUNDS
     assert _session_config._max_rounds() == passed_in
+    await settle(rig, lambda: any("review budget" in str(text) for text in rig.proc.submitted[-1:]))
     message = rig.proc.submitted[-1]
     assert "review budget" in message
     if grants_left:

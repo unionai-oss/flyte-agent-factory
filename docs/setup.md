@@ -1,38 +1,52 @@
 # Setup
 
-From nothing to a first project. The current installer requires Union; OSS Flyte needs the adaptations in
+From nothing to a first project. The deploy and the key modes require Union: with `--backend oss` the bootstrap
+runs every step before the deploy, and OSS Flyte needs the adaptations in
 [the compatibility audit](oss-flyte-compat.md). The factory also needs a Claude
 `setup-token` (and optionally a Codex access token), one GitHub repository of your own for the workspace, and a
 deployment profile that names them. How the pieces fit together is in [architecture.md](architecture.md).
-Start with [guided setup](quickstart.md), which checks existing resources and takes you from GitHub access to
-a first launch one step at a time; every secret is in
+Start with [guided setup](quickstart.md): install the skills, run `/agent-factory`, and it checks existing resources
+and takes you from GitHub access to a first launch one step at a time; every secret is in
 [secrets.md](secrets.md). This page is the detail behind them.
 
 ## The short path
 
-1. **Create the workspace repository.** It is the repository projects are pushed to (`[repo] project`). Create it
-   from the template, then create a GitHub repository for it:
+1. **Create the workspace repository.** It is the repository projects are pushed to (`[repo] project`). Create a
+   private GitHub repository for it, then fill a clone of it from the engine's bundled template:
 
    ```bash
-   PYTHONPATH=src uv run python ops/new_workspace.py ../agent-workspace
+   uv run python ops/new_workspace.py ../agent-workspace
    ```
 
-   Copy an example from `profiles/` (`example-*.toml`) to the engine's `profiles/<name>.toml` and fill it in
+   Copy the workspace's `profile.example.toml` to `profile.toml` at its root and fill it in
    ([quickstart.md](quickstart.md), step 3), replace `OWNER` in `.github/CODEOWNERS`, and turn on branch
-   protection ([branch-protection.md](branch-protection.md)). `standards/` and `waivers.toml` are yours; the
-   factory cannot change them. So is `gardening.toml`; without it the engine is the only gardening target
+   protection ([branch-protection.md](branch-protection.md)). `ops/bootstrap.py` does all of this, and more, in
+   one resumable command. `standards/` and `waivers.toml` are yours; the
+   factory cannot change them. So is `gardening.toml`; without it there are no gardening targets
    ([architecture.md](architecture.md#gardening-targets)).
 2. **Store one `claude setup-token`** as a Flyte secret and name it in the profile's `[secrets] claude_token`
    (section 1 below). Every Claude session runs on it.
 3. **Add a deploy key** for the workspace repository, store it as a secret and name it in
-   `[secrets] deploy_key` (section 3). To launch projects into another repository, such as the engine's, give it a
-   deploy key too and list it under `[repo_keys]`.
-4. **Select the profile and deploy** with `AGENT_FACTORY_PROFILE=<name>` (or a path to the file): the first install is
-   `ops/deploy_work.py` and `ops/deploy_factory.py` ("Deploying", below): the only hand step besides creating
-   secrets. After that every merge to the engine repository deploys itself, the personal browser app included
-   when the profile enables it ([personal-browser.md](personal-browser.md)); a merge to the workspace deploys
-   only if the profile has `[direction]` pointing at it (`repo`, and `profile = "profile.toml"`). The engine does not look for a `profile.toml` in the workspace by itself.
-5. **Connect chat** to the factory MCP ([chat-operator.md](chat-operator.md#setup),
+   `[secrets] deploy_key` (section 3). To launch projects into another repository, give it a
+   deploy key too and list it under `[repo_keys]`. The workspace deploy key is the only GitHub credential setup requires; the
+   GitHub App is optional and yours to register ([github-app.md](github-app.md)).
+4. **Select the profile and deploy** with `--profile <workspace clone>/profile.toml` (or `AGENT_FACTORY_PROFILE` set to
+   that path). The first install is `ops/deploy_work.py` and `ops/deploy_factory.py` ("Deploying", below): the only
+   hand step besides creating secrets. After that a merge to the workspace deploys itself when the profile has
+   `[direction]` (below). A merge to the public engine deploys once its CI is green: the App is installed on the
+   workspace only, so the deployer reads the engine anonymously, polls (`[deploy] webhook = false`) and keeps its lock
+   in `[direction] repo`. To deploy sooner, run the
+   bootstrap with `--redeploy` ([quickstart.md](quickstart.md#what-agent-factory-walks-you-through)). The personal browser app
+   follows the same rule ([personal-browser.md](personal-browser.md)); a merge to the workspace deploys
+   only if the profile has `[direction]` pointing at it (`repo`, and `profile = "profile.toml"`), which the workspace's
+   own `profile.toml` carries. The engine does not look for a `profile.toml` in the workspace by itself: the first
+   deploy names it, and moving an existing install onto `[direction]` later needs one run of the bootstrap with
+   `--redeploy` ([quickstart.md](quickstart.md)), which deploys with that `--profile`.
+5. **Link a backlog board.** A GitHub Projects board owned by the same account, linked to the workspace with it as
+   the board's default repository, is the standard backlog: unrelated projects, your own items, and copies of
+   issues pulled from tracked repositories. The bootstrap creates and links it (`gh project create`,
+   `gh project link`; skip with `--no-board`) and prints the clicks GitHub has no command for.
+6. **Connect chat** to the factory MCP ([chat-operator.md](chat-operator.md#setup),
    [factory-mcp-setup.md](factory-mcp-setup.md)) and launch a project
    ([operating.md](operating.md)).
 
@@ -44,11 +58,11 @@ The sections below are the detail behind each step.
 
 Everything specific to your deployment (Flyte project and domain, console host, project
 repo, project slots, secret names, role policy, MCP settings) lives in one TOML
-profile. Copy `profiles/example.toml`, fill it in, and select it for every command
-and ops tool, either with the environment variable or with `--profile <name>` on `ops/*.py`:
+profile: `profile.toml` at the root of your workspace. Fill in the workspace's `profile.example.toml`, and select it
+for every command and ops tool, either with the environment variable or with `--profile <path>` on `ops/*.py`:
 
 ```bash
-export AGENT_FACTORY_PROFILE=<name or path>
+export AGENT_FACTORY_PROFILE=../agent-workspace/profile.toml
 ```
 
 See [profiles/README.md](../profiles/README.md) for the schema. The names below in angle brackets are the profile's.
@@ -82,10 +96,11 @@ Google through a Flyte condition and leaves only a service-account key behind; s
 [docs/gcp-bootstrap.md](gcp-bootstrap.md).
 
 Then deploy with the profile-selected credential mounted. The slots, `factory`, `factory-mcp`,
-`factory-deployer` and, with `[browser] personal`, the personal browser app are deployed by the factory itself: with `[deploy] auto = true` every merge
-to the factory repo's default branch ships on the next deployer tick, and `ops/deploy_work.py`
-and `ops/deploy_factory.py` cover the first install. Self-improve is an ordinary project
-launched on a slot with the factory repo; nothing is deployed by hand. The voice app is
+`factory-deployer` and, with `[browser] personal`, the personal browser app are deployed by the factory itself: with `[deploy] auto = true` a merge to the default branch of the repository
+named by `[deploy] repo` (default `[repo] factory`) ships on the next deployer tick once its head's CI passed;
+`ops/deploy_work.py` and `ops/deploy_factory.py` cover the first install. Engine improvement is a workspace project,
+imported and promoted like any other ([architecture-repos.md](architecture-repos.md#promotion)); nothing is
+deployed by hand. The voice app is
 deployed directly:
 
 ```bash
@@ -180,7 +195,11 @@ PYTHONPATH=src uv run flyte --config "$FLYTE_CONFIG" run --root-dir src -p "$FLY
 ```
 
 Merged changes deploy themselves: with `[deploy] auto = true` in the profile, the `factory-deployer` task polls the
-factory repo's default branch every 5 minutes, so a merge ships on the next tick plus build time. With
+default branch of `[deploy] repo` (default `[repo] factory`) every 5 minutes and ships a head whose CI passed, so a
+merge ships on the next tick plus build time. For a user on the public `unionai-oss/flyte-agent-factory`, where the
+App is not installed, the deployer reads that repository anonymously and keeps its deploy lock in `[direction] repo`;
+to deploy the engine's `main` at once, run the bootstrap with `--redeploy`
+([quickstart.md](quickstart.md#what-agent-factory-walks-you-through)). With
 `[github] webhook_secret`, a signed push starts it instead and the schedule is an hourly reconcile
 ([webhook setup](deploy-webhook.md)). It deploys the
 slots, factory, factory-mcp, itself and the personal browser (when the profile enables it, replaced
@@ -188,7 +207,7 @@ stop-then-start), and skips a commit while its CI is failing or still pending. T
 standards it deploys with are the merged tree's `profiles/<name>.toml` when that exists (else the profile the
 deployer pod started with), so a merged change to either ships too. With `auto = false` the trigger still ticks,
 and does nothing. If a Flyte secret that a planned environment mounts does not exist, it deploys nothing and
-its run report and tick message name the secret; create it and the next tick deploys. The `ops/deploy_*.py`
+its run report and tick message name the secret; create it and the next tick deploys (where the deployer works at all; see above). The `ops/deploy_*.py`
 scripts above remain for the first install and for emergencies; the personal browser has no `ops/` path and
 is deployed only by the deployer.
 

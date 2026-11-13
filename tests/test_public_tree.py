@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import subprocess
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -167,74 +165,6 @@ def test_the_public_tree_of_head_is_clean_right_after_building(public_head):
     assert _git("status", "--porcelain", "--ignored", "--untracked-files=all", cwd=public_head) == ""
 
 
-def test_the_dry_run_scans_then_runs_each_lane_after_the_other(tmp_path, monkeypatch):
-    # One lane at a time: two xdist pools at once on a 4-CPU pod push the benchmark's inner pytest past its
-    # exit limit (tests/test_bench_flow.py), which the same tests pass alone.
-    calls: list[tuple[list[str], dict[str, str]]] = []
-
-    def run(cmd, cwd, env):
-        calls.append((cmd, env))
-        return subprocess.CompletedProcess(cmd, 3 if "-m" in cmd and "slow" in cmd else 0)
-
-    monkeypatch.setattr(public_tree, "build", lambda dest: "f" * 40)
-    monkeypatch.setattr(public_tree, "_git", lambda *a, **k: "a\nb")
-    monkeypatch.setattr(subprocess, "run", run)
-    assert public_tree.dry_run(tmp_path) == 1  # the slow lane failed
-    scan, fast, slow = (cmd for cmd, _ in calls)
-    assert scan[-2:] == ["ops/scan_public.py", str(tmp_path)]
-    assert fast == ["bash", "factory-improvement/checks.sh"]
-    assert "AGENT_FACTORY_RUN_SLOW" not in calls[1][1]
-    assert slow[-5:] == ["pytest", "tests", "-q", "-m", "slow"]
-    assert calls[2][1]["PYTHONPATH"] == "src"
-
-
-@pytest.mark.parametrize("lane_code", [0, 3])
-def test_the_dry_run_with_child_lanes_leaves_both_lanes_to_checks_sh(tmp_path, monkeypatch, lane_code):
-    # checks.sh sends both lanes to child containers under AGENT_FACTORY_SLOW_LANE=child, so they overlap
-    # without contending for this pod's CPUs; a second, sequential slow run would only repeat the work.
-    calls: list[tuple[list[str], dict[str, str]]] = []
-
-    def run(cmd, cwd, env):
-        calls.append((cmd, env))
-        return subprocess.CompletedProcess(cmd, lane_code if cmd[0] == "bash" else 0)
-
-    monkeypatch.setenv("AGENT_FACTORY_SLOW_LANE", "child")
-    monkeypatch.setenv("AGENT_FACTORY_PYTEST_JUNIT_DIR", "/somewhere")
-    monkeypatch.setattr(public_tree, "build", lambda dest: "f" * 40)
-    monkeypatch.setattr(public_tree, "_git", lambda *a, **k: "" if a[0] == "status" else "a\nb")
-    monkeypatch.setattr(subprocess, "run", run)
-    assert public_tree.dry_run(tmp_path) == (0 if lane_code == 0 else 1)
-    scan, checks = (cmd for cmd, _ in calls)
-    assert scan[-2:] == ["ops/scan_public.py", str(tmp_path)]
-    assert checks == ["bash", "factory-improvement/checks.sh"]
-    assert calls[1][1]["AGENT_FACTORY_SLOW_LANE"] == "child"
-    assert "AGENT_FACTORY_PYTEST_JUNIT_DIR" not in calls[1][1]
-
-
-def test_the_dry_run_scan_reads_only_the_tree_and_leaves_nothing_in_it(tmp_path, monkeypatch):
-    # The scanner's import of ops/personal_literals.py must not write a .pyc into the tree it scans, or the
-    # scan counts (and the tree holds) a file the build never put in it.
-    tree = tmp_path / "tree"
-    (tree / "ops").mkdir(parents=True)
-    for name in ("scan_public.py", "personal_literals.py", "gitleaks.toml"):
-        (tree / "ops" / name).write_bytes((public_tree.ROOT / "ops" / name).read_bytes())
-    _git("init", "-q", cwd=tree)
-    _git("add", "-A", cwd=tree)
-    _git("-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-qm", "tree", cwd=tree)
-    before = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if ".git" not in p.parts)
-    real_run = subprocess.run
-
-    def run(cmd, **kwargs):
-        if cmd[0] == "git" or "ops/scan_public.py" in cmd:
-            return real_run(cmd, **{"capture_output": True, **kwargs})
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(public_tree, "build", lambda dest: "f" * 40)
-    monkeypatch.setattr(subprocess, "run", run)
-    public_tree.dry_run(tree)
-    assert sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if ".git" not in p.parts) == before
-
-
 def test_the_scan_says_how_many_owner_literals_it_loaded_and_files_it_read(tmp_path, monkeypatch, capsys):
     # CI's log is the evidence that the guard ran with the owner's list over the whole tree, so it says both.
     tree = tmp_path / "tree"
@@ -299,62 +229,6 @@ def test_the_scan_fails_a_non_empty_tree_it_read_no_file_of(tmp_path, monkeypatc
     assert "clean" not in out.out
 
 
-def test_the_dry_run_resolves_a_relative_destination_before_any_subprocess(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    built: list[Path] = []
-    calls: list[tuple[list[str], str]] = []
-
-    def run(cmd, cwd, env):
-        calls.append((cmd, str(cwd)))
-        return subprocess.CompletedProcess(cmd, 0)
-
-    def build(dest: Path) -> str:
-        built.append(dest)
-        return "f" * 40
-
-    monkeypatch.setattr(public_tree, "build", build)
-    monkeypatch.setattr(public_tree, "_git", lambda *a, **k: "a")
-    monkeypatch.setattr(subprocess, "run", run)
-    public_tree.dry_run(Path("relative-public"))
-
-    expected = tmp_path / "relative-public"
-    assert built == [expected]
-    scan, *_ = calls
-    assert scan[0][-1] == str(expected)
-    assert all(Path(cwd).is_absolute() for _, cwd in calls)
-
-
-def test_a_dry_run_of_a_relative_destination_scans_every_file(tmp_path, monkeypatch):
-    # End to end: the real build and the real scan, from a relative destination, read the whole tree. gitleaks
-    # is a stub here: what is under test is which files the literal scan reads.
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "gitleaks").write_text("#!/bin/sh\nexit 0\n")
-    (bin_dir / "gitleaks").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
-    monkeypatch.delenv("FACTORY_OWNER_LITERALS", raising=False)
-    work = tmp_path / "work"
-    work.mkdir()
-    monkeypatch.chdir(work)
-    real_run = subprocess.run
-    scans: list[subprocess.CompletedProcess[str]] = []
-
-    def run(cmd, **kwargs):
-        if "factory-improvement/checks.sh" in cmd or cmd[-2:] == ["-m", "slow"]:
-            return subprocess.CompletedProcess(cmd, 0)  # the checks and the slow lane are not under test
-        if "ops/scan_public.py" not in cmd:
-            return real_run(cmd, **kwargs)  # the build's own git
-        scans.append(real_run(cmd, **kwargs, capture_output=True, text=True))
-        return scans[-1]
-
-    monkeypatch.setattr(subprocess, "run", run)
-    assert public_tree.dry_run(Path("relative-public")) == 0
-    dest = work / "relative-public"
-    files = len(_git("ls-files", cwd=dest).splitlines())
-    assert files > 100
-    assert f"scanned {files} files under {dest} (0 binary, skipped)" in scans[0].stderr, scans[0].stderr
-
-
 def test_the_scan_fails_a_tree_of_binary_files_only(tmp_path, monkeypatch, capsys):
     # Binary files are skipped, so a tree of nothing else had no line checked.
     root = tmp_path / "public-tree"
@@ -367,56 +241,8 @@ def test_the_scan_fails_a_tree_of_binary_files_only(tmp_path, monkeypatch, capsy
     assert "read no file" in capsys.readouterr().err
 
 
-# The built tree is what the owner pushes: the dry run's checks leave it exactly as built (round-1 review).
-
-
-def _dry_run_with_fake_steps(
-    source: Path, dest: Path, monkeypatch: pytest.MonkeyPatch, step: Any
-) -> tuple[int, list[tuple[list[str], Path]]]:
-    """Run `dry_run` on a tree built from `source`, with `step(cmd, cwd)` standing in for each check."""
-    real_build = public_tree.build
-    calls: list[tuple[list[str], Path]] = []
-    real_run = subprocess.run
-
-    def run(cmd, **kwargs):
-        if cmd[0] == "git":
-            return real_run(cmd, **kwargs)
-        calls.append((cmd, Path(kwargs["cwd"])))
-        step(cmd, Path(kwargs["cwd"]))
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(public_tree, "build", lambda d: real_build(d, source))
-    monkeypatch.setattr(subprocess, "run", run)
-    return public_tree.dry_run(dest), calls
-
-
-def test_the_checks_run_in_a_clone_and_leave_the_built_tree_as_built(source, tmp_path, monkeypatch):
-    def step(cmd: list[str], cwd: Path) -> None:
-        # What checks.sh and pytest leave behind in the tree they run in.
-        (cwd / ".venv").mkdir(exist_ok=True)
-        (cwd / ".pytest_cache").mkdir(exist_ok=True)
-        (cwd / "src" / "__pycache__").mkdir(exist_ok=True)
-        (cwd / "ops.watch.lock").write_text("")
-
-    dest = tmp_path / "public"
-    code, calls = _dry_run_with_fake_steps(source, dest, monkeypatch, step)
-
-    assert code == 0
-    assert [cmd[-1] for cmd, _ in calls][0] == str(dest)  # the scan reads the built tree
-    assert all(cwd != dest and dest not in cwd.parents for _, cwd in calls)
-    assert _git("status", "--porcelain", "--ignored", "--untracked-files=all", cwd=dest) == ""
-    assert sorted(_git("ls-files", cwd=dest).splitlines()) == ["README.md", "src/app.py"]
-
-
-def test_a_dry_run_that_leaves_anything_in_the_built_tree_fails(source, tmp_path, monkeypatch, capsys):
-    dest = tmp_path / "public"
-
-    def step(cmd: list[str], cwd: Path) -> None:
-        (dest / "stray.txt").write_text("a check wrote into the published tree\n")
-
-    code, _ = _dry_run_with_fake_steps(source, dest, monkeypatch, step)
-
-    assert code == 1
-    out = capsys.readouterr().out
-    assert "stray.txt" in out
-    assert "dry run FAILED" in out
+def test_there_is_no_dry_run_subcommand(tmp_path):
+    # Checking a tree against a target's CI is `ops/promote.py deliver --dry-run`, for any target.
+    with pytest.raises(SystemExit) as raised:
+        public_tree.main(["dry-run", str(tmp_path / "public")])
+    assert raised.value.code == 2

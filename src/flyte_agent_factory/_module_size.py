@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from . import _target_run
+from . import _gate_base, _vendored
+
+if TYPE_CHECKING:
+    from . import _gate_tests
 
 #: The most lines a source module may have; one already over it may not grow.
 MODULE_LINE_LIMIT = 1500
@@ -18,37 +22,30 @@ _SKIP_DIRS = {".git", ".claude-flyte", "node_modules", ".venv", "migrations"}
 
 
 def _sizes(
-    root: Path, is_test: Callable[[str], bool], nested: list[_target_run.Nested] | None = None
+    root: Path,
+    is_test: Callable[[str], bool],
+    upstreams: _vendored.Upstreams | None = None,
+    started: Container[str] = (),
 ) -> dict[str, int]:
     """Physical line counts of the Python source modules under `root`, without tests and vendored trees.
 
-    A module in a `nested` checkout counts only if the project changed it: upstream's own files are not
-    the project's to shrink.
+    A module that is identical to its upstream's (a vendored copy or a nested checkout) is skipped: upstream's
+    own files are not the project's to shrink. One in `started` (the start tree's modules) is not: the project
+    had it, so it is judged against what it had, whatever upstream commit it matches.
     """
     sizes: dict[str, int] = {}
     for directory, children, names in os.walk(root):
         children[:] = [n for n in children if n not in _SKIP_DIRS]
         for name in names:
             relative = str((Path(directory) / name).relative_to(root))
-            if name.endswith(".py") and not is_test(relative) and not _untouched(root, relative, nested):
+            if (
+                name.endswith(".py")
+                and not is_test(relative)
+                and not (upstreams and relative not in started and upstreams.unchanged(relative))
+            ):
                 with (root / relative).open("rb") as handle:
                     sizes[relative] = sum(1 for _ in handle)
     return sizes
-
-
-def _in_nested(
-    root: Path, relative: str, nested: list[_target_run.Nested] | None
-) -> tuple[_target_run.Nested, str] | None:
-    """Return the nested checkout holding `relative` (a path under `root`) and the file's path inside it."""
-    for checkout in nested or []:
-        if (root / relative).is_relative_to(checkout.root):
-            return checkout, str((root / relative).relative_to(checkout.root))
-    return None
-
-
-def _untouched(root: Path, relative: str, nested: list[_target_run.Nested] | None) -> bool:
-    found = _in_nested(root, relative, nested)
-    return found is not None and found[0].untouched(found[1])
 
 
 def _moved_from(relative: str, before: dict[str, int]) -> str | None:
@@ -68,24 +65,30 @@ def _moved_from(relative: str, before: dict[str, int]) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def check(project: Path, start: Path | None, is_test: Callable[[str], bool]) -> tuple[int, str]:
+def check(
+    project: Path,
+    start: Path | None,
+    is_test: Callable[[str], bool],
+    work: _gate_tests.GateWork | None = None,
+) -> tuple[int, str]:
     """Return an exit code and report: fail a module over the limit that is new or longer than at `start`.
 
     `start` is the project's starting tree. A module over the limit with no more lines than it had there
     passes, listed so the debt stays visible. Without a start tree every module over the limit fails.
+    `work` is the gate run's shared state; its `trusted_base` is where `_vendored.load` reads upstream from.
     """
     before = _sizes(start, is_test) if start is not None else {}
-    nested = _target_run.nested_checkouts(project, _SKIP_DIRS)
+    upstreams = _vendored.load(project, _gate_base._SKIP_DIRS, trusted_base=work.trusted_base if work else "")
     problems: list[str] = []
     debt: list[str] = []
-    for relative, lines in sorted(_sizes(project, is_test, nested).items()):
+    for relative, lines in sorted(_sizes(project, is_test, upstreams, before).items()):
         if lines <= MODULE_LINE_LIMIT:
             continue
         was = before.get(relative)
-        if was is None and (found := _in_nested(project, relative, nested)):
-            # The start tree has no nested checkout (it is the target's, not the project's): a file the
-            # project changed there is judged against upstream's version of it.
-            was = found[0].lines_at_base(found[1])
+        if was is None:
+            # The start tree has no copy of an upstream tree (a nested checkout is the target's, a vendored
+            # copy is another repository's): a file the project changed there is judged against upstream's.
+            was = upstreams.count_upstream_lines(relative)
         if was is None:
             moved = _moved_from(relative, before)
             was = before[moved] if moved is not None else None
@@ -94,4 +97,5 @@ def check(project: Path, start: Path | None, is_test: Callable[[str], bool]) -> 
             problems.append(f"{relative}: {lines} lines{since}; keep it under {MODULE_LINE_LIMIT}")
         else:
             debt.append(f"over the limit but not grown: {relative} ({lines} lines, was {was})")
-    return (1, "\n".join(problems)) if problems else (0, "\n".join(debt) or "no module over the size limit")
+    report = "\n".join(problems) if problems else "\n".join(debt) or "no module over the size limit"
+    return (1 if problems else 0), "\n".join(filter(None, [report, upstreams.describe()]))

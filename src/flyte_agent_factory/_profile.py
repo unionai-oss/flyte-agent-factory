@@ -154,6 +154,10 @@ class Gcp:
 @dataclass(frozen=True)
 class Deploy:
     auto: bool = False  # merged factory changes deploy themselves (the `factory-deployer` task)
+    repo: str = ""  # the repository the deployer deploys from; parse() defaults it to `[repo] factory`
+    #: Pushes to `repo` reach the factory webhook (the App is installed there), so the reconcile is only a
+    #: backstop. A repository without the App never delivers, and the deployer must poll.
+    webhook: bool = False
 
 
 @dataclass(frozen=True)
@@ -270,6 +274,8 @@ class Bench:
 class Loop:
     enabled: bool = False
     repo: str = ""
+    # The subtree of `repo` holding the engine's `src/`, normalised and relative; empty is the repo root.
+    path: str = ""
     merge: str = "dry-run"
     daily_usd: float = 0
     weekly_usd: float = 0
@@ -323,8 +329,6 @@ class Profile:
     judgement: JudgementPolicy = JudgementPolicy()
     # [repo] key -> its earlier URLs (a GitHub rename): requests and projects from before still name them.
     repo_aliases: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: MappingProxyType({}))
-    # How many projects on `[repo] factory` may run at once.
-    factory_projects: int = 1
     standards: _standards.Standards = field(default_factory=_standards.Standards)
     standards_payload: str = field(default="", compare=False)
     source_dir: Path = field(default=Path("."), compare=False)
@@ -488,6 +492,8 @@ def _policy(table: Mapping[str, Any], section: str, where: str) -> Mapping[str, 
             raise ProfileError(f"{where}: [{section}] {key} must be a string")
         if key in _ENGINE_KEYS and value and normalize_engine(value) not in ENGINES:
             raise ProfileError(f"{where}: [{section}] {key} = {value!r} must be one of {ENGINES}")
+        if key == "ENGINE_FALLBACK" and value.strip().lower() not in ("", "allow", "wait"):
+            raise ProfileError(f'{where}: [{section}] {key} = {value!r} must be "allow" or "wait"')
         if key in _NUMERIC_POLICY:
             kind, minimum, wanted = _NUMERIC_POLICY[key]
             try:
@@ -811,13 +817,14 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         raise ProfileError(f"{where}: [backend] kind must be one of {BACKENDS}, not {backend['kind']!r}")
 
     repo_table = dict(_table(data, "repo", where))
-    # The one integer in [repo], whose other keys are all URLs: take it out before they are read as such.
-    factory_projects = repo_table.pop("factory_projects", 1)
+    # Retired: its value is not an URL, so it goes before `_fields` reads the rest. The live profile and
+    # pods deployed before the retirement still carry it; ignore it, loudly, as `[self_agent]` is.
+    if repo_table.pop("factory_projects", None) is not None:
+        _warn_once(
+            f"{where}: [repo] factory_projects was retired and is ignored: projects on any repository "
+            "share the slots, and overlapping files wait (file_conflict)"
+        )
     repo = _fields(repo_table, "repo", where, ("project",), ("factory",))
-    if isinstance(factory_projects, bool) or not isinstance(factory_projects, int) or factory_projects < 1:
-        raise ProfileError(f"{where}: [repo] factory_projects must be an integer of at least 1")
-    if "factory_projects" in data["repo"] and not repo.get("factory"):
-        raise ProfileError(f"{where}: [repo] factory_projects requires [repo] factory")
 
     secrets_table = dict(_table(data, "secrets", where))
     for key in ("claude_login", "codex_login"):
@@ -927,6 +934,17 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
     auto = deploy_table.pop("auto", False)
     if not isinstance(auto, bool):
         raise ProfileError(f"{where}: [deploy] auto must be true or false")
+    # Only an absent `[deploy] repo` falls back to `[repo] factory`: an empty or mistyped one is a mistake to
+    # name, not a silent deploy from somewhere else.
+    explicit_repo = deploy_table.pop("repo", None)
+    if explicit_repo is not None and not isinstance(explicit_repo, str):
+        raise ProfileError(f"{where}: [deploy] repo must be a string")
+    if explicit_repo is not None and not explicit_repo.strip():
+        raise ProfileError(f"{where}: [deploy] repo, when given, must name a repository")
+    deploy_repo = explicit_repo if explicit_repo is not None else repo.get("factory", "")
+    webhook = deploy_table.pop("webhook", False)
+    if not isinstance(webhook, bool):
+        raise ProfileError(f"{where}: [deploy] webhook must be true or false")
     if deploy_table:
         raise ProfileError(f"{where}: unknown key(s) in [deploy]: {', '.join(sorted(deploy_table))}")
     state = State(**_fields(_table(data, "state", where, required=False), "state", where, (), ("uri",)))
@@ -983,13 +1001,12 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         ):
             if not value:
                 raise ProfileError(f"{where}: [deploy] auto = true requires [{section}] {key}")
-        factory = repo.get("factory")
-        if not factory:
-            raise ProfileError(f"{where}: [deploy] auto = true requires [repo] factory")
-        try:
-            _github.parse_repo(factory)
-        except _github.GithubError as exc:
-            raise ProfileError(f"{where}: [repo] factory must be a github.com repository: {exc}") from exc
+        if not deploy_repo:
+            raise ProfileError(f"{where}: [deploy] auto = true requires [deploy] repo or [repo] factory")
+        _check_deploy_repo(deploy_repo, "[deploy] repo" if explicit_repo else "[repo] factory", where)
+    elif explicit_repo:
+        # Bench and the deployer read it even with auto off: a malformed one is refused here, not at use.
+        _check_deploy_repo(explicit_repo, "[deploy] repo", where)
 
     board = None
     if "board" in data:
@@ -1056,20 +1073,43 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
                     + (" at most 100" if key == "owner_floor_pct" else "")
                 )
             limits[key] = value
+        loop_path = table.pop("path", "")
+        if not isinstance(loop_path, str):
+            raise ProfileError(f"{where}: [loop] path must be a string")
         fields = _fields(table, "loop", where, ("repo",), ("merge",))
         loop_repo = fields["repo"]
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", loop_repo):
             raise ProfileError(f"{where}: [loop] repo must be owner/repo")
+        # The rule `_bench.Source` applies to this path: relative and inside the checkout.
+        raw_path = PurePosixPath(loop_path)
+        if raw_path.is_absolute() or ".." in raw_path.parts:
+            raise ProfileError(f"{where}: [loop] path must be relative and stay inside the repository")
+        loop_path = "/".join(raw_path.parts)
         mode = fields.get("merge", "dry-run")
         if mode not in ("dry-run", "on"):
             raise ProfileError(f"{where}: [loop] merge must be dry-run or on")
         if enabled and not github.configured:
             raise ProfileError(f"{where}: [loop] requires [github] app_id and private_key_secret")
-        if enabled and (not repo.get("factory") or _github.parse_repo(repo["factory"]) != loop_repo):
-            raise ProfileError(f"{where}: [loop] repo must be [repo] factory")
+        # The repositories `_bench_flow.candidate_source` accepts; the engine is `path`'s `src/` in one.
+        engine_repos = {
+            _github.parse_repo(url).lower()
+            for url in (repo.get("factory", ""), deploy_repo, direction.repo if direction else "")
+            if url
+        }
+        if enabled and loop_repo.lower() not in engine_repos:
+            raise ProfileError(
+                f"{where}: [loop] repo must be one of the profile's repositories: "
+                "[repo] factory, [deploy] repo or [direction] repo"
+            )
         if enabled and bench is None:
             raise ProfileError(f"{where}: [loop] requires [bench]")
-        loop = Loop(enabled=enabled, repo=loop_repo, merge=mode, **limits)
+        loop = Loop(enabled=enabled, repo=loop_repo, path=loop_path, merge=mode, **limits)
+
+    # A bench with no source means the engine at `[repo] factory`, or where the loop says the engine is.
+    if bench is not None and not repo.get("factory") and not loop.repo:
+        raise ProfileError(
+            f"{where}: [bench] requires [repo] factory (or a [loop] repo), the engine it deploys at a SHA"
+        )
 
     gardening = _gardening_table(_table(data, "gardening", where, required=False), where)
     judgement = _judgement_table(_table(data, "judgement", where, required=False), where)
@@ -1092,7 +1132,6 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         repo=repo["project"],
         repos=repo,
         repo_keys=repo_keys,
-        factory_projects=factory_projects,
         slots=slots,
         cap=cap,
         secrets=secrets,
@@ -1101,7 +1140,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         mcp=mcp,
         gcp=gcp,
         browser=browser,
-        deploy=Deploy(auto=auto),
+        deploy=Deploy(auto=auto, repo=deploy_repo, webhook=webhook),
         planner=Planner(admission=admission),
         state=state,
         github=github,
@@ -1205,9 +1244,18 @@ def _bench(
     # The engine is fetched at a SHA, and each case's branch read back, through the App.
     if not github.configured:
         raise ProfileError(f"{where}: [bench] requires [github] app_id and private_key_secret")
-    if not repo.get("factory"):
-        raise ProfileError(f"{where}: [bench] requires [repo] factory, the engine it deploys at a SHA")
     return bench
+
+
+def _check_deploy_repo(url: str, setting: str, where: str) -> None:
+    """Refuse `url` unless it is a github.com URL of exactly one `owner/repo`."""
+    try:
+        parsed = _github.parse_repo(url)
+    except _github.GithubError as exc:
+        raise ProfileError(f"{where}: {setting} must be a github.com repository: {exc}") from exc
+    # The URL pattern lets a path or spaces through (`.../org/engine/tree/main`): only `owner/repo` reads.
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", parsed):
+        raise ProfileError(f"{where}: {setting} must be a github.com repository: not one owner/repo: {url!r}")
 
 
 def load(spec: str, *, tolerate_unknown: bool = False) -> Profile:

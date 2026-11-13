@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -40,33 +41,67 @@ def _start_tree(workspace: Path, base: str, commits: list[str] | None) -> Iterat
     The project is judged by its net change. Judging each commit against its parent blocked forever
     on a skip that was added and later removed, and pushed history cannot be rewritten. Without
     `commits` (no attribution available) the start is simply `base`.
+
+    A merge from main whose resolution joined upstream lines to a project hunk can leave a project
+    commit that no longer reverses. The start is then the upstream side of the newest merge on the
+    branch: all of upstream that HEAD holds, and none of the project's work.
     """
-    archive = _git_bytes(["archive", "HEAD" if commits is not None else base], workspace)
     with tempfile.TemporaryDirectory(prefix="factory-start-") as directory:
         checkout = Path(directory)
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            tar.extractall(checkout, filter="data")
-        # Newest first, so each patch meets the lines it produced. Upstream code stays identical
-        # on both sides, even after the mandated rebase and push.
-        for commit in commits or []:
-            patch = _git_bytes(
-                ["show", *_secret_env.GIT_NO_DRIVERS, "--format=", "--binary", "--no-renames", commit],
-                workspace,
-            )
-            if not patch:
-                continue
-            applied = subprocess.run(
-                _secret_env.git_argv("apply", "--reverse", "--binary"),
-                cwd=checkout,
-                env=_secret_env.child_env(),
-                input=patch,
-                capture_output=True,
-                timeout=60,
-                check=False,
-            )
-            if applied.returncode:
-                raise _GateError("cannot reverse project changes: " + applied.stderr.decode(errors="replace"))
+        _extract(workspace, "HEAD" if commits is not None else base, checkout)
+        try:
+            _reverse(workspace, checkout, commits or [])
+        except _GateError:
+            if not (upstream := _merged_upstream(workspace, base)):
+                raise
+            shutil.rmtree(checkout)
+            checkout.mkdir()
+            _extract(workspace, upstream, checkout)
         yield checkout
+
+
+def _extract(workspace: Path, ref: str, checkout: Path) -> None:
+    archive = _git_bytes(["archive", ref], workspace)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        tar.extractall(checkout, filter="data")
+
+
+def _reverse(workspace: Path, checkout: Path, commits: list[str]) -> None:
+    # Newest first, so each patch meets the lines it produced. Upstream code stays identical
+    # on both sides, even after the mandated rebase and push.
+    for commit in commits:
+        patch = _git_bytes(
+            ["show", *_secret_env.GIT_NO_DRIVERS, "--format=", "--binary", "--no-renames", commit],
+            workspace,
+        )
+        if not patch:
+            continue
+        # A merge that kept upstream lines after a hunk with no trailing context breaks git's anchoring
+        # of that hunk to the end of the file; without it (`--unidiff-zero`) the hunk's own lines and
+        # leading context still place it.
+        applied = _apply_reverse(checkout, patch)
+        if applied.returncode and _apply_reverse(checkout, patch, "--unidiff-zero").returncode:
+            raise _GateError("cannot reverse project changes: " + applied.stderr.decode(errors="replace"))
+
+
+def _apply_reverse(checkout: Path, patch: bytes, *options: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        _secret_env.git_argv("apply", "--reverse", "--binary", *options),
+        cwd=checkout,
+        env=_secret_env.child_env(),
+        input=patch,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _merged_upstream(workspace: Path, base: str) -> str | None:
+    """Return the second parent of the newest merge on HEAD's first-parent line since `base`, or None."""
+    merge = _git_bytes(
+        ["rev-list", "--first-parent", "--merges", "--max-count=1", f"{base}..HEAD"], workspace
+    )
+    return f"{merge.decode().strip()}^2" if merge.strip() else None
 
 
 #: ruff's concise format: `path:line:col: CODE message`.

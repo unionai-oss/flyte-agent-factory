@@ -65,7 +65,7 @@ def test_template_config_files_parse_and_only_the_engine_is_gardened(tmp_path):
             capture_output=True,
         )
     assert tomllib.loads((TEMPLATE / "profile.example.toml").read_text())["repo"]["project"]
-    assert [t.repo for t in _gardening.load(TEMPLATE, {})] == ["factory"]  # the engine is the default target
+    assert _gardening.load(TEMPLATE, {}) == []  # gardening is opt-in: the template lists no target
     assert _waivers.load(committed_copy, "HEAD") == []
 
 
@@ -82,32 +82,110 @@ def test_template_standards_equal_the_engine_standards():
     assert all(len(re.findall(r"^Enforced:", r.body, re.MULTILINE)) == 1 for r in rules)
 
 
-def test_new_workspace_creates_a_repository_with_one_commit(tmp_path):
+@pytest.fixture
+def person(monkeypatch):
+    """A git identity that is not the placeholder, as a person's configuration would give."""
+    for who in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{who}_NAME", "Pat Example")
+        monkeypatch.setenv(f"GIT_{who}_EMAIL", "pat@example.com")
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout
+
+
+def test_new_workspace_creates_a_repository_with_one_commit(tmp_path, person):
+    # Still one commit of the whole template; it is now the person's, never an "agent-workspace" placeholder.
     dest = tmp_path / "ws"
     assert _ops("new_workspace").main([str(dest)]) == 0
     # One listing: git may write .git/ files (maintenance.lock) between two.
     assert {p for p in _tree(dest) if not p.startswith(".git/")} == _tree(TEMPLATE)
-    log = subprocess.run(["git", "log", "--oneline"], cwd=dest, capture_output=True, text=True, check=True)
-    assert len(log.stdout.splitlines()) == 1
+    assert len(_git(dest, "log", "--oneline").splitlines()) == 1
+    assert _git(dest, "log", "-1", "--format=%an <%ae>").strip() == "Pat Example <pat@example.com>"
 
 
-def test_new_workspace_points_at_the_engines_profiles_folder(tmp_path, capsys):
+def test_new_workspace_without_a_git_identity_fails_clearly_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    for var in ("AUTHOR_NAME", "AUTHOR_EMAIL", "COMMITTER_NAME", "COMMITTER_EMAIL"):
+        monkeypatch.delenv(f"GIT_{var}", raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-such-config"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "no-such-config"))
+    assert _ops("new_workspace").main([str(tmp_path / "ws")]) == 1
+    assert "no commit identity" in capsys.readouterr().err
+    assert not (tmp_path / "ws").exists()
+
+
+@pytest.fixture
+def clone(tmp_path, person):
+    """A clone of a bare repository holding GitHub's auto-created files, like `gh repo create
+    --add-readme`."""
+    bare, seed = tmp_path / "origin.git", tmp_path / "seed"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    seed.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=seed, check=True)
+    (seed / "README.md").write_text("# auto\n")
+    (seed / "LICENSE").write_text("MIT, mine\n")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-qm", "Initial commit")
+    _git(seed, "push", "-q", str(bare), "main")
+    subprocess.run(["git", "clone", "-q", str(bare), str(tmp_path / "ws")], check=True)
+    return tmp_path / "ws"
+
+
+def test_new_workspace_populates_a_clone_and_keeps_its_remote_and_license(clone):
+    remote = _git(clone, "remote", "get-url", "origin")
+    assert _ops("new_workspace").main([str(clone)]) == 0
+    assert _git(clone, "remote", "get-url", "origin") == remote
+    assert (clone / "LICENSE").read_text() == "MIT, mine\n"
+    assert (clone / "README.md").read_text() == (TEMPLATE / "README.md").read_text()
+    assert (clone / "profile.example.toml").is_file()
+    assert len(_git(clone, "log", "--oneline").splitlines()) == 1  # nothing committed without --commit
+
+
+def test_new_workspace_commits_in_a_clone_as_the_person_when_asked(clone):
+    assert _ops("new_workspace").main([str(clone), "--commit"]) == 0
+    authors = set(_git(clone, "log", "--format=%an <%ae>").splitlines())
+    assert authors == {"Pat Example <pat@example.com>"}
+    assert "agent-workspace" not in _git(clone, "log", "--format=%an %ae %cn %ce")
+    assert _git(clone, "status", "--porcelain") == ""
+
+
+def test_new_workspace_points_at_the_engines_profiles_folder(tmp_path, capsys, person):
+    """Kept name: the message still says where the profile goes, repointed by the brief.
+
+    The brief's "`ops/new_workspace.py` tells the user to write `profiles/<name>.toml`, while the template
+    README and architecture-repos.md say `profile.toml`. Pick one." is settled as one name, profile.toml at
+    the workspace root, everywhere; the engine's profiles folder is no longer where a person writes it.
+    """
     assert _ops("new_workspace").main([str(tmp_path / "ws")]) == 0
     printed = capsys.readouterr().out
-    # The engine reads profiles/<name>.toml from its own checkout, never the workspace's profile.toml.
-    assert "profiles/<name>.toml" in printed and "profile.example.toml" not in printed
+    assert "profile.example.toml to profile.toml" in printed and "profiles/<name>.toml" not in printed
 
 
-def test_new_workspace_accepts_an_existing_empty_directory(tmp_path):
+def test_new_workspace_accepts_an_existing_empty_directory(tmp_path, person):
     (tmp_path / "ws").mkdir()
     assert _ops("new_workspace").main([str(tmp_path / "ws")]) == 0
 
 
-def test_new_workspace_refuses_a_non_empty_directory(tmp_path, capsys):
+def test_new_workspace_refuses_a_non_empty_directory(tmp_path, capsys, person):
     (tmp_path / "keep.txt").write_text("mine\n")
     assert _ops("new_workspace").main([str(tmp_path)]) == 1
     assert "refusing" in capsys.readouterr().err
     assert _tree(tmp_path) == {"keep.txt"}
+
+
+def test_new_workspace_refuses_a_clone_with_other_files_untouched(clone, capsys):
+    (clone / "mine.py").write_text("print(1)\n")
+    before = _tree(clone)
+    assert _ops("new_workspace").main([str(clone), "--commit"]) == 1
+    assert "refusing" in capsys.readouterr().err
+    assert _tree(clone) == before
+    assert (clone / "README.md").read_text() == "# auto\n"
+
+
+def test_new_workspace_refuses_a_readme_without_a_git_directory(tmp_path, capsys, person):
+    (tmp_path / "README.md").write_text("mine\n")
+    assert _ops("new_workspace").main([str(tmp_path)]) == 1
+    assert (tmp_path / "README.md").read_text() == "mine\n"
 
 
 # --- the public scan ---------------------------------------------------------------------------

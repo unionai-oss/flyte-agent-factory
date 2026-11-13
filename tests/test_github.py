@@ -183,7 +183,50 @@ def test_clone_url_carries_the_token_and_redact_hides_it(gh):
             [{"name": "lint", "status": "completed", "conclusion": "success"}],
             "ok",
         ),
-        ([], [{"name": "lint", "status": "completed", "conclusion": "skipped"}], "ok"),
+        # Skipped and neutral runs are not evidence: they pass alongside a success, never alone.
+        (
+            [],
+            [
+                {"name": "test", "status": "completed", "conclusion": "success"},
+                {"name": "docs", "status": "completed", "conclusion": "skipped"},
+                {"name": "lint", "status": "completed", "conclusion": "neutral"},
+            ],
+            ("ok", "1 passing"),
+        ),
+        (
+            [{"context": "ci/test", "state": "success"}],
+            [{"name": "lint", "status": "completed", "conclusion": "skipped"}],
+            ("ok", "1 passing"),
+        ),
+        (
+            [],
+            [{"name": "lint", "status": "completed", "conclusion": "skipped"}],
+            ("none", "no successful check (only skipped or neutral results)"),
+        ),
+        (
+            [],
+            [
+                {"name": "lint", "status": "completed", "conclusion": "skipped"},
+                {"name": "docs", "status": "completed", "conclusion": "neutral"},
+            ],
+            ("none", "no successful check (only skipped or neutral results)"),
+        ),
+        (
+            [],
+            [
+                {"name": "test", "status": "in_progress", "conclusion": None},
+                {"name": "lint", "status": "completed", "conclusion": "skipped"},
+            ],
+            ("pending", "test pending"),
+        ),
+        (
+            [],
+            [
+                {"name": "test", "status": "completed", "conclusion": "failure"},
+                {"name": "lint", "status": "completed", "conclusion": "skipped"},
+            ],
+            ("failing", "test failing"),
+        ),
         ([{"context": "factory/verifier", "state": "failure"}], [], ("failing", "factory/verifier failing")),
         ([{"context": "ci/test", "state": "error"}], [], ("failing", "ci/test failing")),
         (
@@ -809,3 +852,30 @@ def test_bounded_issue_listing_filters_prs_and_logs_cap(gh, caplog, pages):
     assert len(calls) == pages
     assert all("pull_request" not in issue for issue in issues)
     assert ("truncated" in caplog.text) is (pages == 10)
+
+
+def test_public_github_reads_health_without_a_credential():
+    fake = FakeGithub(Clock())
+    fake.statuses = [{"context": "ci", "state": "success"}]
+    client = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(fake.handler))
+    public = _github.PublicGithub(client=client)
+    assert public.commit_health(REPO, "a" * 40) == ("ok", "1 passing")
+    assert fake.requests and all("authorization" not in r.headers for r in fake.requests)
+    assert fake.minted == 0  # no installation token, no JWT
+
+
+def test_public_github_error_says_so_and_names_the_status():
+    fake = FakeGithub(Clock())
+    client = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(fake.handler))
+    with pytest.raises(_github.GithubError) as err:
+        _github.PublicGithub(client=client).default_branch_sha("acme/other")
+    assert err.value.status == 404
+
+
+def test_the_base_reader_has_no_way_to_call_github_of_its_own():
+    """Only a subclass knows how to authenticate, so the base reader refuses rather than call anonymously."""
+    reader = _github._GithubReader(
+        httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500)))
+    )
+    with pytest.raises(NotImplementedError):
+        reader._call("org/repo", "GET", "/repos/org/repo")

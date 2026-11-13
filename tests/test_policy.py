@@ -8,7 +8,16 @@ from typing import Any, cast
 
 import pytest
 
-from flyte_agent_factory import _policy, _review, _reviewer, _session_config, _timeline, _usage, agent
+from flyte_agent_factory import (
+    _policy,
+    _review,
+    _reviewer,
+    _router,
+    _session_config,
+    _timeline,
+    _usage,
+    agent,
+)
 
 SRC = Path(agent.__file__).parent
 
@@ -177,10 +186,15 @@ def test_codex_models_are_not_claude(model):
 
 @pytest.mark.asyncio
 async def test_codex_limit_falls_back_to_claude_with_the_claude_setting(monkeypatch):
-    """Codex has its own meter: a Codex limit must move the call to Claude, not fail it."""
+    """Codex has its own meter: a Codex limit must move the call to Claude, not fail it.
+
+    `DELEGATE_ENGINE` is an explicit pin, hard unless `ENGINE_FALLBACK = "allow"` opts into the move (#125,
+    decision-001); `test_a_hard_delegate_pin_defers_instead_of_falling_back` covers the default.
+    """
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
     monkeypatch.setattr(_session_config, "CODEX_TOKEN_SECRET", "configured")
     monkeypatch.setenv("AGENT_FACTORY_DELEGATE_ENGINE", "codex")
+    monkeypatch.setenv("AGENT_FACTORY_ENGINE_FALLBACK", "allow")
     calls = []
 
     async def raw(**kwargs):
@@ -199,3 +213,26 @@ async def test_codex_limit_falls_back_to_claude_with_the_claude_setting(monkeypa
     assert text == "answer"
     assert [c["engine"] for c in calls] == ["codex", "claude"]
     assert calls[-1]["model"] == "opus" and calls[-1]["effort"] == "high"
+
+
+async def test_a_hard_delegate_pin_defers_instead_of_falling_back(monkeypatch):
+    """The same Codex limit with `DELEGATE_ENGINE = "codex"` and no `ENGINE_FALLBACK`: wait, never Claude."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    monkeypatch.setattr(_session_config, "CODEX_TOKEN_SECRET", "configured")
+    monkeypatch.setenv("AGENT_FACTORY_DELEGATE_ENGINE", "codex")
+    monkeypatch.delenv("AGENT_FACTORY_ENGINE_FALLBACK", raising=False)
+    calls = []
+
+    async def raw(**kwargs):
+        calls.append(kwargs)
+        # Every engine would refuse; `calls` below is what proves only Codex was ever asked.
+        raise RuntimeError(f"{_usage.USAGE_LIMIT_MARK} {kwargs['engine']}: You've hit your usage limit.")
+
+    monkeypatch.setattr(_reviewer, "_call_reviewer_raw", raw)
+    monkeypatch.setattr(_usage, "_record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(_usage, "_meters", None)
+    monkeypatch.setattr(_usage, "_hard_pins", False)
+    with pytest.raises(_router.RouterDeferred) as deferred:
+        await _reviewer._call_reviewer(purpose="delegate", model="opus", effort="high")
+    assert [c["engine"] for c in calls] == ["codex"]
+    assert deferred.value.retry_at is not None

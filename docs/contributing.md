@@ -145,13 +145,17 @@ cluster. Expect the first deploy to need a round of
 
 ## Sign your commits (DCO)
 
-Every commit needs a `Signed-off-by` line, certifying the [Developer Certificate of Origin](https://developercertificate.org/):
+Every commit a human makes needs a `Signed-off-by` line, certifying the [Developer Certificate of Origin](https://developercertificate.org/):
 
 ```bash
 git commit -s -m "Describe the change"
 ```
 
 which adds `Signed-off-by: Your Name <you@example.org>` using your git `user.name` and `user.email`.
+
+The certification is personal, so it applies to commits a human makes. Factory sessions do not sign off: the
+operator's promotion does, with the owner's git identity, when it delivers a project
+([Promotion](architecture-repos.md#promotion)).
 
 ## Reporting security problems
 

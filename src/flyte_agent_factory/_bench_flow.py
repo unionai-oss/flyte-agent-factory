@@ -166,11 +166,66 @@ def _store(app: _github.GithubApp) -> _bench_store.Store:
         ) from None
 
 
-def resolve_sha(app: _github.GithubApp, ref: str) -> str:
-    """`ref` as a commit SHA of the engine repo: itself when it is one, else resolved through the App."""
+def _source_clone_url(app: _github.GithubApp, repo: str) -> str:
+    """Return the App's token URL where it is installed on `repo`, else the anonymous one (public repo).
+
+    The same fallback as `_deployer._clone_url`, repeated rather than imported: `_deployer` defines Flyte
+    environments and a trigger at import, which the bench pod has no business deploying.
+    """
+    try:
+        return _github.clone_url(repo, app.installation_token(repo))
+    except _github.GithubError as exc:
+        if exc.status != 404:
+            raise
+    return f"https://github.com/{repo}.git"
+
+
+def _factory_repo() -> str:
+    """Return the engine repo, `[repo] factory`; ValueError if the profile has none (`[loop]` names it)."""
+    if not PROFILE.repos.get("factory"):
+        raise ValueError("the profile has no [repo] factory: name the engine's repo and path")
+    return _github.parse_repo(PROFILE.repos["factory"])
+
+
+def candidate_source(repo: str, path: str) -> _bench.Source | None:
+    """Return the candidate source asked for, or None for the default: the engine repo's root.
+
+    `repo` must be one the profile names (the engine repo, `[deploy] repo` or the `[direction]` workspace
+    repo), so a benchmark cannot be pointed at an arbitrary repository. Empty `repo` means the engine repo.
+    A profile with no `[repo] factory` takes `[loop] repo` and `path` as that default, and so always has a
+    source.
+    """
+    has_factory = bool(PROFILE.repos.get("factory"))
+    if has_factory:
+        factory = _factory_repo()
+    else:
+        factory = PROFILE.loop.repo
+        if not factory:
+            raise ValueError("the profile has no [repo] factory or [loop] repo to benchmark by default")
+        # An unqualified bench is the loop's engine, subtree and all.
+        path = path or (PROFILE.loop.path if not repo else "")
+    # Either `owner/repo` or a clone URL, as the profile spells its repositories.
+    wanted = repo if re.fullmatch(r"[\w.-]+/[\w.-]+", repo) else _github.parse_repo(repo) if repo else factory
+    known = {factory.lower()}
+    for url in (PROFILE.deploy.repo, PROFILE.direction.repo if PROFILE.direction else ""):
+        if url:
+            known.add(_github.parse_repo(url).lower())
+    if wanted.lower() not in known:
+        raise ValueError(f"{wanted} is not one of the profile's repositories ({', '.join(sorted(known))})")
+    source = _bench.Source(wanted, path)
+    # Without `[repo] factory` there is no root engine to stand for the default: it is always a source.
+    return None if has_factory and wanted.lower() == factory.lower() and not source.path else source
+
+
+def resolve_sha(app: _github.GithubApp, ref: str, source: _bench.Source | None = None) -> str:
+    """Return `ref` as a commit SHA of the engine repo (of `source`'s repo, if any).
+
+    A SHA is itself; anything else is resolved through the App.
+    """
     if len(ref) == 40:
         return _bench.check_sha(ref)
-    _, sha = app.default_branch_sha(_github.parse_repo(PROFILE.repos["factory"]), ref)
+    repo = source.repo if source else _factory_repo()
+    _, sha = app.default_branch_sha(repo, ref)
     return _bench.check_sha(sha)
 
 
@@ -770,9 +825,13 @@ async def run_case(case: str) -> str:
         return path.read_text()
 
 
-def deploy_engine_sync(app: _github.GithubApp, sha: str) -> list[str]:
-    """Deploy engine `sha` as its bench envs, skipping those already deployed."""
-    profile = _bench.bench_profile(PROFILE, sha)
+def deploy_engine_sync(app: _github.GithubApp, sha: str, source: _bench.Source | None = None) -> list[str]:
+    """Deploy engine `sha` as its bench envs, skipping those already deployed.
+
+    With a `source` the engine is `<subtree>/src` of that repo's `sha`, in envs of its own. Either way the
+    production deploy source is not touched: this only reads a repository and deploys bench envs.
+    """
+    profile = _bench.bench_profile(PROFILE, sha, source)
     envs = [slot.env for slot in profile.slots]
     missing = []
     for name in envs:
@@ -784,9 +843,11 @@ def deploy_engine_sync(app: _github.GithubApp, sha: str) -> list[str]:
         # The deploy children import and run the engine being benchmarked: they never get the App key.
         credentials = _pull_requests.credential_env_vars(PROFILE.github.private_key_secret, os.environ)
         base = {k: v for k, v in os.environ.items() if k not in credentials}
-        with _deploy.fetched_tree(_clone_url(app, PROFILE.repos["factory"]), sha) as tree:
+        url = _source_clone_url(app, source.repo) if source else _clone_url(app, PROFILE.repos["factory"])
+        with _deploy.fetched_tree(url, sha) as tree:
+            src = _bench.candidate_src(tree, source.path) if source else tree / "src"
             code = _deploy.deploy_slots(
-                profile, tree / "src", missing, project=PROJECT, domain=DOMAIN, ref=sha, base_env=base
+                profile, src, missing, project=PROJECT, domain=DOMAIN, ref=sha, base_env=base
             )
         if code:
             raise _deploy.DeployError(f"deploying {', '.join(missing)} from {sha} failed (exit code {code})")
@@ -794,9 +855,10 @@ def deploy_engine_sync(app: _github.GithubApp, sha: str) -> list[str]:
 
 
 @env.task
-async def deploy_engine(sha: str) -> list[str]:
+async def deploy_engine(sha: str, source_repo: str = "", source_path: str = "") -> list[str]:
     """Return the bench env names of engine `sha`, deployed if they were not already."""
-    return await asyncio.to_thread(deploy_engine_sync, _app(), sha)
+    source = candidate_source(source_repo, source_path)
+    return await asyncio.to_thread(deploy_engine_sync, _app(), sha, source)
 
 
 def _stop_cases(cases: list[dict[str, Any]]) -> dict[str, tuple[bool, str | None]]:
@@ -1010,8 +1072,15 @@ async def benchmark(
     baseline_policy: str = "{}",
     reuse_baseline_days: int = 7,
     max_usd: float = 0.0,
+    source_repo: str = "",
+    source_path: str = "",
 ) -> tuple[str, str]:
     """Benchmark engine `candidate_sha` (a SHA or a ref of `[repo] factory`): `(summary JSON, cases JSONL)`.
+
+    `source_repo` / `source_path` benchmark a modified engine copy instead: the candidate is then a commit of
+    that profile repo (`[direction]`, `[deploy]` or `[repo] factory`) and its engine is `<source_path>/src`,
+    deployed to bench envs of its own. The baseline is a commit of that same repo, built from that same
+    subtree, so the two arms differ only by the change; with no source it is `[repo] factory`'s root.
 
     `tasks` are suite task ids (empty: all); `candidate_policy` a JSON object of launch policy keys.
     The sum of case budgets, including their stop margins, must be within `max_usd` and the
@@ -1021,8 +1090,16 @@ async def benchmark(
     `max_usd = 0` returns the estimate and spends nothing.
     """
     app = _app()
-    sha = await asyncio.to_thread(resolve_sha, app, candidate_sha)
-    baseline_sha = await asyncio.to_thread(resolve_sha, app, baseline_sha) if baseline_sha else ""
+    engine_source = candidate_source(source_repo, source_path)
+    # The source is passed only when there is one: the default call keeps its old shape.
+    sha = await asyncio.to_thread(
+        resolve_sha, app, candidate_sha, *([engine_source] if engine_source else [])
+    )
+    baseline_sha = (
+        await asyncio.to_thread(resolve_sha, app, baseline_sha, *([engine_source] if engine_source else []))
+        if baseline_sha
+        else ""
+    )
     if reuse_baseline_days < 0:
         raise ValueError("reuse_baseline_days must be non-negative")
     # Inside a task the context always carries the run's name.
@@ -1031,7 +1108,7 @@ async def benchmark(
     cases, estimate, go = prepare(*args, baseline_sha, baseline_policy) if baseline_sha else prepare(*args)
     aa = (
         bool(baseline_sha)
-        and sha == baseline_sha
+        and sha == baseline_sha  # the baseline is in the candidate's repo and subtree, so the same engine
         and (
             _factory_policy.normalize_policy(_factory_policy.parse_policy(candidate_policy))
             == _factory_policy.normalize_policy(_factory_policy.parse_policy(baseline_policy))
@@ -1042,6 +1119,8 @@ async def benchmark(
     loop_origin = PROFILE.loop.enabled and await asyncio.to_thread(_loop_origin)
     for case in cases:
         case["loop_origin"] = loop_origin
+        if engine_source:
+            case["engine_source"] = engine_source.key
     title = f"Factory benchmark {bench_run}: {sha[:7]}, suite {_bench_suite.SUITE}"
     await flyte.report.replace.aio(
         f"<h3>{_dashboard._e(title)}</h3><p>Running {len(cases)} case(s).</p>", do_flush=True
@@ -1054,13 +1133,19 @@ async def benchmark(
     # Refuse changed inputs rather than silently reusing a measurement of a different engine.
     for row in previous:
         planned_case = planned.get(row["case_run"])
-        if planned_case is None or any(
-            row[key] != planned_case[key]
-            for key in ("engine_sha", "policy", "suite_digest", "task", "repeat", "model")
+        if (
+            planned_case is None
+            or any(
+                row[key] != planned_case[key]
+                for key in ("engine_sha", "policy", "suite_digest", "task", "repeat", "model")
+            )
+            or row.get("engine_source", "") != planned_case.get("engine_source", "")
         ):
             raise _bench_store.StoreError("cannot resume a benchmark with different inputs")
     pending = [case for case in cases if case["case"] not in completed]
-    if baseline_sha and not aa and reuse_baseline_days:
+    # A sourced benchmark measures its own baseline; a root one reuses only rows of the root engine, since
+    # a sourced row at the same SHA measured `<path>/src` of another repo (see `baseline_records`).
+    if baseline_sha and not aa and reuse_baseline_days and engine_source is None:
         with await asyncio.to_thread(_store, app) as store:
             for case in pending:
                 if case["arm"] != "baseline":
@@ -1073,6 +1158,7 @@ async def benchmark(
                     case["repeat"],
                     reuse_baseline_days,
                     model=case["model"],
+                    engine_source=case.get("engine_source", ""),
                 )
                 if baseline is not None:
                     # The record itself says it was reused, so the label survives a resume.
@@ -1100,10 +1186,11 @@ async def benchmark(
     records: list[dict[str, Any]] | None = None
     try:
         if pending:
-            candidate_envs = await deploy_engine(sha)
+            source_args = (engine_source.repo, engine_source.path) if engine_source else ()
+            candidate_envs = await deploy_engine(sha, *source_args)
             envs: list[str] | dict[str, list[str]] = candidate_envs
             if baseline_sha:
-                baseline_envs = await deploy_engine(baseline_sha)
+                baseline_envs = await deploy_engine(baseline_sha, *source_args)
                 envs = {"candidate": candidate_envs, "baseline": baseline_envs}
             # A recovered run has no durable env assignment. If it cannot stop, none of the envs is safe.
             if any(error for _, error in recovered.values()):
@@ -1191,6 +1278,7 @@ async def benchmark(
         "bench_run": bench_run,
         "engine_sha": sha,
         "baseline_sha": baseline_sha,
+        **({"source": {"repo": engine_source.repo, "path": engine_source.path}} if engine_source else {}),
         "suite": _bench_suite.SUITE,
         "suite_digest": _bench_suite.digest(),
         "estimate": estimate,

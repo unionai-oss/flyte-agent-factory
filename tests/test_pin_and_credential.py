@@ -24,6 +24,7 @@ from flyte_agent_factory import (
     _factory_policy,
     _issues,
     _meter,
+    _pins,
     _planner,
     _planner_facts,
     _queue,
@@ -283,7 +284,10 @@ async def test_r2_the_author_is_claude_when_only_the_slot_login_is_limited(monke
     store.update(_meter.Meter("claude slot_login", "oauth-usage", now, limited_until=now + 3600))
     monkeypatch.setenv(PIN, "claude")
     assert (
-        await _author._choose_author_engine("", ("claude", "codex"), False, _timeline._Timeline()) == "claude"
+        await _author._choose_author_engine(
+            _pins.author_pin(), ("claude", "codex"), False, _timeline._Timeline()
+        )
+        == "claude"
     )
 
 
@@ -455,7 +459,13 @@ async def _choose(
     if owner is not None:
         (tmp_path / "author-conversation.json").write_text(json.dumps(owner))
     timeline = _timeline._Timeline()
-    engine = await _author._choose_author_engine(pin, available, resumed, timeline)
+    previous = _pins.engine_input  # `_engine_input_pin` sets it, as `project` does
+    try:
+        engine = await _author._choose_author_engine(
+            _author._engine_input_pin(pin), available, resumed, timeline
+        )
+    finally:
+        _pins.engine_input = previous
     return engine, [text for _, _, text in timeline._rows]
 
 
@@ -492,8 +502,22 @@ def test_r4_the_conversation_owner_follows_the_pin_so_claude_resumes_its_own_tra
     assert json.loads(owner_file.read_text())["thread"] == "kept"
 
 
+async def test_r4_an_exhausted_hard_pin_starts_on_its_engine_and_waits(monkeypatch, tmp_path):
+    """Since #125 a pin is hard by default: an exhausted one starts on its engine and waits out the limit.
+
+    Replaces the unqualified form of the test below, with the same inputs: that override now needs
+    `ENGINE_FALLBACK = "allow"`.
+    """
+    store = _token_pod(monkeypatch, tmp_path)
+    store.note_limit("claude", time.time() + 3600, _session_config._claude_account())
+    engine, rows = await _choose("claude", False)
+    assert engine == "claude"
+    assert not any("pin overridden" in row for row in rows)
+
+
 async def test_r4_an_exhausted_pin_is_overridden_and_the_timeline_says_so(monkeypatch, tmp_path):
-    """R4 an exhausted pin is overridden and the timeline says so."""
+    """R4 an exhausted pin is overridden and the timeline says so, when fallback is allowed."""
+    monkeypatch.setenv("AGENT_FACTORY_ENGINE_FALLBACK", "allow")
     store = _token_pod(monkeypatch, tmp_path)
     store.note_limit("claude", time.time() + 3600, _session_config._claude_account())
     engine, rows = await _choose("claude", False)

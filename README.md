@@ -13,6 +13,7 @@ flowchart LR
     chat --> gh[GitHub connector]
     mcp --> queue[Factory queue]
     queue --> session
+    workspace[("Your private workspace: projects live here")] <--> session
     subgraph session[Project session: one Flyte run]
         coord[Coordinator] --> roles[Session roles]
         coord --> workers[Delegate workers]
@@ -20,10 +21,12 @@ flowchart LR
     session --> gate[Pre-review gate]
     gate --> review[Independent review]
     review -->|fail| session
-    review -->|pass| pr[Draft PR, then ready]
+    review -->|pass| pr[Draft PR in the workspace, then ready]
     gh -->|on your word| pr
-    pr --> promote[Promote]
-    promote --> target[Target repository]
+    pr --> promote["Promotion PR from chat: ops/promote.py deliver, operator and owner"]
+    promote --> target["Target repository: any, including the public engine"]
+    target -.->|"when it is [deploy] repo"| deployer
+    deployer["Deployer: reads the default branch of [deploy] repo once CI is green"] --> factory[Deployed factory]
 ```
 
 One project is one Flyte run. The run has no time limit, takes direction and asks questions through Flyte
@@ -37,10 +40,12 @@ and GitHub's MCP server connected. It sits between you and the factory on purpos
 - **It answers the factory.** Sessions ask questions as they work. The operator answers the engineering ones and
   brings you only real decisions: product choices, tradeoffs, money, anything irreversible.
 - **It holds the credentials the factory doesn't.** A session pushes only to the repository it was launched on
-  and opens pull requests; it does not merge (unless you turn on `[loop] merge` for the engine's own repository).
-  Merging and promoting to another repository use your credentials, which only the operator holds, and only when
-  you say so. Secrets mounted in the factory's own pods are not an isolation boundary: with `[board]` each project's
-  supervisor mounts a token with repo scope ([profiles/README.md](profiles/README.md#projects-v2-board)).
+  and opens pull requests; it does not merge. (`[loop] merge = "on"` is an opt-in exception: it merges the loop's
+  own passing pull requests on its `[loop] repo`, and needs the factory's GitHub App installed there, so it does not
+  apply to a public engine repository you cannot install an App on.) Merging and promoting to another repository,
+  the engine included, use your credentials, which only the operator holds, and only when you say so. Secrets
+  mounted in the factory's own pods are not an isolation boundary: with `[board]` each project's supervisor mounts
+  a token with repo scope ([profiles/README.md](profiles/README.md#projects-v2-board)).
   Deciding what is Ready on the board is yours too: by default the factory sets neither Ready nor Backlog (the
   settings that change that are listed in [docs/chat-operator.md](docs/chat-operator.md#what-each-side-can-do)).
 - **It helps you write the inputs.** Issues and briefs are problem and requirements documents. The operator
@@ -55,27 +60,32 @@ Setup, the full split of who can do what, and what to ask: [docs/chat-operator.m
   ([compatibility audit](docs/oss-flyte-compat.md)).
 - A Claude `setup-token` as a Flyte secret; a personal Claude Pro or Max plan works. Optionally, for Codex, a
   ChatGPT login from a personal Plus or Pro plan, or a Codex access token from a Business or Enterprise workspace.
-- A GitHub repository of your own, the workspace, with a deploy key. Sessions push there. A further repository
-  (the engine's, for factory-improvement launches) is reachable only if the profile lists a deploy key for it in
-  `[repo_keys]`.
+- A private GitHub repository of your own, the workspace, with a write deploy key. Sessions push there. Optionally
+  (and by default in guided setup) your own GitHub App for draft pull requests, verifier statuses and auto-deploy
+  ([docs/github-app.md](docs/github-app.md)). Work on another repository, the engine included, is imported into a
+  workspace project and promoted back as a pull request ([promotion](docs/architecture-repos.md#promotion));
+  sessions hold no credential for it.
 - For the operator: Claude Code, or claude.ai where your organization has its request-header connectors (a beta),
   and a GitHub OAuth App or token for its GitHub connector.
-- A deployment profile naming all of it. It holds every owner-specific value; none is in this repository.
+- A deployment profile naming all of it: `profile.toml` at the root of your workspace. It holds every
+  owner-specific value; none is in this repository.
 
-Start with [guided setup](docs/quickstart.md). Tell your chat agent: “Help me set up Flyte Agent Factory using
-https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/quickstart.md. Check what I already have and
-guide me one step at a time.” It covers GitHub access, creating your workspace
-from the [public template](https://github.com/unionai-oss/flyte-agent-workspace), backend and local setup,
-credentials stored locally, deployment, connectors and your first launch. Fresh installs currently follow the
-Union path; OSS needs the adaptations in the compatibility audit above. A hosted bootstrap app is planned, not
-built.
+Start with [guided setup](docs/quickstart.md): download `agent-factory.zip` and `since.zip` from
+[`skills/dist/`](https://github.com/unionai-oss/flyte-agent-factory/tree/main/skills/dist), save them in claude.ai
+(Settings, Capabilities, Skills) or unzip them into `~/.claude/skills/` for Claude Code, then run `/agent-factory`.
+It asks for your Flyte endpoint, project, GitHub owner and state bucket, hands you one copy-paste command that does the
+machine work (workspace from the bundled template, deploy key, your own GitHub App, ruleset, board, profile, deploy)
+and resumes if interrupted, then connects the MCP and helps with your first launch. It never asks for a credential in
+chat. Fresh installs currently follow the Union path; OSS runs every step except the deploy
+(see the compatibility audit above).
 Every secret is in [docs/secrets.md](docs/secrets.md).
 
 Cost is your model usage plus Flyte compute. Usage meters and a per-account reserve decide when a launch may start.
 
 ## Using it, in five steps
 
-1. **Set up once.** Install the factory ([docs/quickstart.md](docs/quickstart.md)), then connect the operator
+1. **Set up once.** Install the skills and run `/agent-factory`, and the operator guides the install
+   ([docs/quickstart.md](docs/quickstart.md)), then the connections
    ([docs/chat-operator.md](docs/chat-operator.md#setup)): the factory MCP, the skill, the GitHub connector.
 2. **Launch.** Tell the operator what you want and what done means. It writes the brief and calls
    `factory.launch`, which queues the project and starts it when a slot is free.
@@ -86,8 +96,8 @@ Cost is your model usage plus Flyte compute. Usage meters and a per-account rese
    passes; without it the session pushes the default branch and no pull request is opened. The operator tells you
    the result and explains any blocking findings.
 5. **Merge and promote.** You decide; the operator merges. A project that delivers to another repository (a
-   `Delivers to:` line) leaves `projects/<name>/patches/*.patch`; `ops/promote.py` applies them to the target under
-   its CI and coverage checks, with your credentials, from a shell: Claude Code as the operator, or you.
+   `Delivers to:` line) is imported into the workspace, worked on there and promoted to the target as a pull request by
+   the operator, with your credentials: [Promotion](docs/architecture-repos.md#promotion).
 
 The same tasks run without chat, for scripts and automation: `ops/operate.py` from a terminal, issues bearing the
 intake label through the signed webhook ([docs/deploy-webhook.md](docs/deploy-webhook.md#issue-intake)), and a

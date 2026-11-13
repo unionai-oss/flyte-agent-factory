@@ -15,7 +15,8 @@ Every page, grouped by the reader it is written for. The project overview is the
 
 | Page | Answers |
 |---|---|
-| [quickstart.md](quickstart.md) | Start here: prerequisites and every step from a clone to a first launched project, on a personal Claude Pro/Max or ChatGPT Plus/Pro plan |
+| [quickstart.md](quickstart.md) | Start here: install the skills, run `/agent-factory`, and what it walks you through; prerequisites, and the same steps by hand, on a personal Claude Pro/Max or ChatGPT Plus/Pro plan |
+| [github-app.md](github-app.md) | Registering your own GitHub App (the bootstrap's manifest flow, or by hand): permissions, what it enables and what works without it |
 | [secrets.md](secrets.md) | Every Flyte secret a profile can name: what it unlocks, how to get it, how to store it, where it is mounted, how to rotate it |
 | [install-audit.md](install-audit.md) | The gaps found walking the README as a stranger, what fixed each, and what is still to prove on a personal cluster |
 | [setup.md](setup.md) | From nothing to a first project: workspace, profile, setup-token, deploy key, deploying |

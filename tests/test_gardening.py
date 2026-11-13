@@ -68,8 +68,8 @@ def test_repo_factory_means_the_profiles_factory_repo(tmp_path):
     assert [t.repo for t in _gardening.load(tmp_path, REPOS)] == [REPOS["factory"]]
 
 
-def test_the_workspace_template_gardens_the_engine_by_default():
-    assert [t.repo for t in _gardening.load(_workspace.TEMPLATE, REPOS)] == [REPOS["factory"]]
+def test_the_workspace_template_opts_out_of_gardening():
+    assert _gardening.load(_workspace.TEMPLATE, REPOS) == []
 
 
 def test_the_factory_commits_no_gardening_targets_of_its_own():
@@ -353,19 +353,6 @@ def test_the_decision_reads_the_target_list_from_the_workspace_repo(flyte_world,
     assert _factory._gardening_targets() == []
 
 
-def test_a_workspace_without_the_file_gardens_the_engine_by_default(tmp_path):
-    assert [t.repo for t in _gardening.load_or_default(tmp_path, REPOS)] == [REPOS["factory"]]
-
-
-def test_a_workspace_without_the_file_and_a_profile_without_the_engine_has_no_targets(tmp_path):
-    assert _gardening.load_or_default(tmp_path, {}) == []
-
-
-def test_a_present_file_without_targets_opts_out(tmp_path):
-    write(tmp_path, "# no targets\n")
-    assert _gardening.load_or_default(tmp_path, REPOS) == []
-
-
 def _github_profile(monkeypatch, files, **repos):
     """A profile whose workspace repo serves `files` (path -> text) through a fake GitHub app."""
 
@@ -390,47 +377,85 @@ def _github_profile(monkeypatch, files, **repos):
     monkeypatch.setattr(_github, "GithubApp", App)
 
 
-def test_a_workspace_without_the_file_has_the_engine_as_its_one_target(flyte_world, monkeypatch):
-    _github_profile(monkeypatch, {}, factory="git@github.com:owner/engine.git")
-    assert [t.repo for t in _factory._gardening_targets() or []] == ["git@github.com:owner/engine.git"]
-
-
-def test_a_workspace_file_listing_no_target_has_none(flyte_world, monkeypatch):
-    _github_profile(monkeypatch, {"gardening.toml": "# none\n"}, factory="git@github.com:owner/engine.git")
+def test_a_workspace_without_the_file_has_no_targets(flyte_world, monkeypatch):
+    _github_profile(monkeypatch, {})
     assert _factory._gardening_targets() == []
 
 
-def test_a_workspace_file_listing_the_engine_has_it_as_target(flyte_world, monkeypatch):
-    engine = "git@github.com:owner/engine.git"
-    _github_profile(monkeypatch, {"gardening.toml": '[[target]]\nrepo = "factory"\n'}, factory=engine)
-    assert [t.repo for t in _factory._gardening_targets() or []] == [engine]
+def test_a_workspace_file_listing_no_target_has_none(flyte_world, monkeypatch):
+    _github_profile(monkeypatch, {"gardening.toml": "# none\n"})
+    assert _factory._gardening_targets() == []
 
 
-def test_the_weekly_task_skips_without_a_factory_repo_in_the_profile(weekly, monkeypatch):
-    repos = {k: v for k, v in _factory_base.PROFILE.repos.items() if k != "factory"}
-    monkeypatch.setattr(_factory_base, "PROFILE", dataclasses.replace(_factory_base.PROFILE, repos=repos))
+def test_a_target_resolves_without_any_factory_entry_in_the_profile(flyte_world, monkeypatch):
+    _github_profile(monkeypatch, {"gardening.toml": '[[target]]\nrepo = "other"\n'}, other=FACTORY)
+    assert "factory" not in _factory_base.PROFILE.repos
+    assert [t.repo for t in _factory._gardening_targets() or []] == [FACTORY]
+
+
+def test_the_weekly_task_skips_without_a_workspace_repo(weekly, monkeypatch):
+    monkeypatch.setattr(_factory_base, "PROFILE", dataclasses.replace(_factory_base.PROFILE, repo=""))
     result = asyncio.run(_factory.garden_weekly.func())
-    assert result.startswith("skip: ") and "[repo] factory" in result
+    assert result.startswith("skip: ") and "workspace repository" in result
     assert _queue.pending(weekly.world.queue) == []
 
 
-def test_the_weekly_task_queues_when_the_engine_is_the_target(weekly):
+def test_the_weekly_task_launches_in_the_workspace_without_a_factory_entry(weekly, monkeypatch):
+    assert "factory" not in _factory_base.PROFILE.repos
+    launched = []
+
+    def launch(brief, name, **kwargs):
+        launched.append((name, kwargs["repo"]))
+        return {"status": "queued"}
+
+    monkeypatch.setattr(_factory, "launch_project", launch)
+    weekly.scans.targets = [FACTORY]
+    asyncio.run(_factory.garden_weekly.func())
+    assert launched == [(_gardening.NAME, _factory_base.PROFILE.repo)]
+
+
+def test_the_decision_counts_issues_on_the_workspace_repo(flyte_world, monkeypatch):
+    asked = []
+
+    class App:
+        def __init__(self, *_):
+            pass
+
+        def open_issues(self, repo, label):
+            asked.append((repo, label))
+            return [1] * 11
+
+        def read_file(self, repo, path):
+            return '[[target]]\nrepo = "x"\n'
+
+    _github_profile(monkeypatch, {})
+    monkeypatch.setattr(_github, "GithubApp", App)
+    level, reasons = _factory.gardening_decision(NOW)
+    assert asked == [("owner/workspace", _gardening.LABEL)]
+    assert any("11 open gardening issues" in r for r in reasons)
+
+
+def test_the_weekly_task_queues_when_a_target_is_listed(weekly):
     weekly.scans.targets = [FACTORY]
     result = json.loads(asyncio.run(_factory.garden_weekly.func()))
     assert result["status"] in ("started", "queued")
 
 
-def test_list_targets_defaults_to_the_engine_when_the_workspace_has_no_file(monkeypatch):
+def test_list_targets_has_none_when_the_workspace_has_no_file(monkeypatch):
     async def clone(repo, ref, dest):
-        assert repo == "git@example.org:owner/workspace.git"
         dest.mkdir(parents=True)
 
-    repos = {**_factory_base.PROFILE.repos, "factory": FACTORY}
-    monkeypatch.setattr(_factory_base, "PROFILE", dataclasses.replace(_factory_base.PROFILE, repos=repos))
     monkeypatch.setattr(_factory, "_no_scan_key", lambda repo: "")
     monkeypatch.setattr(_git, "clone", clone)
-    names = asyncio.run(_factory.list_targets.func("git@example.org:owner/workspace.git"))
-    assert json.loads(names) == [FACTORY]
+    assert json.loads(asyncio.run(_factory.list_targets.func("git@example.org:owner/workspace.git"))) == []
+
+
+def test_gardening_does_not_read_the_engine_repo_entry():
+    for name in ("_factory.py", "_gardening.py"):
+        text = (ROOT / "src" / "flyte_agent_factory" / name).read_text()
+        assert (
+            'repos["factory"]' not in text and '"factory" in' not in text and '"factory" not in' not in text
+        )
 
 
 # --- the profile (H6)
@@ -520,9 +545,9 @@ def weekly(flyte_world, queue_state, monkeypatch):
     """`garden_weekly` against fake slots, a local state directory and a fake scan child."""
     flyte_world.add("one", _factory_base.SLOTS[0])
     flyte_world.add("two", _factory_base.SLOTS[1])
-    repos = {**_factory_base.PROFILE.repos, "factory": FACTORY}
+    repos = {k: v for k, v in _factory_base.PROFILE.repos.items() if k != "factory"}
     monkeypatch.setattr(_factory_base, "PROFILE", dataclasses.replace(_factory_base.PROFILE, repos=repos))
-    monkeypatch.setattr(_factory, "allowed_repos", lambda: {"factory": FACTORY})
+    monkeypatch.setattr(_factory, "allowed_repos", lambda: {"project": _factory_base.PROFILE.repo})
     scans = SimpleNamespace(targets=[FACTORY, "path:tools"], by_repo={FACTORY: {"counts": {"ruff": 1}}})
 
     async def spot_first(task, *args):
@@ -567,7 +592,7 @@ def test_the_weekly_task_queues_a_low_priority_launch(weekly):
     [entry] = _queue.pending(weekly.world.queue)
     assert entry.request is not None
     assert (entry.name, entry.request.priority) == (_gardening.NAME, "low")
-    assert entry.request.repo == FACTORY
+    assert entry.request.repo == _factory_base.PROFILE.repo
 
 
 def test_the_weekly_task_scans_before_it_decides_and_records_the_baseline(weekly):

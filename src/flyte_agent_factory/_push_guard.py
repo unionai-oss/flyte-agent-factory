@@ -26,8 +26,8 @@ added lines of every new commit and its message and refuses the push if one hold
 with a secret in it (`_bridge.find_credential_shape`) or the value of a live credential grant. It prints the
 commit and the line number, never the line. It fails closed: a push it cannot fully check (the grant server
 does not answer, a live grant cannot be read, git cannot show a commit) is refused too. The harness never
-pushes the session's commits (`_promote` pushes engine code, and its git calls run with
-`core.hooksPath=/dev/null`), so it is not subject to this.
+pushes the session's commits to another repository: promotion (`_promote`) runs outside the factory, by the
+operator with their own credentials, from a fresh clone with no hook installed, so it is not subject to this.
 
 The honest limit: `git push --no-verify` and editing `.git/hooks` skip the scan exactly as they skip the URL
 check. It catches the mistake; redaction on every published path and the provider-side expiry of the

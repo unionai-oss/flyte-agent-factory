@@ -49,6 +49,7 @@ class _StoredCase(TypedDict):
     repeat: int
     outcome: str
     model: NotRequired[str]
+    engine_source: NotRequired[str]
 
 
 class _AARun(TypedDict):
@@ -323,8 +324,13 @@ class Store:
         repeat: int,
         max_age_days: float,
         model: str = "opus",
+        engine_source: str = "",
     ) -> dict[str, object] | None:
-        """Newest matching baseline younger than `max_age_days`, measured at ended_at (UTC epoch seconds)."""
+        """Newest matching baseline younger than `max_age_days`, measured at ended_at (UTC epoch seconds).
+
+        `engine_source` is the case's `Source.key`, "" for the root of `[repo] factory`: the same SHA in
+        another repo and subtree is a different engine.
+        """
         now = time.time()
         # Published cases have the schema validated on append, even though records() tolerates new fields.
         matches = [
@@ -333,6 +339,7 @@ class Store:
             if (row["engine_sha"], row["policy"], row["suite_digest"], row["task"], row["repeat"])
             == (sha, policy, suite_digest, task, repeat)
             and row.get("model", "opus") == model
+            and row.get("engine_source", "") == engine_source
             and row.get("outcome") not in RETRYABLE
             and 0 <= now - row["ended_at"] < max_age_days * DAY_S
         ]

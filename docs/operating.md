@@ -47,7 +47,6 @@ either.
 | `code` | Meaning | Detail keys | Written by |
 |---|---|---|---|
 | `project_running` | its project's previous run is still live | `holders`: that run (absent before the first pass judges it) | both |
-| `engine_busy` | the `[repo] factory` lane is full | `holders`, `limit` | both |
 | `engine_limit` | its engine is at `[concurrency] per_engine` | | dispatcher |
 | `no_token` | it pins an engine whose login is not deployed | | dispatcher |
 | `no_codex_slot` | it pins Codex and no free slot holds a Codex login | | dispatcher |
@@ -66,11 +65,12 @@ either.
 The table below says where each hold also shows outside `wait`.
 
 A `low` launch yields only to a higher-priority launch that could start now. One held by a reason of its own
-(its lane, engine, account, project or files) does not make `low` work wait, so a free slot is not left idle behind
+(its engine, account, project or files) does not make `low` work wait, so a free slot is not left idle behind
 it; when its hold clears it goes before any `low` launch. Expedite goes before normal, and a normal resume ranks
 as a normal launch. When a resume's own run ends and hands over its slot, another project may take that slot but
-`low` work may not: it is kept for the resume (on the `[repo] factory` repository the ending run still holds its
-lane for `low` work), and `low` work may take any other free slot. A launch that fails for good, or is cancelled, holds nothing.
+`low` work may not: it is kept for the resume, and `low` work may take any other free slot. Projects on every
+repository, the engine's included, share the same slots; no repository has a lane of its own. A launch that fails
+for good, or is cancelled, holds nothing.
 
 | Reason | Where it shows |
 |---|---|
@@ -79,7 +79,6 @@ lane for `low` work), and `low` work may take any other free slot. A launch that
 | the engine's cap, `[concurrency] per_engine`; only that launch waits, a later one on the other engine may go | `engine_limit` in `wait` |
 | a usage reserve: the launch's account has less than `k` times the hours to reset left | a `reserve` line in `queue_list` and `overview`, such as `claude reserve: weekly 22% left < 0.5%/h x 61h = 30.5% held back`, and `no_capacity` in `wait` on a launch it holds |
 | its own project still has a live run: a resume waits until that run has ended and published its workspace, so two pods never work on one project; a hand-over frees its slot for other projects only, and not for `low` work | a `waiting_for` line in `queue_list`, `factory.status` and `overview`, and the log line `[queue] <name> waits: project_running: <run>` |
-| engine busy: a launch on the `[repo] factory` repository while `[repo] factory_projects` (default 1) projects on it already run or were admitted in this sweep | `engine_busy` in `wait`, with `holders` and `limit`, and the log line `[queue] <name> waits: engine_busy: <running projects>` (with a limit above 1: `engine_busy: a, b (limit 2)`) |
 | the launch pins an engine whose login is not deployed | `no_token` in `wait` |
 | every engine of a slot refused a call (a usage limit), so the slot cannot take a project | `no_capacity` in `wait` |
 | a loop launch whose slot budget says wait (the `[loop]` caps are unset, or the daily or weekly cap is spent) | `loop_budget` in `wait` |
@@ -117,6 +116,56 @@ flyte signal condition <run-name> <action-name> 'Also handle refresh-token rotat
 Direction reaches the coordinator in its running conversation, so the session keeps its context. The
 conditions are named `direct-a<attempt>-NNN` and `ask-a<attempt>-NNN`; `flyte get condition` lists the open ones.
 `stop` and `/exit` stop a project like `/stop`.
+
+### While it waits on a usage limit
+
+A project whose coordinator engine is out of quota pauses until the earliest reset of an engine it may use,
+then resumes on its own. The phase reads like `limited until 14:50 UTC, waiting for claude` (with the day,
+`limited until Mon 16 Nov 00:40 UTC, waiting for claude`, when the reset is not today). `factory.status`
+returns the same facts as a `paused` field (`null` when the project is not paused):
+
+```json
+{"engine": "claude", "until": 1794789600.0,
+ "others": {"codex": "pinned to claude (ENGINE_FALLBACK unset)"}, "needs_human": ""}
+```
+
+`engine` is the engine waited for, `until` the reset in Unix seconds, `others` why each other engine is not
+used, and `needs_human` what someone must do when no engine can run without help (a missing credential or a
+broken login), otherwise empty. A pin's reason names what holds it: `ENGINE_FALLBACK unset` or its value,
+`operator direction`, or `benchmark hard_pin`. When the pin is all that keeps a usable engine idle,
+`needs_human` names that engine and how to lift the pin.
+
+The router is asked again at every resume attempt, and each attempt writes a `router: author -> ...` row (a
+repeat of the previous decision in the short form `(unchanged; retry at 22:40 UTC)`). A project that had
+declared DONE is resumed twice; if neither takes, the router is asked again and the project waits for the
+next reset it names. Each such round doubles the wait before the next (30 minutes, 1 h, 2 h, then every
+4 h), until a resume takes, the engine switches, or a refusal states its reset. A reset a meter learns
+during the wait, for an engine the coordinator may use, ends it a minute after that reset. A human is asked
+only when no engine can run without one, or once per limit episode when three rounds in a row found no known reset on an
+engine the coordinator may use (the engine keeps refusing with no reset time; under a hard pin, or once the
+run has used its engine switches, the other engine's reset does not count, and the question says how to
+lift that and when the other engine is itself limited until); the backed-off retries go on after that. After a pod restart the
+saved reset still holds, so a restart does not bring back half-hourly retries of a pinned engine's weekly limit.
+
+The review can wait on a limit too. When a reviewer is deferred by a usage limit after DONE, the phase
+reads `limited until 06:02 UTC` (the router's retry time plus two minutes, at least ten from now), the
+activity line reads `review waiting on the usage limit -- re-runs automatically at 06:02 UTC`, and a
+`review waiting: ...` row names the limit. Nothing needs doing: at that time the review runs again by
+itself, for the judges still missing, and the phase returns to `review round N`. It does not use a review
+round and the session is not told. A review that is incomplete for another reason (a judge gave no verdict
+or could not run) waits in phase `review`, not `limited`, and re-runs after three minutes, at most twice
+per DONE; after that the session is told the work was not reviewed. A pod restart resumes either wait.
+
+What you can send to the `direct-` condition while it waits:
+
+| Send | Effect |
+| --- | --- |
+| `/stop` | ends the project at once, as when it is running; it does not wait for the reset |
+| `/engine claude`, `/resume [on] claude`, `resume [now] on claude`, `switch to claude` (or `codex`) | the project switches to that engine now, through the handoff, if it can run; otherwise the timeline says when that engine resets and the project waits for it. The engine becomes a hard pin for the rest of the run |
+| anything else | kept, and delivered once to the session when it resumes |
+
+An engine direction counts only as the whole message, in any case and with an optional final `.` or `!`:
+`please resume on claude when you can` is ordinary direction, delivered on resume.
 
 ## How it asks you things
 
@@ -169,7 +218,9 @@ The coordinator (the policy role is still called `author`, so its keys are `AUTH
 coordinates implementation through `delegate "<standalone brief>"`
 (or `delegate --file brief.md`; use `delegate submit "status"` for a reserved word). Submission prints a job id immediately;
 `delegate status` lists jobs and `delegate wait <id> --timeout 3600` prints the
-worker summary and patch path, or exits nonzero on failure. The coordinator reviews
+worker summary and patch path, or exits nonzero on failure. A job waiting on an engine's usage limit shows in
+`delegate status` as `<id> waiting for <engine> until HH:MM UTC` (with the date when it is not today), and
+`delegate wait` prints that line to stderr when it times out. The coordinator reviews
 the patch, commits any pending local work (three-way apply requires the index to match the
 worktree for files touched by the patch), and applies the patch with `git apply --3way <patch-path>`, runs checks, and commits.
 Workers receive a snapshot including uncommitted changes; they never edit the
@@ -272,3 +323,32 @@ Two rules, both learned by breaking them on a real cluster:
 `claude -p` in its own container, on a warm `ReusePolicy` pool. For work
 deserving its own context window and a separate transcript. Nothing it produces
 is merged automatically.
+
+## Benchmarking an engine candidate
+
+Production always deploys `[deploy] repo` main (the public engine). A modified copy of the engine, imported
+into `projects/<name>/` of the workspace repo (`[direction] repo`), is benchmarked without ever becoming that
+deploy source. Launch the `benchmark` task with the candidate's commit and where its copy lives:
+
+```python
+run = flyte.with_runcontext(mode="remote").run(
+    bench,
+    candidate_sha="<40-hex commit of the workspace repo>",
+    source_repo="<owner>/<workspace repo>",
+    source_path="projects/<name>",
+    max_usd=0,  # an estimate; raise it to spend
+)
+```
+
+`source_repo` must be `[repo] factory`, `[deploy] repo` or the `[direction]` repo; `source_path` is the
+directory holding the copy's `src/` (default: the repo root). The bench fetches that commit, anonymously when
+the GitHub App is not installed on a public repo, and deploys `<source_path>/src`. A path that is absolute,
+contains `..`, or reaches outside the checkout through a symlink is refused. The baseline is a commit of the same repo (`baseline_sha`, a SHA or a ref of it), built from the same
+`<source_path>/src` and deployed to bench environments the same way; the two arms then differ only by the change.
+With no `source_repo` the baseline is `[repo] factory`'s root, as before. A profile with no `[repo] factory` takes
+`[loop] repo` and `path` as the default source.
+
+The candidate lands in `bench-c<12 hex>-<n>` (and `-sub`) environments, the digest being of (repo, path, commit):
+never a production environment, never shared with another candidate, and apart from the `bench-<sha7>-<n>`
+environments of an ordinary benchmark. The result summary records `source`. Nothing here writes `[deploy]` or
+the deployer's state; promoting a candidate means merging it to the public engine's main like any other change.

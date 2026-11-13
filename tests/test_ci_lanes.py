@@ -156,15 +156,41 @@ def test_a_loop_pull_request_cannot_change_what_ci_skips():
     assert _loop.classify([".github/ci_lanes.py"]) == "needs_owner"
 
 
-# The public-cutover checks.sh, which runs both lanes as children (`_slow_lane --no-local --on-demand`): fast
-# lane retried after the slow one, exit 74 terminal. Other projects' harness scripts call `_slow_lane` their
-# own way and are not held to this contract. Harness directories are left out of the public tree, so there
-# the list is empty and these tests collect no cases (an empty parametrisation, not a skip).
+# The engine-as-target checks.sh, which runs both lanes as children through the launcher
+# (`$AGENT_FACTORY_TEST_LANE --no-local --on-demand`): fast lane retried after the slow one, exit 74
+# terminal. Other projects' harness scripts call the lane their own way and are not held to this contract.
+# Harness directories are left out of the public tree, so there the list is empty and these tests collect no
+# cases (an empty parametrisation, not a skip).
 _LANE_SCRIPTS = [
     p
-    for p in sorted(ROOT.glob(".claude-flyte/public-cutover/checks.sh"))
-    if "_slow_lane --no-local" in p.read_text()
+    for p in sorted(ROOT.glob(".claude-flyte/engine-as-target/checks.sh"))
+    if "AGENT_FACTORY_TEST_LANE" in p.read_text()
 ]
+
+
+def _lane_env(root: Path, bin_dir: Path) -> dict[str, str]:
+    """The pre-review's environment for the script, with `launcher.py` as the lane launcher.
+
+    The fake `python3` answers the script's probe for the controller extension and its image lookup (`-`);
+    `launcher.py` gets the lane's arguments, as the real launcher does.
+    """
+    (bin_dir / "python3").write_text(
+        "#!/bin/bash\n"
+        "[[ $1 == -c ]] && exit 0\n"
+        "[[ $1 == - ]] && { echo IMAGE=test-image; exit 0; }\n"
+        'exec "$@"\n'
+    )
+    (bin_dir / "python3").chmod(0o755)
+    lane = bin_dir / "test-lane"
+    lane.write_text(f'#!/bin/bash\nexec {sys.executable} {root / "launcher.py"} "$@"\n')
+    lane.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "AGENT_FACTORY_SLOW_LANE": "child",
+        "AGENT_FACTORY_TEST_LANE": str(lane),
+        "AGENT_FACTORY_PYTEST_JUNIT_DIR": "",
+    }
 
 
 def _gone(pid: int, within: float = 2.0) -> bool:
@@ -224,13 +250,7 @@ def test_terminating_the_checks_script_stops_its_launcher(script, fast_lane, tmp
         "pathlib.Path(f'{lane}-child.pid').write_text(str(os.getpid()))\n"
         "time.sleep(60)\n"
     )
-    env = {
-        **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "AGENT_FACTORY_SLOW_LANE": "child",
-        "AGENT_FACTORY_SLOW_LANE_PYTHON": f"{sys.executable} {root / 'launcher.py'}",
-        "AGENT_FACTORY_PYTEST_JUNIT_DIR": "",
-    }
+    env = _lane_env(root, bin_dir)
     if fast_lane == "here":
         env.update(FAKE_FAST_EXIT="75", FAKE_SLOW_EXIT="0")  # the slow lane is done; its node is free
     pid_files = ["slow-child.pid", "fast-child.pid"] if fast_lane == "child" else ["fast-here.pid"]
@@ -288,13 +308,7 @@ def test_a_lane_whose_upload_failed_fails_the_checks_without_a_local_run(script,
     (root / "launcher.py").write_text(
         "import sys\nif sys.argv[1] == '-':\n    print('IMAGE=test-image')\n    sys.exit(0)\nsys.exit(74)\n"
     )
-    env = {
-        **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "AGENT_FACTORY_SLOW_LANE": "child",
-        "AGENT_FACTORY_SLOW_LANE_PYTHON": f"{sys.executable} {root / 'launcher.py'}",
-        "AGENT_FACTORY_PYTEST_JUNIT_DIR": "",
-    }
+    env = _lane_env(root, bin_dir)
     proc = subprocess.run(
         ["bash", str(script.relative_to(ROOT))], cwd=root, env=env, capture_output=True, timeout=60
     )
@@ -354,13 +368,7 @@ def test_an_unplaced_slow_lane_runs_here_while_the_fast_lane_tries_a_child_again
         "pathlib.Path('fast-retry.saw').write_text(str(pathlib.Path('slow-here.started').exists()))\n"
         "sys.exit(0)\n"
     )
-    env = {
-        **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "AGENT_FACTORY_SLOW_LANE": "child",
-        "AGENT_FACTORY_SLOW_LANE_PYTHON": f"{sys.executable} {root / 'launcher.py'}",
-        "AGENT_FACTORY_PYTEST_JUNIT_DIR": "",
-    }
+    env = _lane_env(root, bin_dir)
     proc = subprocess.run(
         ["bash", str(script.relative_to(ROOT))], cwd=root, env=env, capture_output=True, timeout=60
     )

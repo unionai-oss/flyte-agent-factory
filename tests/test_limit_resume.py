@@ -80,10 +80,31 @@ async def tick(n=0.03):
     await asyncio.sleep(n)
 
 
+class _CountingQueue(_Queue):
+    """A note queue that counts the pump's passes; it drains notes at the top of every one."""
+
+    passes = 0
+
+    def drain_notes(self) -> list[str]:
+        self.passes += 1
+        return super().drain_notes()
+
+
 async def start(proc: _BaseProc):
-    bridge, tl, stop = _Queue(), _timeline._Timeline(), asyncio.Event()
+    bridge, tl, stop = _CountingQueue(), _timeline._Timeline(), asyncio.Event()
     pump = asyncio.create_task(_supervise._pump(cast(Bridge, bridge), cast(ClaudeProcess, proc), tl, stop))
     return bridge, tl, stop, pump
+
+
+async def settle(bridge: _CountingQueue, passes=2):
+    """Wait until the pump has seen the state as it is now, however slowly it is scheduled.
+
+    Not a sleep: under load the pump can miss the whole of a short one, and the test's clock jumps would then
+    reach it all at once. A pass that starts after this call has read what the test set before it; the one
+    after that has finished acting on it.
+    """
+    target = bridge.passes + passes
+    await wait_for(lambda: bridge.passes >= target, what="the pump to go round again")
 
 
 async def finish(stop, pump):
@@ -141,7 +162,7 @@ async def test_stale_notice_after_carry_on_does_not_repeat_resume(monkeypatch, o
     now = _clock(monkeypatch, WALL0)
     proc = _Proc()
     proc.output_count = 0
-    _bridge, tl, stop, pump = await start(proc)
+    bridge, tl, stop, pump = await start(proc)
     await proc.submit(FINDINGS)
     now["t"] += 33
     proc.limit_hit_at = now["t"]
@@ -154,12 +175,13 @@ async def test_stale_notice_after_carry_on_does_not_repeat_resume(monkeypatch, o
     # old notice right after registers as a new hit with the same text
     now["t"] += 2
     proc.limit_hit_at = now["t"]
+    await settle(bridge)  # the pump judges the redraw while the resume is two seconds old
     # session works for 2 hours, with quiet gaps (thinking / long command) but no note
     for i in range(8):
         now["t"] += 15 * 60
         proc.output_count += output
         proc.last_output = now["t"] - (120 if i % 2 else 0)
-        await tick()
+        await settle(bridge)
     ended = bool(rows(tl, "running again"))
     resends = len(rows(tl, "trying to resume"))
     await finish(stop, pump)
@@ -495,4 +517,33 @@ async def test_same_notice_after_a_new_direction_starts_an_episode(monkeypatch):
     now["t"] += 1
     proc.limit_hit_at = now["t"]
     await wait_for(lambda: len(rows(tl, "usage limit reached")) == 2)
+    await finish(stop, pump)
+
+
+@pytest.mark.asyncio
+async def test_a_finished_session_that_two_resumes_do_not_revive_says_a_human_must_look_once(monkeypatch):
+    """Without a router to ask (not the author's session), the cap can only say so, and says it once."""
+    now = _clock(monkeypatch, WALL0)
+    proc = _Proc()
+    bridge, tl, stop, pump = await start(proc)
+    bridge.push("DONE: delivered")
+    await wait_for(lambda: "send direction" in (tl._activity or ""))
+    await proc.submit("Please wrap up: run end-project")
+    now["t"] += 10
+    proc.limit_hit_at = now["t"]
+    proc.limit_text = "You've hit your limit"
+    proc.last_output = now["t"] - 120
+    await wait_for(lambda: rows(tl, "usage limit reached"))
+    rounds = 0
+    while not rows(tl, "still on the usage limit"):
+        assert rounds < 12, "the human-must-look row never appeared"
+        rounds += 1
+        now["t"] += _session_config.LIMIT_RETRY_S + 61
+        await settle(bridge)
+    assert rows(tl, "still on the usage limit after two tries; a human needs to look")
+    resumes = [s for s in proc.submitted if s.startswith("Your usage limit")]
+    assert len(resumes) == 2
+    now["t"] += 10 * _session_config.LIMIT_RETRY_S
+    await settle(bridge)
+    assert len(rows(tl, "still on the usage limit")) == 1
     await finish(stop, pump)

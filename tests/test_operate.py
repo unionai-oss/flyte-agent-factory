@@ -638,11 +638,14 @@ def test_every_package_module_loads_with_the_agent():
     # `_promote` runs from chat through ops/promote.py. `_slow_lane` runs as a subprocess and ships
     # via include.
     # The `_factory_*` modules are `_factory`'s own and ship with it (the slot env's `include`).
+    # `_bootstrap*` is the setup command (ops/bootstrap.py) run from an engine checkout on a person's machine.
     # `_grant_page` is `_factory_mcp`'s (the factory side); `_grants_cli` is the `credential-grant` command,
     # run by name in the session, so it is in the slot env's `include` too.
     assert out.stdout.strip() == (
         "_admission,_backlog,_bench,_bench_check,_bench_flow,_bench_logstats_files,_bench_stats,_bench_store,"
-        "_bench_suite,_board_events,_deploy,_deploy_apps,_deploy_child,_deployer,_factory,_factory_base,"
+        "_bench_suite,_board_events,_bootstrap,_bootstrap_base,_bootstrap_finish,_bootstrap_flyte,"
+        "_bootstrap_github,_bootstrap_keys,_bootstrap_profile,_bootstrap_steps,_deploy,_deploy_apps,_deploy_child,_deployer,"
+        "_factory,_factory_base,"
         "_factory_grants,_factory_live,_factory_mcp,_factory_meters,_factory_policy,_factory_recreate,"
         "_factory_status,_grant_page,_grants_cli,_loop,_loop_flow,"
         "_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_slow_lane,_webhook,voice"

@@ -1085,8 +1085,8 @@ def benchmark_world(world, monkeypatch):
         def append_case(self, row):
             self.rows.append(row)
 
-        def baseline_records(self, sha, policy, digest, task, repeat, age, model="opus"):
-            # The real store's filters: same model, and a harness fault is never a baseline.
+        def baseline_records(self, sha, policy, digest, task, repeat, age, model="opus", engine_source=""):
+            # The real store's filters: same model and engine source, and a harness fault is never a baseline.
             self.reuses.append((sha, policy, digest, task, repeat, age))
             return next(
                 (
@@ -1095,6 +1095,7 @@ def benchmark_world(world, monkeypatch):
                     if (r["engine_sha"], r["policy"], r["suite_digest"], r["task"], r["repeat"])
                     == (sha, policy, digest, task, repeat)
                     and r.get("model", "opus") == model
+                    and r.get("engine_source", "") == engine_source
                     and r.get("outcome") not in _bench_store.RETRYABLE
                 ),
                 None,
@@ -1167,6 +1168,49 @@ def test_benchmark_two_arms_abba_and_verdict(benchmark_world):
     assert "no A/A band" in _bench.render_report(store.rows, result, title="test")
 
 
+def test_a_candidate_source_gives_the_baseline_the_same_repo_and_subtree(benchmark_world, monkeypatch):
+    _, _, launched = benchmark_world
+    resolved, deployed = [], []
+
+    def resolve(app, ref, source=None):
+        resolved.append((ref, source))
+        return {"main": "f" * 40}.get(ref, ref)
+
+    async def deploy(sha, source_repo="", source_path=""):
+        deployed.append((sha, source_repo, source_path))
+        return [f"bench-{sha[:7]}-1"]
+
+    monkeypatch.setattr(_bench_flow, "resolve_sha", resolve)
+    monkeypatch.setattr(_bench_flow, "deploy_engine", deploy)
+    source = _bench.Source("example-org/direction", "projects/engine")
+    summary, _ = asyncio.run(
+        _bench_flow.benchmark.func(
+            SHA,
+            baseline_sha="main",
+            max_usd=1000,
+            source_repo="example-org/direction",
+            source_path="projects/engine",
+        )
+    )
+    # The baseline is a commit of the candidate's repo, and its engine is the same subtree's `src/`.
+    assert resolved == [(SHA, source), ("main", source)]
+    assert deployed == [(SHA, source.repo, source.path), ("f" * 40, source.repo, source.path)]
+    assert {c["arm"] for c in launched} == {"candidate", "baseline"}
+    assert json.loads(summary)["baseline_sha"] == "f" * 40
+
+
+def test_without_a_source_the_baseline_stays_in_the_factory_repo(benchmark_world, monkeypatch):
+    resolved = []
+
+    def resolve(app, ref, *source):
+        resolved.append((ref, source))
+        return {"main": "f" * 40}.get(ref, ref)
+
+    monkeypatch.setattr(_bench_flow, "resolve_sha", resolve)
+    asyncio.run(_bench_flow.benchmark.func(SHA, baseline_sha="main", max_usd=1000))
+    assert resolved == [(SHA, ()), ("main", ())]
+
+
 def test_benchmark_reuses_baseline(benchmark_world):
     store, _, launched = benchmark_world
     for case in _bench.plan_cases("old", "f" * 40, [], 2, {}, "opus"):
@@ -1180,6 +1224,66 @@ def test_benchmark_reuses_baseline(benchmark_world):
     rows = [json.loads(line) for line in jsonl.splitlines()]
     assert len(rows) == len(launched) * 2
     assert all(r["bench_run"] == "r1" for r in rows)
+
+
+def test_a_candidate_source_never_reuses_a_baseline_stored_by_sha(benchmark_world, monkeypatch):
+    # The store keys baselines by engine SHA, not by repo and subtree: one measured from another source at
+    # the same SHA is a different engine, so a sourced benchmark measures its own baseline.
+    store, _, launched = benchmark_world
+    for case in _bench.plan_cases("old", "f" * 40, [], 2, {}, "opus"):
+        measured = {**_bench.error_record({**case, "env": "old-env"}, "old", now=1), "outcome": "failed"}
+        store.rows.append(measured)
+
+    async def deploy(sha, source_repo="", source_path=""):
+        return [f"bench-{sha[:7]}-1"]
+
+    monkeypatch.setattr(_bench_flow, "resolve_sha", lambda app, ref, source=None: ref)
+    monkeypatch.setattr(_bench_flow, "deploy_engine", deploy)
+    summary, _ = asyncio.run(
+        _bench_flow.benchmark.func(
+            SHA,
+            baseline_sha="f" * 40,
+            max_usd=1000,
+            source_repo="example-org/direction",
+            source_path="projects/engine",
+        )
+    )
+    assert not store.reuses
+    assert {c["arm"] for c in launched} == {"candidate", "baseline"}
+    assert not json.loads(summary).get("reused_baselines")
+
+
+def test_a_baseline_a_sourced_run_measured_is_never_reused_by_a_root_benchmark(benchmark_world, monkeypatch):
+    # The sourced run measured `<source_path>/src` of another repo at that SHA: a different engine from the
+    # engine repo's root at the same SHA, so a later benchmark without a source must measure its own.
+    from types import SimpleNamespace
+
+    store, _, launched = benchmark_world
+    run_name = "r1"
+    monkeypatch.setattr(flyte, "ctx", lambda: SimpleNamespace(action=SimpleNamespace(run_name=run_name)))
+
+    async def deploy(sha, source_repo="", source_path=""):
+        return [f"bench-{sha[:7]}-1"]
+
+    monkeypatch.setattr(_bench_flow, "resolve_sha", lambda app, ref, source=None: ref)
+    monkeypatch.setattr(_bench_flow, "deploy_engine", deploy)
+    asyncio.run(
+        _bench_flow.benchmark.func(
+            SHA,
+            baseline_sha="f" * 40,
+            max_usd=1000,
+            source_repo="example-org/direction",
+            source_path="projects/engine",
+        )
+    )
+    sourced = [r for r in store.rows if r["bench_run"] == "r1"]
+    assert {r["engine_source"] for r in sourced} == {"example-org/direction:projects/engine"}
+    run_name = "r2"
+    launched.clear()
+    summary, _ = asyncio.run(_bench_flow.benchmark.func(SHA, baseline_sha="f" * 40, max_usd=1000))
+    assert not json.loads(summary).get("reused_baselines")
+    assert {c["arm"] for c in launched} == {"candidate", "baseline"}
+    assert all("engine_source" not in r for r in store.rows if r["bench_run"] == "r2")
 
 
 def test_aa_is_recorded_and_never_reused(benchmark_world):

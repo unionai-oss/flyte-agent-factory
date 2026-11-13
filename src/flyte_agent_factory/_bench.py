@@ -20,7 +20,8 @@ import statistics
 import tomllib
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
 
 # Writes the bench profile, which tomllib cannot. flyte depends on `toml`, so every image has it.
@@ -96,18 +97,69 @@ def check_sha(sha: str) -> str:
     return sha
 
 
-def bench_envs(sha: str, count: int) -> list[str]:
+@dataclass(frozen=True)
+class Source:
+    """Where a candidate engine lives when it is not the root of `[repo] factory`: `repo` and a subtree.
+
+    The subtree is the directory holding the engine's `src/`, relative to the checkout (a modified engine
+    copy imported into `projects/<name>/` of a workspace repo). `__post_init__` refuses a path that is
+    absolute or climbs with `..` and normalises the rest; symlinks need the checkout, see `candidate_src`.
+    """
+
+    repo: str  # `owner/repo`
+    path: str = ""
+
+    def __post_init__(self) -> None:
+        raw = PurePosixPath(self.path)
+        if raw.is_absolute() or ".." in raw.parts:
+            raise ValueError(f"candidate subtree {self.path!r} must be relative and stay inside the checkout")
+        object.__setattr__(self, "path", "/".join(raw.parts))
+
+    @property
+    def key(self) -> str:
+        """`<repo>:<path>`, the `engine_source` of a case record: the SHA alone does not name the engine."""
+        return f"{self.repo}:{self.path}"
+
+
+def candidate_src(tree: Path, subtree: str) -> Path:
+    """Return `<tree>/<subtree>/src`, refusing one that resolves outside `tree`.
+
+    `Source` refuses `..` lexically; this closes the rest: a symlink in the fetched tree, on any component
+    of the path or `src` itself, pointing outside the checkout. Resolving follows every link.
+    """
+    root = tree.resolve()
+    src = (root / subtree / "src").resolve()
+    if not src.is_relative_to(root):
+        raise ValueError(f"candidate subtree {subtree!r} resolves outside the checkout")
+    if not src.is_dir():
+        raise ValueError(f"candidate subtree {subtree!r} has no src/")
+    # The bundle carries what a link under src/ points at: one out of the checkout ships unreviewed files.
+    for path in src.rglob("*"):
+        if path.is_symlink() and not path.resolve().is_relative_to(root):
+            raise ValueError(
+                f"{path.relative_to(src)} in candidate subtree {subtree!r} links outside the checkout"
+            )
+    return src
+
+
+def bench_envs(sha: str, count: int, source: Source | None = None) -> list[str]:
     """Return the bench env names for engine `sha`, one per concurrent case: `bench-<sha7>-<i>`.
 
     Named apart from every slot, so `_factory.operated_live`, `free_slot` and the queue, which list by
     slot task name, never see a bench case; and deploying one never moves production, which launches
     `<slot>.project` at its latest version.
+
+    A candidate from a `source` is `bench-c<12 hex of (repo, subtree, sha)>-<i>`: apart from
+    `bench-<sha7>-<i>` by its `c` and its length, and from every other candidate by the digest.
     """
     check_sha(sha)
-    return [f"bench-{sha[:7]}-{i}" for i in range(1, count + 1)]
+    if source is None:
+        return [f"bench-{sha[:7]}-{i}" for i in range(1, count + 1)]
+    digest = hashlib.sha256(f"{source.repo.lower()}\0{source.path}\0{sha}".encode()).hexdigest()[:12]
+    return [f"bench-c{digest}-{i}" for i in range(1, count + 1)]
 
 
-def bench_profile(profile: _profile.Profile, sha: str) -> _profile.Profile:
+def bench_profile(profile: _profile.Profile, sha: str, source: Source | None = None) -> _profile.Profile:
     """Return the profile engine `sha`'s bench envs are deployed with: production's, cut down.
 
     Its slots are `[bench] token_concurrency` envs on the bench token, its project repository is the bench
@@ -120,6 +172,12 @@ def bench_profile(profile: _profile.Profile, sha: str) -> _profile.Profile:
     bench = profile.bench
     if bench is None:
         raise ValueError("the profile has no [bench] table")
+    envs = bench_envs(sha, bench.token_concurrency, source)
+    production = {name for slot in profile.slots for name in (slot.env, slot.subagent_env)}
+    production |= {identity.app for identity in profile.browser.identities}
+    for env in (name for base in envs for name in (base, f"{base}-sub")):
+        if any(env.startswith(name) or name.startswith(env) for name in production):
+            raise ValueError(f"bench env {env!r} would collide with a production environment")
     data = tomllib.loads(profile.text)
     for key in _NOT_FOR_BENCH:
         data.pop(key, None)
@@ -128,9 +186,7 @@ def bench_profile(profile: _profile.Profile, sha: str) -> _profile.Profile:
     data["policy"] = {
         k: v for k, v in data.get("policy", {}).items() if "ENGINE" not in k and "CODEX" not in k
     }
-    data["slots"] = [
-        {"env": env, "subagent_env": f"{env}-sub"} for env in bench_envs(sha, bench.token_concurrency)
-    ]
+    data["slots"] = [{"env": env, "subagent_env": f"{env}-sub"} for env in envs]
     data["cap"] = bench.token_concurrency
     parsed = _profile.parse(toml.dumps(data), f"bench profile for {sha[:7]}")
     # The standards are production's, as captured when this pod was deployed.
@@ -544,8 +600,10 @@ FIELDS: dict[str, tuple[type, ...]] = {
 }
 
 
-#: Fields a record may carry but need not: only a reused baseline has `reused_from` (its source case).
-OPTIONAL_FIELDS: dict[str, tuple[type, ...]] = {"reused_from": (dict,)}
+#: Fields a record may carry but need not: only a reused baseline has `reused_from` (its source case), and
+#: only a case of a sourced engine has `engine_source` (`Source.key`); without it the engine is the root of
+#: `[repo] factory`, as in every record written before the field existed.
+OPTIONAL_FIELDS: dict[str, tuple[type, ...]] = {"reused_from": (dict,), "engine_source": (str,)}
 
 
 def validate(record: Mapping[str, Any]) -> None:
@@ -701,6 +759,7 @@ def case_record(
                 "repeat",
             )
         },
+        **({"engine_source": case["engine_source"]} if case.get("engine_source") else {}),
         "case_run": run["name"],
         "case_url": run["url"],
         "start_sha": harness.get("start_sha"),

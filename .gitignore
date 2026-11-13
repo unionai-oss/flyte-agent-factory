@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 dist/
+!skills/dist/
 ops/.watch.log
 ops/.watch.pid
 ops/.watch.kick

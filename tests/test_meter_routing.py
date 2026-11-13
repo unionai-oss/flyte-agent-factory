@@ -521,3 +521,23 @@ def test_a_full_meter_ranks_the_slots_last_but_does_not_close_them(monkeypatch):
     assert headroom == {one: 0.0, two: 0.0}
     assert _factory_meters.free_slot([], headroom=headroom) == one
     assert _factory_meters.free_slot([_slotted("busy", one)], headroom=headroom) == two
+
+
+@pytest.mark.parametrize("purpose", ["author", "delegate", "planner", "contract", *sorted(_usage._QA_ROLES)])
+def test_every_purpose_routes_to_the_engine_with_quota(engines, purpose, monkeypatch):
+    """#125 criterion 4: codex at its weekly limit, claude usable, nothing pinned -> claude, any role."""
+    for key in (
+        "PLANNER",
+        "DELEGATE",
+        "CONTRACT",
+        "AUTHOR",
+        "COORDINATOR",
+        "JUDGE",
+        *(p.upper() for p in _usage._QA_ROLES),
+    ):
+        monkeypatch.delenv(f"AGENT_FACTORY_{key}_ENGINE", raising=False)
+    engines.store.update(_claude(20))
+    engines.store.note_limit("codex", time.time() + 5 * 86400)
+    for _attempt in range(3):
+        decision = _usage._route(purpose, None)
+        assert decision.engine == "claude", (purpose, decision.row())

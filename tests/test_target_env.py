@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import urllib.error
@@ -132,6 +133,13 @@ def test_the_runner_env_keeps_the_basics_and_drops_credentials(monkeypatch, tmp_
     assert not set(PLANTED) & set(env)
     assert env["PATH"] == os.environ["PATH"] and env["LC_ALL"] == "C.UTF-8"
     assert env["GITHUB_REPOSITORY"] == "acme/widgets" and env["GITHUB_SHA"] == "a" * 40
+
+
+def test_the_runner_env_keeps_where_the_machine_installed_its_browsers(monkeypatch, tmp_path):
+    # A workflow's install step that sets it up is not run: the machine's own browsers are what a test uses.
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
+    env = _target_run.runner_env(tmp_path, tmp_path / "state", "acme/widgets", "a" * 40)
+    assert env["PLAYWRIGHT_BROWSERS_PATH"] == "/ms-playwright"
 
 
 # -- toolchains --
@@ -1010,3 +1018,131 @@ def test_coverage_findings_are_the_failing_test_ids_when_pytest_names_them():
         "tests/test_a.py::test_one",
         "tests/test_b.py::test_two",
     }
+
+
+def test_a_uv_is_installed_while_another_job_runs_the_cached_one(monkeypatch, tmp_path):
+    # Two promotions (or a promotion and a gate) on one machine share the cache: rewriting a running
+    # binary in place fails with "Text file busy", so the new one is renamed over it.
+    directory = tmp_path / "uv"
+    directory.mkdir()
+    shutil.copy(shutil.which("sleep") or "/bin/sleep", directory / "uv")
+    running = subprocess.Popen([str(directory / "uv"), "30"])
+    try:
+        _release(monkeypatch)
+        assert _target_tools._install_uv(directory, "latest") == ""
+        assert "uv 0.13.4" in (directory / "uv").read_text()
+        assert (directory / "verified.sha256").is_file()
+    finally:
+        running.kill()
+        running.wait()
+
+
+# -- artifact steps the gate performs itself ------------------------------------------------------
+
+
+def _upload(tmp_path, **inputs):
+    """Run an upload-artifact step in `tmp_path/ws`, storing into `tmp_path/store`; return (code, output)."""
+    return _target_run._upload(inputs, tmp_path / "ws", tmp_path / "store")
+
+
+def _workspace(tmp_path, files):
+    for name, text in files.items():
+        (tmp_path / "ws" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "ws" / name).write_text(text)
+
+
+def _stored(tmp_path, name):
+    root = tmp_path / "store" / name
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def test_an_upload_takes_the_files_a_glob_names_and_not_the_others(tmp_path):
+    _workspace(tmp_path, {"out/a.xml": "a", "out/b.txt": "b", "out/deep/c.xml": "c"})
+    code, output = _upload(tmp_path, name="junit", path="out/**/*.xml")
+    assert code == 0 and "2 file(s)" in output
+    assert _stored(tmp_path, "junit") == ["a.xml", "deep/c.xml"]
+
+
+def test_an_upload_refuses_a_name_that_would_leave_the_run_storage(tmp_path):
+    _workspace(tmp_path, {"a.txt": "a"})
+    for name in ("../escape", "a/b", ".."):
+        code, output = _upload(tmp_path, name=name, path="a.txt")
+        assert code == 1 and output == f"invalid artifact name `{name}`"
+    assert not (tmp_path / "store").exists()
+
+
+def test_an_upload_of_several_paths_is_rooted_at_their_common_ancestor(tmp_path):
+    _workspace(tmp_path, {"one/a.txt": "a", "two/b.txt": "b"})
+    code, _ = _upload(tmp_path, name="both", path="one/a.txt\ntwo/b.txt")
+    assert code == 0
+    assert _stored(tmp_path, "both") == ["one/a.txt", "two/b.txt"]
+
+
+def test_an_upload_leaves_hidden_files_out_unless_asked(tmp_path):
+    _workspace(tmp_path, {"out/.secret": "s", "out/shown.txt": "v", "out/.cache/x.txt": "x"})
+    _upload(tmp_path, name="plain", path="out/")
+    assert _stored(tmp_path, "plain") == ["shown.txt"]
+    _upload(tmp_path, name="all", path="out/", **{"include-hidden-files": "true"})
+    assert _stored(tmp_path, "all") == [".cache/x.txt", ".secret", "shown.txt"]
+
+
+def test_a_second_upload_under_the_same_name_is_refused_unless_it_overwrites(tmp_path):
+    _workspace(tmp_path, {"a.txt": "first"})
+    assert _upload(tmp_path, name="out", path="a.txt")[0] == 0
+    _workspace(tmp_path, {"b.txt": "second"})
+    code, output = _upload(tmp_path, name="out", path="b.txt")
+    assert code == 1 and output == "an artifact named `out` already exists in this run"
+    assert _stored(tmp_path, "out") == ["a.txt"]
+    code, _ = _upload(tmp_path, name="out", path="b.txt", overwrite="true")
+    assert code == 0 and _stored(tmp_path, "out") == ["b.txt"]
+
+
+def test_a_download_of_an_artifact_no_job_uploaded_fails_with_githubs_message(tmp_path):
+    (tmp_path / "ws").mkdir()
+    code, output = _target_run._download({"name": "nope"}, tmp_path / "ws", tmp_path / "store")
+    assert code == 1
+    assert output == "Unable to download artifact(s): Artifact not found for name: nope"
+
+
+def test_a_job_replayed_on_the_base_downloads_what_the_head_uploaded(checkout, tmp_path):
+    uploaded = tmp_path / "head-artifacts"
+    (uploaded / "junit").mkdir(parents=True)
+    (uploaded / "junit/head.xml").write_text("from the head\n")
+    items = [
+        _target_ci.Command(
+            "", "ci.yml:1", action="download-artifact", inputs=(("name", "junit"), ("path", "got"))
+        ),
+        _target_ci.Command("grep -q 'from the head' got/head.xml", "ci.yml:2"),
+    ]
+    runs, _ = _target_run.runs_on_base(checkout, items, "", uploaded)
+    assert [run.code for run in runs] == [0, 0], [run.output for run in runs]
+    assert (uploaded / "junit/head.xml").read_text() == "from the head\n"  # the head's copy is untouched
+
+
+@pytest.mark.parametrize(
+    ("base", "then"),
+    [
+        (_target_run.Run(1, "", not_run="no cargo here"), "(on the unpatched base the same command not run)"),
+        (
+            _target_run.Run(0, "", skipped="an earlier step failed (`make`)"),
+            "(on the unpatched base the same command is skipped: an earlier step failed (`make`))",
+        ),
+    ],
+)
+def test_a_head_failure_beside_a_base_that_did_not_run_the_command_says_so(checkout, monkeypatch, base, then):
+    item = _target_ci.Command("make test", "ci.yml:1")
+    run = _target_run.Run(2, "boom\n", str(checkout))
+    judged = _judged_against(monkeypatch, checkout, item, run, base)
+    assert len(judged.failures) == 1 and judged.failures[0].endswith(then), judged
+
+
+def test_a_checkout_that_cannot_be_copied_fails_the_gate_and_says_why(checkout, monkeypatch):
+    def cannot_copy(*args, **kwargs):
+        raise _target_run.WorktreeUnavailable("fatal: cannot create worktree")
+
+    monkeypatch.setattr(_target_run, "run_jobs", cannot_copy)
+    result = _verdict(checkout, _named("lint", ["true"]))
+    assert result.status is _gate_base.Status.FAIL
+    assert (
+        result.output == "cannot copy the checkout to run the target's CI in:\nfatal: cannot create worktree"
+    )

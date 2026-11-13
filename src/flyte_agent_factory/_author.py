@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ from flyte_agent_factory import (
     _codex_auth,
     _inbox,
     _meter,
-    _names,
+    _pins,
     _policy,
     _router,
     _secret_env,
@@ -41,6 +42,7 @@ from flyte_agent_factory import (
 )
 from flyte_agent_factory._author_session import AuthorSession
 from flyte_agent_factory._bridge import (
+    DEFAULT_ASK_TIMEOUT_S,
     _write_atomic,
 )
 
@@ -207,20 +209,165 @@ def _restore_refusal(session: AuthorSession, owner: dict[str, Any]) -> None:
 
 
 def _author_refusal_route(
-    pin: str, timeline: _timeline._Timeline, refused: str, reset_at: float
+    pin: _pins.Pin, timeline: _timeline._Timeline, refused: str, reset_at: float | None
 ) -> _router.Decision:
     available = _usage._author_engines()
     meters = {e: _author_meter(e) for e in available}
     meter = _author_meter(refused) or _meter.Meter(refused, "refusal", time.time())
-    meters[refused] = replace(meter, limited_until=max(reset_at, meter.limited_until or 0))
+    meters[refused] = replace(meter, limited_until=max(reset_at or 0.0, meter.limited_until or 0.0) or None)
+    # Never prefer the engine that refused: once its remembered reset passed, "preferred wins" kept the
+    # author on it every 30 minutes while the other engine sat free (#125).
+    others = [e for e in available if e != refused]
     return _router.route(
         "author",
         meters,
         available=available,
         now=time.time(),
-        preferred=refused,
-        pin=pin,
-        hard_pin=_usage._hard_pins,
+        preferred=pin.engine or (others[0] if others else refused),
+        pin=pin.engine,
+        hard_pin=pin.hard,
+        retry_s=_session_config.LIMIT_RETRY_S,
+    )
+
+
+def _when(at: float) -> str:
+    """Return `at` as a person reads a reset that may be days away, e.g. `Mon 16 Nov 00:40 UTC`."""
+    return f"{datetime.fromtimestamp(at, timezone.utc):%a %d %b %H:%M} UTC"
+
+
+def _clock(at: float) -> str:
+    """Return `at` as the router rows show a retry time, e.g. `22:40 UTC`."""
+    return f"{datetime.fromtimestamp(at, timezone.utc):%H:%M} UTC"
+
+
+def _pin_why(pin: _pins.Pin) -> str:
+    """Say what holds `pin`, for the paused row's reason not to use another engine."""
+    if pin.source == "direction":
+        return "operator direction"
+    if pin.source == "benchmark hard_pin":
+        return "benchmark hard_pin"
+    if pin.source == "allowance":
+        return "no engine switch left in this run"
+    fallback = _policy.read("ENGINE_FALLBACK").strip()
+    return f'ENGINE_FALLBACK="{fallback}"' if fallback else "ENGINE_FALLBACK unset"
+
+
+def _pin_fix(pin: _pins.Pin) -> str:
+    """Say what would lift `pin`, for the text that asks a human to unblock the coordinator."""
+    if pin.source == "direction":
+        return "send a direction to resume on the other engine (`resume on <engine>`)"
+    if pin.source == "benchmark hard_pin":
+        return "rerun the benchmark without hard_pin"
+    if pin.source == "allowance":
+        return "relaunch the project (this run has used its engine switches)"
+    return 'set ENGINE_FALLBACK="allow"'
+
+
+def _ask_human(timeline: _timeline._Timeline, text: str) -> None:
+    """Say on the timeline that the coordinator cannot continue on its own, and notify the owner."""
+    timeline.row("🚨", f"a human needs to look: {text}")
+    if timeline.bridge is not None:
+        try:
+            timeline.bridge.notify_owner(
+                f"The coordinator is paused and cannot continue on its own: {text}", DEFAULT_ASK_TIMEOUT_S
+            )
+        except OSError as exc:
+            timeline.row("⚠️", f"could not ask the owner: {type(exc).__name__}: {exc}")
+
+
+def _permitted(pin: _pins.Pin, engine: str) -> bool:
+    """Whether the coordinator may run on `engine` under `pin`: a hard pin allows only its own engine."""
+    return not (pin.engine and pin.hard) or engine == pin.engine
+
+
+def _reset_known(
+    decision: _router.Decision, pin: _pins.Pin, refused: str, refused_known: bool, refused_until: float
+) -> bool:
+    """Whether an engine the coordinator may use has a known reset still ahead.
+
+    The refused engine's own time counts only when a notice, meter or saved record gave it: the
+    LIMIT_RETRY_S fallback is a guess, and counting it hid an engine that refuses for good (#125). The
+    permitted engines come from the pin, not from `decision.pin`, which the router sets only on a deferral.
+    """
+    now = time.time()
+    if refused_known and refused_until > now:
+        return True
+    return any(
+        c.usable_at is not None and c.usable_at > now
+        for c in decision.candidates
+        if c.engine != refused and _permitted(pin, c.engine)
+    )
+
+
+def _known_resets(pin: _pins.Pin, refused: str, refused_known: bool, refused_until: float) -> list[float]:
+    """Return the resets, past or ahead, that the meters know for the engines the coordinator may use.
+
+    Read live, so a reset a meter learns while a finished session waits out its backoff ends the wait. The
+    refused engine's own LIMIT_RETRY_S guess is left out: the handoff notes it on the meter too, and it is
+    not a reset.
+    """
+    resets = [refused_until] if refused_known else []
+    for engine in _usage._author_engines():
+        meter = _author_meter(engine) if _permitted(pin, engine) else None
+        at = meter.limited_until if meter else None
+        if at is None or (engine == refused and not refused_known and at == refused_until):
+            continue
+        resets.append(at)
+    return resets
+
+
+def _no_reset_text(engine: str, pin: _pins.Pin | None = None) -> str:
+    """Return the human-needed text for an engine refusing a finished session with no reset time.
+
+    `pin` is the one the last route ran under, which is the allowance pin once the switches are used up.
+    """
+    text = f"{engine} keeps refusing with no reset time; restore its quota or {_router._FIX[engine]}"
+    pin = pin or _pins.author_pin()
+    others = [e for e in _usage._author_engines() if e != engine]
+    if others and pin.engine == engine and pin.hard:
+        text += f", or {_pin_fix(pin)} to use {' or '.join(_with_limit(e) for e in others)}"
+    return text
+
+
+def _with_limit(engine: str) -> str:
+    """`engine`, with the reset it waits for when it is limited too: lifting a pin alone would not run it."""
+    meter = _author_meter(engine)
+    until = meter.limited_until if meter else None
+    return f"{engine} (limited until {_when(until)})" if until and until > time.time() else engine
+
+
+def _latest_claude_thread() -> str:
+    """Return the id of the newest Claude conversation in this workspace, or "" when there is none."""
+    transcripts = _inbox._session_transcripts(_session_config.CONFIG_DIR, _session_config.WORKSPACE)
+    if not transcripts:
+        return ""
+    return max(transcripts, key=lambda p: p.stat().st_mtime).stem
+
+
+def _direct_engine(session: asyncio.Future[Any], engine: str) -> str:
+    """Pin the coordinator to `engine` as the operator directed; return the row that says what happens.
+
+    A paused session re-routes on the pump's next tick instead of at the next reset; a running one keeps
+    its engine until it next pauses or the pod restarts.
+    """
+    _pins.set_direction_pin(engine)
+    proc = session.result() if session.done() and not session.cancelled() else None
+    if isinstance(proc, AuthorSession) and proc._paused:
+        proc.reroute_requested = True
+        return f"engine direction: resume on {engine}; re-routing the paused session now"
+    return f"engine direction: next pause or restart runs on {engine}"
+
+
+def _pin_row(pin: _pins.Pin, until: str, others: list[str]) -> str:
+    """Return the row that says once per pause why a pinned coordinator waits instead of moving."""
+    instead = f" instead of moving to {' or '.join(others)}" if others else ""
+    if pin.source == "direction":
+        return f"coordinator directed to resume on {pin.engine}, so it waits until {until}{instead}"
+    if pin.source == "benchmark hard_pin":
+        return f"coordinator pinned to {pin.engine} by hard_pin, so it waits until {until}{instead}"
+    return (
+        f'coordinator pinned to {pin.engine} by {pin.source}; ENGINE_FALLBACK is not "allow", '
+        f"so it waits for {pin.engine} until {until}{instead}"
     )
 
 
@@ -243,24 +390,80 @@ class AuthorHandoffRestart(RuntimeError):
 
 
 def _author_handoff(
-    session: AuthorSession, state: Any, timeline: _timeline._Timeline, *, pin: str, brief: str
+    session: AuthorSession, state: Any, timeline: _timeline._Timeline, *, brief: str
 ) -> Callable[..., Awaitable[bool]]:
     refused_engine = ""
     refused_until = 0.0
+    refused_known = False
     refused_hit = None
-    last_decision = None
+    last_decision: tuple[str | None, float | None] | None = None
     deferred_until = 0.0
+    # What this pause already said, so a tick that changes nothing writes nothing. Reset by a new refusal.
+    last_paused: tuple[str, float | None] | None = None
+    pin_rows: set[tuple[str, str]] = set()
+    allowance_noted = False
+    # Each distinct "a human needs to look" text is raised once per session, not once per pause.
+    asked: set[str] = set()
+
+    def note_pause(decision: _router.Decision, pin: _pins.Pin) -> None:
+        """Say who the paused coordinator waits for, until when and why not the other engine."""
+        nonlocal last_paused
+        p = _router.paused(decision, now=time.time(), pin_why=_pin_why(pin), pin_fix=_pin_fix(pin))
+        # The phase carries the pause on every deferral: the pump re-sets the phase after each one.
+        timeline.phase("limited", limited_until=session.retry_at, paused=p.as_dict())
+        if p.engine and p.engine == refused_engine and not refused_known and p.until == refused_until:
+            until = f"its reset (time unknown; checking again at {_when(session.retry_at or refused_until)})"
+        else:
+            until = _when(p.until) if p.until else "its reset (time unknown)"
+        if (p.engine, p.until) != last_paused:
+            last_paused = (p.engine, p.until)
+            why = "; ".join(f"{e}: {text}" for e, text in p.others.items())
+            waiting = f"waiting for {p.engine} until {until}" if p.engine else "no engine can run"
+            timeline.row("⏸️", f"coordinator paused, {waiting}" + (f"; not using {why}" if why else ""))
+        if decision.pinned and pin.engine and pin.source != "allowance":
+            if (pin.engine, pin.source) not in pin_rows:
+                pin_rows.add((pin.engine, pin.source))
+                others = [e for e in _usage._author_engines() if e != pin.engine]
+                timeline.row("⏸️", _pin_row(pin, until, others))
+        if p.needs_human and p.needs_human not in asked:
+            asked.add(p.needs_human)
+            _ask_human(timeline, p.needs_human)
+
+    def known_resets() -> list[float]:
+        pin = getattr(session, "limit_pin", None)
+        return _known_resets(pin, refused_engine, refused_known, refused_until) if pin else []
+
+    session.known_resets = known_resets
 
     async def handoff(reset_at: float | None, interrupted: bool, reason: str = "usage limit") -> bool:
-        nonlocal refused_engine, refused_until, refused_hit, last_decision, deferred_until
+        nonlocal refused_engine, refused_until, refused_known, refused_hit, last_decision, deferred_until
+        nonlocal last_paused, allowance_noted
         # Also on a re-evaluation at a deferred retry: the other engine may have reset since.
         await _usage._read_meters(timeline)
+        # Read on every call, not once at start: a direction typed while paused changes it.
+        pin = _pins.author_pin()
         if refused_engine != _usage._author_engine or refused_hit != session.limit_hit_at:
             refused_engine = _usage._author_engine
             refused_hit = session.limit_hit_at
             own_meter = _author_meter(refused_engine)
-            known_reset = own_meter.limited_until if own_meter else None
-            refused_until = reset_at or known_reset or time.time() + _session_config.LIMIT_RETRY_S
+            # A refusal restored after a restart carries its saved reset only here: the pump passes no
+            # reset for it, and a missing or replaced meters file must not turn a weekly wait into 30 minutes.
+            restored = getattr(session.current, "limit_restored", None)
+            saved = restored[1] if restored and restored[0] == session.limit_hit_at else None
+            # The latest reset still ahead: a 5-hour notice must not shorten a known weekly reset (#125).
+            future = [
+                at
+                for at in (reset_at, own_meter.limited_until if own_meter else None, saved)
+                if at is not None and at > time.time()
+            ]
+            refused_known = bool(future)
+            refused_until = max(future) if future else time.time() + _session_config.LIMIT_RETRY_S
+            if not future and saved is not None:
+                # The saved reset passed between the restart and this first route: the engine has reset,
+                # which is a known time, not an unknown one to hold for another LIMIT_RETRY_S.
+                refused_known, refused_until = True, saved
+            last_paused, allowance_noted = None, False
+            pin_rows.clear()
             if _usage._meters:
                 try:
                     _usage._meters.note_limit(refused_engine, refused_until, _author_account(refused_engine))
@@ -303,10 +506,22 @@ def _author_handoff(
         retries_left = project_task.retries.count - attempt
         if (
             handoff_count >= _AUTHOR_HANDOFF_MAX_RESTARTS or retries_left < _AUTHOR_HANDOFF_MIN_RETRIES_LEFT
-        ) and not decision.deferred:
-            decision = replace(
-                decision, engine=None, retry_at=refused_until, reason="author handoff retry allowance spent"
-            )
+        ) and decision.engine not in (None, _usage._author_engine):
+            # Stay on this engine as if hard-pinned: the router then wakes it at its own reset, or polls
+            # every LIMIT_RETRY_S when that is unknown, rather than guessing a time (#125).
+            pin = _pins.Pin(_usage._author_engine, True, "allowance")
+            decision = _author_refusal_route(pin, timeline, refused_engine, refused_until)
+            if not allowance_noted:
+                allowance_noted = True
+                used = min(handoff_count, _AUTHOR_HANDOFF_MAX_RESTARTS)
+                timeline.row(
+                    "⏸️",
+                    f"engine switches used up ({used}/{_AUTHOR_HANDOFF_MAX_RESTARTS}); "
+                    f"staying on {_usage._author_engine} until its reset",
+                )
+        # After the allowance check: once the switches are used up, the other engine is no longer permitted.
+        session.limit_pin = pin
+        session.reset_known = _reset_known(decision, pin, refused_engine, refused_known, refused_until)
         if decision.deferred:
             # A missing reset is polled on a fixed deadline; recomputing now + retry_s on every
             # pump tick would drift forever and checkpoint the same pause on every tick.
@@ -322,7 +537,14 @@ def _author_handoff(
         if key != last_decision:
             _usage._record_route(decision, timeline)
             last_decision = key
+        else:
+            # Every attempt is shown, so a reader can tell the router was asked again; the repeat is short
+            # because the candidates and the reason are the row above.
+            retry = f"; retry at {_clock(decision.retry_at)}" if decision.retry_at is not None else ""
+            timeline.row("🔀", f"router: author -> {decision.engine or 'deferred'} (unchanged{retry})")
         session.retry_at = decision.retry_at or refused_until
+        if decision.deferred:
+            note_pause(decision, pin)
         if decision.deferred or decision.engine == _usage._author_engine:
             if last_decision != getattr(session, "_checkpointed_limit", None):
                 try:
@@ -338,6 +560,8 @@ def _author_handoff(
 
         assert decision.engine is not None  # deferred decisions returned above
         old_engine, new_engine = _usage._author_engine, decision.engine
+        if pin.source == "direction" and pin.engine == new_engine:
+            reason = f"direction: resume on {new_engine} ({reason})"
         session._switching = True
         path = None
 
@@ -353,6 +577,7 @@ def _author_handoff(
             # where the next pod resumes from whatever was recorded. The record is written first so
             # that pod knows what was intended.
             try:
+                old_thread = getattr(session.current, "thread_id", None)
                 await session.current.stop()
                 handoff_dir = _session_config.STATE_ROOT / "author-handoffs"
                 handoff_dir.mkdir(parents=True, exist_ok=True)
@@ -364,7 +589,7 @@ def _author_handoff(
                     "to": new_engine,
                     "reason": reason,
                     "reset_at": refused_until,
-                    "old_thread": getattr(session.current, "thread_id", None),
+                    "old_thread": old_thread,
                     "transcripts": [
                         str(p)
                         for p in _inbox._session_transcripts(
@@ -381,7 +606,13 @@ def _author_handoff(
                 if isinstance(on_line, _session_log.RawCapture):
                     on_line.close()
                 prompt = await _handoff_prompt(
-                    old_engine, new_engine, f"{reason}; reset {refused_until}", brief, timeline
+                    old_engine,
+                    new_engine,
+                    f"{reason}; reset {_when(refused_until)}",
+                    brief,
+                    timeline,
+                    str(old_thread or ""),
+                    declared_done=bool(getattr(session, "declared_done", False)),
                 )
                 # Persist the first turn before starting either process. If the pod dies here the next
                 # attempt starts the chosen engine fresh and delivers this same handoff from the journal.
@@ -389,23 +620,35 @@ def _author_handoff(
                 session._save()
                 _CODEX_THREAD_FILE.unlink(missing_ok=True)
                 owner = _session_config.STATE_ROOT / "author-conversation.json"
-                conversation = {"engine": new_engine, "fresh": True, "pin": pin}
+                conversation: dict[str, Any] = {"engine": new_engine, "fresh": True, "pin": pin.engine}
                 if new_engine == "claude":
-                    conversation["thread"] = str(uuid.uuid4())
+                    if earlier := _latest_claude_thread():
+                        # Back to Claude after a Codex stint: resume its own conversation, which still
+                        # holds everything before the switch; the queued briefing covers the rest.
+                        conversation = {"engine": "claude", "thread": earlier, "pin": pin.engine}
+                    else:
+                        conversation["thread"] = str(uuid.uuid4())
                 _write_atomic(owner, conversation)
                 timeline.row(
                     "🔀",
                     f"author handoff {old_engine} -> {new_engine}: {reason}, "
-                    f"reset {refused_until}; attempts linked in {path}",
+                    f"reset {_when(refused_until)}; attempts linked in {path}",
                 )
             finally:
-                # Best effort, and also on failure: the next pod resumes from this checkpoint.
+                # Best effort, and also on failure: the next pod resumes from this checkpoint. The
+                # factory never pushes; the briefing tells the new author to push first.
                 try:
                     await asyncio.wait_for(
                         _state.save_checkpoint(state, exclude_private=True), timeout=_HANDOFF_STEP_TIMEOUT_S
                     )
                 except (*REMOTE_ERRORS, TimeoutError) as exc:
                     timeline.row("💥", f"author handoff checkpoint failed: {type(exc).__name__}: {exc}")
+                else:
+                    timeline.row(
+                        "💾",
+                        f"checkpoint saved before switching to {new_engine}; "
+                        "the new author is told to commit and push first",
+                    )
         except Exception as exc:
             # The author is already stopped, so any failure must end in the restart.
             timeline.row("💥", f"author handoff failed: {type(exc).__name__}: {exc}")
@@ -427,14 +670,37 @@ async def _handoff_prompt(
     brief: str,
     timeline: _timeline._Timeline,
     old_thread: str = "",
+    *,
+    declared_done: bool | None = None,
 ) -> str:
-    """Return the first turn of an author that takes over from `old_engine`: what it needs to continue."""
+    """Return the first turn of an author that takes over from `old_engine`: what it needs to continue.
+
+    `declared_done` is None when the caller cannot know it (a project resumed on another engine).
+    """
     status = await _checkpoint._handoff_git_out(_session_config.WORKSPACE, "status", "--short")
     diff = await _checkpoint._handoff_git_out(
         _session_config.WORKSPACE, "diff", *_secret_env.GIT_NO_DRIVERS, "HEAD", "--stat"
     )
+    branch = await _checkpoint._handoff_git_out(
+        _session_config.WORKSPACE, "rev-parse", "--abbrev-ref", "HEAD"
+    )
+    head = await _checkpoint._handoff_git_out(_session_config.WORKSPACE, "rev-parse", "--short", "HEAD")
+    unpushed = await _checkpoint._handoff_git_out(
+        _session_config.WORKSPACE, "rev-list", "--count", "@{u}..HEAD"
+    )
+    # No upstream (a branch never pushed) makes git fail; "unknown" says so without a git error message.
+    unpushed = unpushed.strip() if unpushed.strip().isdigit() else "unknown"
     return (
         f"AUTHOR HANDOFF: {old_engine} -> {new_engine} ({reason}).\n"
+        # The factory never pushes on the author's behalf, so what the previous author committed but did
+        # not push exists only in this checkpoint until the new author pushes it.
+        "Before anything else: commit tracked work and push your branch (the factory does not push for "
+        "you), then continue.\n"
+        f"Branch: {branch.strip()}  HEAD: {head.strip()}  Unpushed commits: {unpushed}\n"
+        f"Review: round {timeline.review_round}, passed={timeline.review_passed}\n"
+        # A switch while finished work waits on a wrap-up must not start the work over (#125).
+        f"DONE declared before the switch: "
+        f"{'not recorded' if declared_done is None else 'yes' if declared_done else 'no'}\n"
         "Continue this same work item. Partial work is UNVERIFIED; hand it to QA.\n"
         "processes the previous author started (servers, watchers) were stopped; "
         "restart any the brief requires\n"
@@ -455,6 +721,27 @@ async def _handoff_prompt(
     )
 
 
+def _latest_handoff() -> tuple[Path, dict[str, Any]] | None:
+    """Return the newest author handoff record and its path; numbered, so "10" sorts after "9"."""
+    records = sorted(
+        (_session_config.STATE_ROOT / "author-handoffs").glob("*.json"), key=lambda path: int(path.stem)
+    )
+    return (records[-1], json.loads(records[-1].read_text())) if records else None
+
+
+def _takeover_row(engine: str) -> str:
+    """Return the start row of an author taking over from a handoff not yet delivered, else "".
+
+    Its briefing is queued first, so "starting fresh" would wrongly tell the owner the work was lost.
+    """
+    latest = _latest_handoff()
+    if latest is None or latest[1].get("to") != engine or "new_thread" in latest[1]:
+        return ""
+    record = latest[1]
+    thread = f" (thread {record['old_thread']})" if record.get("old_thread") else ""
+    return f"taking over from {record.get('from')} with a handoff briefing{thread}"
+
+
 async def _resume_author_pending(session: AuthorSession, engine: str) -> None:
     await session.resume("Resume the pending work item.", label="Restored author handoff")
     owner_file = _session_config.STATE_ROOT / "author-conversation.json"
@@ -467,45 +754,52 @@ async def _resume_author_pending(session: AuthorSession, engine: str) -> None:
         owner["thread"] = session.thread_id
     owner.pop("fresh", None)
     _write_atomic(owner_file, owner)
-    records = sorted(
-        (_session_config.STATE_ROOT / "author-handoffs").glob("*.json"), key=lambda path: int(path.stem)
-    )
-    if records:
-        path = records[-1]
-        record = json.loads(path.read_text())
+    if latest := _latest_handoff():
+        path, record = latest
         if record["to"] == engine and "new_thread" not in record:
             record["new_thread"] = owner.get("thread")
             _write_atomic(path, record)
 
 
+def _engine_input_pin(engine: str) -> _pins.Pin:
+    """Record the `engine` task input as the coordinator's pin and return the pin now in force.
+
+    Checked here because `_pins` reads an unknown engine as no pin, and a typo in the input must fail the
+    launch rather than quietly run unpinned.
+    """
+    engine = engine.strip().lower()
+    if engine not in ("", "claude", "codex"):
+        raise ValueError(f"engine must be 'claude' or 'codex', not {engine!r}")
+    _pins.engine_input = engine
+    return _pins.author_pin()
+
+
 async def _choose_author_engine(
-    pin: str, available: tuple[str, ...], resumed: bool, timeline: _timeline._Timeline
+    pin: _pins.Pin, available: tuple[str, ...], resumed: bool, timeline: _timeline._Timeline
 ) -> str:
     """`claude` or `codex` for the author session.
 
-    A pin wins: the `engine` input, else `AGENT_FACTORY_COORDINATOR_ENGINE` from the launch or profile
-    policy. It wins over the engine a resumed conversation sits on, so a codex-owned project pinned to
-    Claude goes back to Claude. A pin to an engine the slot has no credential for is an error; a pinned
-    engine that is only exhausted is used unless the router moves off it, and the timeline says so.
+    A pin wins (`_pins.author_pin`: a direction, the `engine` input, else `COORDINATOR_ENGINE`). It wins
+    over the engine a resumed conversation sits on, so a codex-owned project pinned to Claude goes back to
+    Claude. A pin to an engine the slot has no credential for is an error. A hard pin starts on its engine
+    even when it is exhausted and waits out the limit; a soft one (`ENGINE_FALLBACK=allow`) is used unless
+    the router moves off it, and the timeline says so.
     Without a pin a resumed project stays on the engine whose conversation it holds, including after a
     handoff, and otherwise the router picks from the current meters among the engines the slot can use,
     preferring admission's choice (`AGENT_FACTORY_ADMITTED_ENGINE`, never a pin); the decision is a
     timeline row like any other. Claude is metered on the setup-token its author session runs on.
     """
-    if pin.strip().lower() not in ("", "claude", "codex"):
-        raise ValueError(f"engine must be 'claude' or 'codex', not {pin.strip().lower()!r}")
-    policy_pin = _names.coordinator_engine()
-    pin = pin.strip().lower() or (policy_pin if policy_pin in ("claude", "codex") else "")
-    if pin and pin not in available and (available or pin == "codex"):
+    engine = pin.engine
+    if engine and engine not in available and (available or engine == "codex"):
         # Claude's own sign-in names what is missing when nothing at all is configured.
         raise flyte.errors.NonRecoverableError(
-            f"the author is pinned to {pin} (the engine input or AGENT_FACTORY_COORDINATOR_ENGINE), but this "
-            f"slot has no {pin} login mounted (engines available: {', '.join(available) or 'none'}). "
+            f"the author is pinned to {engine} (the engine input or AGENT_FACTORY_COORDINATOR_ENGINE), but "
+            f"this slot has no {engine} login mounted (engines available: {', '.join(available) or 'none'}). "
             "Remove the pin or configure the login; the project will not run on the other engine."
         )
     if not available:
         return "claude"
-    if resumed and not pin:
+    if resumed and not engine:
         try:
             owner = json.loads((_session_config.STATE_ROOT / "author-conversation.json").read_text())
         except (OSError, ValueError):
@@ -516,25 +810,25 @@ async def _choose_author_engine(
             return "codex"
         if has_conversation(_session_config.CONFIG_DIR) and "claude" in available:
             return "claude"
-    if available == ("claude",) and not pin:
+    if available == ("claude",) and not engine:
         return "claude"
     await _usage._read_meters(timeline)
     meters = {e: _author_meter(e) for e in available} if _usage._meters else {}
     admitted = _policy.read("ADMITTED_ENGINE").strip().lower()
-    preferred = pin or (admitted if admitted in available else available[0])
+    preferred = engine or (admitted if admitted in available else available[0])
     decision = _router.route(
         "author",
         meters,
         available=available,
         now=time.time(),
         preferred=preferred,
-        pin=pin,
-        hard_pin=_usage._hard_pins,
+        pin=engine,
+        hard_pin=pin.hard,
     )
     _usage._record_route(decision, timeline)
-    if pin and decision.engine and decision.engine != pin:
-        timeline.row("🔀", f"pin overridden: {pin} ({decision.reason})")
-    # Every engine exhausted: start on the preferred one and wait out its limit like any session.
+    if engine and decision.engine and decision.engine != engine:
+        timeline.row("🔀", f"pin overridden: {engine} ({decision.reason})")
+    # Every engine exhausted, or a hard pin's engine is: start on the preferred one and wait out its limit.
     return decision.engine or preferred
 
 
@@ -799,7 +1093,8 @@ async def _codex_login_dead(proc: CodexAuthor, timeline: _timeline._Timeline) ->
         await proc.on_limit(None, "", reason=_usage._CODEX_LOGIN_UNUSABLE)
     # Still here: the handoff did not move the author. With Claude in the slot that is the pin (or a spent
     # handoff allowance), and saying "no other engine" would send the owner looking for a missing login.
-    if claude and _usage._hard_pins:
+    pin = _pins.author_pin()
+    if claude and pin.hard and pin.engine == "codex":
         why = "the run is pinned to Codex, so the author does not move to Claude"
     elif claude:
         why = "the author could not be handed to Claude"

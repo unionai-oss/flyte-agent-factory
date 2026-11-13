@@ -62,8 +62,10 @@ class OwnerCopyUnavailable(Exception):
     """The owner's repository could not be read, so there are no waivers (never a session-controlled ref)."""
 
 
-def _env() -> dict[str, str]:
-    """Return the environment for reading waivers: no replace refs, and no user or system git config.
+def git_env() -> dict[str, str]:
+    """Return the environment for reading what the session must not forge: waivers, upstream trees.
+
+    It ignores replace refs and every user or system git config.
 
     The supervisor's credentials come through the environment (`GIT_SSH_COMMAND`, a token in the URL), so
     nothing is lost; `~/.gitconfig` is the session's to write, and so is every config in the workspace.
@@ -87,7 +89,7 @@ def load_owner(repo_url: str) -> list[Waiver]:
             ["git", "init", "--quiet", "--bare"],
             ["git", "fetch", "--quiet", "--depth", "1", repo_url, "HEAD"],
         ):
-            code, output = _gate_base._run(args, Path(scratch), env=_env())
+            code, output = _gate_base._run(args, Path(scratch), env=git_env())
             if code:
                 # The URL can carry an access token.
                 output = output.replace(repo_url, "<repo url>").strip()
@@ -99,10 +101,10 @@ def load(workspace: Path, ref: str) -> list[Waiver]:
     """Load the waivers committed at `ref`; no such file has none, an unreadable one raises ValueError."""
     if not ref:
         return []
-    code, _ = _gate_base._run(["git", "cat-file", "-e", f"{ref}:{FILE}"], workspace, env=_env())
+    code, _ = _gate_base._run(["git", "cat-file", "-e", f"{ref}:{FILE}"], workspace, env=git_env())
     if code:
         return []
-    code, text = _gate_base._run(["git", "show", f"{ref}:{FILE}"], workspace, env=_env())
+    code, text = _gate_base._run(["git", "show", f"{ref}:{FILE}"], workspace, env=git_env())
     if code:
         raise ValueError(f"{FILE}: git show {ref}:{FILE} exited {code}: {text.strip()}")
     try:

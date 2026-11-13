@@ -141,8 +141,6 @@ def read_facts(profile: Profile) -> _planner.Facts:
     return replace(
         facts,
         active_runs=(*facts.active_runs, *live_children(profile)),
-        engine_repo=profile.repos.get("factory", ""),
-        engine_projects=profile.factory_projects,
         loop_enabled=profile.loop.enabled,
         loop_killed=profile.loop.enabled and _loop.killed(profile, app),
         author_engine=profile.policy.get("COORDINATOR_ENGINE", "").strip().lower() or "claude",

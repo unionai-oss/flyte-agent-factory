@@ -690,16 +690,16 @@ async def test_a_reviewer_that_never_ran_is_admitted_on_a_pass(monkeypatch):
         raise RuntimeError("pod never scheduled")
 
     monkeypatch.setattr(_reviewer, "_call_reviewer", broken)
-    unreviewed: list[str] = []
+    outcomes: dict[str, _review._JudgeOutcome] = {}
     timeline = _timeline._Timeline()
     _judge, passed, _ = await _review._one_judge(
-        "craft", "i", cast(Any, None), "b", "", 1, timeline, unreviewed
+        "craft", "i", cast(Any, None), "b", "", 1, timeline, outcomes=outcomes
     )
-    assert passed and unreviewed == ["craft"]
+    # A reviewer that never ran is not admitted on a pass any more (#87): it is NOT_RUN, never passed.
+    assert not passed and outcomes["craft"].outcome == _review.NOT_RUN
+    assert "pod never scheduled" in outcomes["craft"].reason
     attempts = [t for _, _, t in timeline._rows if "could not run" in t]
     assert len(attempts) == 2, "should retry once before giving up"
-    assert "craft" in _review._unreviewed_caveat(unreviewed)
-    assert _review._unreviewed_caveat([]) == ""
 
 
 @pytest.mark.asyncio
@@ -746,7 +746,10 @@ async def test_a_failed_snapshot_upload_blocks_rather_than_approves(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_some_reviewers_unrunnable_still_passes_with_a_caveat(monkeypatch):
-    """CASE: partial. Somebody did look, so the run is not held open; the gap is admitted."""
+    """CASE: partial (#87). Somebody did look, but a required judge never ran: not a pass, not a round.
+
+    The name is kept from before #87, which reversed what this asserts: it used to pass with a caveat.
+    """
 
     async def one_broken(*, brief, **_):
         if "**craft** reviewer" in brief:
@@ -758,9 +761,11 @@ async def test_some_reviewers_unrunnable_still_passes_with_a_caveat(monkeypatch)
 
     monkeypatch.setattr(_reviewer, "_call_reviewer", one_broken)
     monkeypatch.setattr(Dir, "from_local", snapshot)
-    passed, note = await _review._evaluate(Path("."), "brief", "", 1, _timeline._Timeline())
-    assert passed is True
-    assert "craft" in note and "NOT independently checked" in note
+    timeline = _timeline._Timeline()
+    with pytest.raises(_reviewer.ReviewIncomplete) as raised:
+        await _review._evaluate(Path("."), "brief", "", 1, timeline)
+    assert list(raised.value.missing) == ["craft"]
+    assert not timeline.verdicts
 
 
 @pytest.mark.asyncio
@@ -1669,10 +1674,13 @@ async def _three_judges(monkeypatch, replies_by_round):
     monkeypatch.setattr(_reviewer, "_call_reviewer", reviewer)
     monkeypatch.setattr(_review, "_review_facts", facts)
     monkeypatch.setattr(Dir, "from_local", snapshot)
-    results = []
+    results: list[tuple[bool, str] | _reviewer.ReviewUnavailable] = []
     for n in range(len(replies_by_round)):
         rounds["n"] = n
-        results.append(await _review._evaluate(Path("."), "brief", "", n + 1, _timeline._Timeline()))
+        try:
+            results.append(await _review._evaluate(Path("."), "brief", "", n + 1, _timeline._Timeline()))
+        except _reviewer.ReviewUnavailable as e:  # a round with a judge missing is undecided, not passed
+            results.append(e)
     return seen, results
 
 
@@ -3151,19 +3159,21 @@ def test_a_long_plan_is_cut_at_a_paragraph_and_says_so():
 
 @pytest.mark.real_reset
 @pytest.mark.parametrize(
-    ("text", "hh", "mm"),
+    ("text", "hh", "mm", "seen"),
     [
-        ("resets 1:50am (UTC)", 1, 50),
-        ("resets6pm(UTC)", 18, 0),
-        ("Your limit will reset at 7pm (UTC)", 19, 0),
-        ("You've hit your session limit · resets 12am (UTC)", 0, 0),
-        ("resets 12:30pm (UTC)", 12, 30),
+        ("resets 1:50am (UTC)", 1, 50, (22, 39)),
+        ("resets6pm(UTC)", 18, 0, (15, 10)),
+        ("Your limit will reset at 7pm (UTC)", 19, 0, (16, 30)),
+        ("You've hit your session limit · resets 12am (UTC)", 0, 0, (22, 39)),
+        ("resets 12:30pm (UTC)", 12, 30, (9, 45)),
     ],
 )
-def test_the_reset_time_is_the_next_occurrence_in_utc(text, hh, mm):
+def test_the_reset_time_is_the_next_occurrence_in_utc(text, hh, mm, seen: tuple[int, int]):
+    """#125: the notice is read against when it was seen, so each case is seen inside its five-hour window
+    (a time already well past is stale, not tomorrow: `test_a_reset_just_passed_is_now_not_tomorrow`)."""
     import datetime as dt
 
-    now = dt.datetime(2026, 10, 18, 22, 39, tzinfo=dt.timezone.utc).timestamp()
+    now = dt.datetime(2026, 10, 18, *seen, tzinfo=dt.timezone.utc).timestamp()
     at = dt.datetime.fromtimestamp(_known_reset(text, now), tz=dt.timezone.utc)
     assert (at.hour, at.minute) == (hh, mm) and at.timestamp() > now
     assert at.timestamp() - now <= 24 * 3600
@@ -3279,8 +3289,17 @@ def test_a_reset_just_passed_is_now_not_tomorrow():
 
     now = dt.datetime(2026, 10, 19, 1, 51, tzinfo=dt.timezone.utc).timestamp()
     assert _known_reset("resets 1:50am (UTC)", now) <= now
+    # #125: this asserted `> late` ("well past means tomorrow"), the bug behind the llm-gateway-probe
+    # incident: a 2:50am notice seen at 04:31Z waited 22 h for a limit that was already over. A clock
+    # time well past means the notice is stale and the limit has reset: the answer is that past time.
     late = dt.datetime(2026, 10, 19, 3, 0, tzinfo=dt.timezone.utc).timestamp()
-    assert _known_reset("resets 1:50am (UTC)", late) > late, "well past means tomorrow"
+    stale = _known_reset("resets 1:50am (UTC)", late)
+    assert stale == dt.datetime(2026, 10, 19, 1, 50, tzinfo=dt.timezone.utc).timestamp() and stale <= late
+    probe = dt.datetime(2026, 11, 11, 4, 31, tzinfo=dt.timezone.utc).timestamp()
+    assert (
+        _known_reset("resets 2:50am (UTC)", probe)
+        == dt.datetime(2026, 11, 11, 2, 50, tzinfo=dt.timezone.utc).timestamp()
+    )
     assert _usage._reset_at("resets 1:99am (UTC)", now) is None
 
 
@@ -3377,6 +3396,56 @@ async def test_a_still_limited_review_does_not_spin(repo, monkeypatch):
     await asyncio.wait_for(pump, timeout=30)
 
 
+async def _review_retry_at(repo, monkeypatch, reset_at):
+    """Where a review refused with `reset_at` (the notice's reset, None if unknown) schedules its rerun."""
+    _criteria_path(repo).write_text("- [ ] x\n")
+    _git(repo, "add", _session_config._acceptance_rel(_session_config._project_name))
+    _git(repo, "commit", "-m", "c")
+    _git(repo, "push")
+
+    async def review(*_a, **_k):
+        raise _reviewer.ReviewLimited("resets 1:50am (UTC)")
+
+    monkeypatch.setattr(_review, "_review_round", review)
+    monkeypatch.setattr(_usage, "_reset_at", lambda text, now=None: reset_at)
+    monkeypatch.setattr(_session_config, "POLL_EVERY_S", 0.0)
+    monkeypatch.setattr(_session_config, "LIMIT_RETRY_S", 1800.0)
+    bridge, proc, timeline, stop = _Queue(), _Proc(), _timeline._Timeline(), asyncio.Event()
+    pump = asyncio.create_task(_pump(bridge, proc, timeline, stop, workspace=repo, brief="b"))
+    bridge.push("DONE: built it")
+    await wait_for(lambda: any("review waiting" in t for _, _, t in timeline._rows))
+    stop.set()
+    await asyncio.wait_for(pump, timeout=30)
+    return timeline._phase["limited_until"]
+
+
+@pytest.mark.asyncio
+async def test_a_review_refused_with_a_reset_already_past_waits_the_floor(repo, monkeypatch):
+    """#194 (6): a notice whose time had passed waited LIMIT_RETRY_S + 120 s (32 min), not 10 min."""
+    import time as real_time
+
+    now = real_time.time()
+    retry_at = await _review_retry_at(repo, monkeypatch, now - 1800)
+    assert retry_at == pytest.approx(now + _supervise_support._REVIEW_RETRY_MIN_S, abs=30)
+
+
+@pytest.mark.asyncio
+async def test_a_review_refused_with_no_reset_waits_the_unknown_wait(repo, monkeypatch):
+    import time as real_time
+
+    now = real_time.time()
+    retry_at = await _review_retry_at(repo, monkeypatch, None)
+    assert retry_at == pytest.approx(now + 1800 + 120, abs=30)
+
+
+@pytest.mark.asyncio
+async def test_a_review_refused_with_a_future_reset_waits_for_it(repo, monkeypatch):
+    import time as real_time
+
+    future = real_time.time() + 3 * 3600
+    assert await _review_retry_at(repo, monkeypatch, future) == pytest.approx(future + 120, abs=1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.real_reset
 async def test_a_notice_whose_reset_is_well_past_is_ignored(monkeypatch):
@@ -3443,10 +3512,36 @@ async def test_a_first_notice_is_never_treated_as_stale(monkeypatch):
 
 @pytest.mark.real_reset
 @pytest.mark.parametrize(
-    "text", ["resets Mon 9am (UTC)", "resets Oct 24, 3pm (UTC)", "resets 10/24 3pm (UTC)"]
+    ("text", "expected"),
+    [
+        ("resets Mon 9am (UTC)", (2026, 10, 26, 9, 0)),  # 2026-10-20 is a Tuesday: the next Monday
+        ("resets Oct 24, 3pm (UTC)", (2026, 10, 24, 15, 0)),
+        ("resets 10/24 3pm (UTC)", (2026, 10, 24, 15, 0)),
+    ],
+)
+def test_a_reset_with_a_day_or_date_is_parsed(text, expected: tuple[int, int, int, int, int]):
+    """#125: this asserted `is None` for the same inputs, so a weekly limit was remembered for 30 minutes.
+
+    A day or date is placed against when the text was seen."""
+    import datetime as dt
+
+    seen = dt.datetime(2026, 10, 20, 9, 0, tzinfo=dt.timezone.utc).timestamp()
+    assert _usage._reset_at(text, seen) == dt.datetime(*expected, tzinfo=dt.timezone.utc).timestamp()
+
+
+@pytest.mark.real_reset
+@pytest.mark.parametrize(
+    "text", ["resets Mon 9am (PDT)", "resets Oct 24, 3pm (America/Los_Angeles)", "resets 2/30 3pm (UTC)"]
 )
 def test_a_reset_with_a_day_or_date_is_unknown(text):
+    """The day and date resets that stay unknown since #125: a zone other than UTC, or no such date.
+
+    The same day and date in UTC are now parsed (`test_a_reset_with_a_day_or_date_is_parsed`)."""
+    import datetime as dt
+
+    seen = dt.datetime(2026, 10, 20, 9, 0, tzinfo=dt.timezone.utc).timestamp()
     assert _usage._reset_at(text) is None
+    assert _usage._reset_at(text, seen) is None
 
 
 @pytest.mark.asyncio

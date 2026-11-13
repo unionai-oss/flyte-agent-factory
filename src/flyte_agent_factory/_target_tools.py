@@ -109,9 +109,13 @@ def _install_uv(directory: Path, version: str) -> str:
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
             for member in tar.getmembers():
                 if member.isfile() and Path(member.name).name in {"uv", "uvx"}:
+                    # Renamed into place: another job may be running the cached one, and a running
+                    # binary cannot be rewritten ("Text file busy").
                     target = directory / Path(member.name).name
-                    target.write_bytes(tar.extractfile(member).read())  # type: ignore[union-attr]
-                    target.chmod(0o755)
+                    partial = directory / f".{target.name}.{os.getpid()}.partial"
+                    partial.write_bytes(tar.extractfile(member).read())  # type: ignore[union-attr]
+                    partial.chmod(0o755)
+                    partial.replace(target)
         if (directory / "uv").is_file():
             (directory / _VERIFIED).write_text(f"{digest}\n")
     except (OSError, tarfile.TarError, UnicodeDecodeError) as exc:

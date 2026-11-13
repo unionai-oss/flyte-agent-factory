@@ -41,6 +41,7 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
 
@@ -480,6 +481,22 @@ class _DelegationResult(TypedDict):
     patch: NotRequired[str]
     partial_patch: NotRequired[str]
     plan: NotRequired[str]
+    engine: NotRequired[str]
+    until: NotRequired[float]  # Unix seconds, UTC (the same clock as factory.status's paused.until)
+
+
+def _format_status_line(job_id: str, result: _DelegationResult, now: float) -> str:
+    """One `delegate status` line: `<id> <state>`.
+
+    A waiting job names its engine and reset: `<id> waiting for <engine> until HH:MM UTC`, or
+    `... until YYYY-MM-DD HH:MM UTC` when the reset is not today (UTC, judged at `now`).
+    """
+    if result["state"] != "waiting" or "engine" not in result or "until" not in result:
+        return f"{job_id} {result['state']}"
+    until = datetime.fromtimestamp(result["until"], timezone.utc)
+    today = datetime.fromtimestamp(now, timezone.utc).date()
+    when = f"{until:%H:%M}" if until.date() == today else f"{until:%Y-%m-%d %H:%M}"
+    return f"{job_id} waiting for {result['engine']} until {when} UTC"
 
 
 def delegate_cli(argv: list[str] | None = None) -> int:
@@ -530,7 +547,7 @@ def delegate_cli(argv: list[str] | None = None) -> int:
         ids = {path.stem for path in (root / REQUESTS).glob("delegate-*.json")}
         ids.update(path.name for path in jobs.glob("delegate-*") if path.is_dir())
         for job_id in sorted(ids):
-            print(f"{job_id} {result_for(job_id)['state']}")
+            print(_format_status_line(job_id, result_for(job_id), time.time()))
         return 0
     if args.task == "wait" and not explicit_submit:
         if not args.job_id or Path(args.job_id).name != args.job_id:
@@ -552,6 +569,8 @@ def delegate_cli(argv: list[str] | None = None) -> int:
                             print(result[key])
                     return 0
             if time.monotonic() >= deadline:
+                if result["state"] == "waiting":
+                    print(_format_status_line(args.job_id, result, time.time()), file=sys.stderr)
                 print("delegation wait timed out", file=sys.stderr)
                 return 3
             time.sleep(_POLL_INTERVAL_S)

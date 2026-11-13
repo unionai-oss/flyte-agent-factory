@@ -375,25 +375,57 @@ def demo_kind(brief: str, package: str = "") -> str:
     return "pattern" if package else ""
 
 
-def select(files: dict[str, str], config: Standards, project: Path, *, demo: str = "") -> dict[str, str]:
+def _detects(path: str, pattern: str) -> bool:
+    return (
+        fnmatch.fnmatch(path, pattern)
+        or ("/" not in pattern and fnmatch.fnmatch(PurePosixPath(path).name, pattern))
+        or (pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:]))
+    )
+
+
+def select(
+    files: dict[str, str],
+    config: Standards,
+    project: Path,
+    *,
+    demo: str = "",
+    fetch: bool = True,
+    trusted_base: str = "",
+) -> dict[str, str]:
+    """Return the standards files that apply to `project`: its language packs, configs and referenced files.
+
+    A vendored file identical to upstream says nothing about the project's languages (`_vendored`). With
+    `fetch=False` upstream is read only from the workspace and the cache: a snapshot on the supervisor's event
+    loop must never wait on the network. `trusted_base` is the commit the project was created at.
+    """
+    # Imported here: `_vendored` reaches modules that import this one.
+    from . import _gate_base, _vendored
+
     selected = {f"{n}.md": files[f"{n}.md"] for n in config.include if f"{n}.md" in files}
     paths: list[str] = []
     # Prune dependency and harness trees before walking: they are not project sources.
     for directory, children, names in os.walk(project):
-        children[:] = [n for n in children if n not in {".git", ".claude-flyte", "node_modules", ".venv"}]
+        children[:] = [n for n in children if n not in _gate_base._SKIP_DIRS]
         paths.extend(str((Path(directory) / n).relative_to(project)) for n in names)
+    upstreams: list[_vendored.Upstreams] = []
+    owned: dict[str, bool] = {}
+
+    def owns(path: str) -> bool:
+        # Hashed only for a path a pattern matched, and the trees read once: a snapshot runs on every flush.
+        if path not in owned:
+            if not upstreams:
+                upstreams.append(
+                    _vendored.load(project, _gate_base._SKIP_DIRS, trusted_base=trusted_base, fetch=fetch)
+                )
+            owned[path] = not upstreams[0].unchanged(path)
+        return owned[path]
+
     for name, text in files.items():
         if not name.startswith("languages/") or len(PurePosixPath(name).parts) != 2:
             continue
         match = re.search(r"^detect:\s*(.+)$", text, re.MULTILINE)
         patterns = [p.strip() for p in match[1].split(",")] if match else []
-        detected = any(
-            fnmatch.fnmatch(p, pattern)
-            or ("/" not in pattern and fnmatch.fnmatch(PurePosixPath(p).name, pattern))
-            or (pattern.startswith("**/") and fnmatch.fnmatch(p, pattern[3:]))
-            for p in paths
-            for pattern in patterns
-        )
+        detected = any(_detects(p, pattern) and owns(p) for p in paths for pattern in patterns)
         if (config.languages == "auto" and detected) or (
             config.languages != "auto" and PurePosixPath(name).stem in config.languages
         ):
@@ -421,9 +453,16 @@ def select(files: dict[str, str], config: Standards, project: Path, *, demo: str
 
 
 def materialize(
-    workspace: Path, project: Path, config: Standards, files: dict[str, str], *, demo: str = ""
+    workspace: Path,
+    project: Path,
+    config: Standards,
+    files: dict[str, str],
+    *,
+    demo: str = "",
+    fetch: bool = True,
+    trusted_base: str = "",
 ) -> dict[str, str]:
-    selected = select(files, config, project, demo=demo)
+    selected = select(files, config, project, demo=demo, fetch=fetch, trusted_base=trusted_base)
     directory = workspace / ".claude-flyte/standards"
     directory.mkdir(parents=True, exist_ok=True)
     for old in directory.rglob("*"):

@@ -1270,6 +1270,27 @@ def test_status_returns_the_decisions_oldest_first_with_overruled_spelled_out(mo
     assert "private" not in first and "request" not in first
 
 
+def test_status_has_paused_field(monkeypatch):
+    """A paused run's status names who it waits for, until when and why not the others, with a dated label."""
+    from datetime import datetime, timezone
+
+    until = datetime(2030, 1, 7, 0, 40, tzinfo=timezone.utc).timestamp()
+    paused = {
+        "engine": "claude",
+        "until": until,
+        "others": {"codex": "pinned to claude (ENGINE_FALLBACK unset)"},
+        "needs_human": "",
+    }
+    phase = {"kind": "limited", "since": 1000.0, "round": 0, "limited_until": until, "paused": paused}
+    result = _status_of(monkeypatch, {"schema": 1, "timeline": [], "phase": phase})
+    assert result["paused"] == paused
+    assert result["phase"] == "limited until Mon 7 Jan 00:40 UTC, waiting for claude"
+
+    running = {"kind": "building", "since": 1000.0, "round": 0, "limited_until": None}
+    result = _status_of(monkeypatch, {"schema": 1, "timeline": [], "phase": running})
+    assert result["paused"] is None and result["phase"] == "building"
+
+
 def test_status_has_no_decisions_for_a_report_without_any(monkeypatch):
     assert _status_of(monkeypatch, {"schema": 1, "timeline": []})["decisions"] == []
 

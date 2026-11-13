@@ -16,6 +16,7 @@ from flyte_agent_factory import (
     _checkpoint,
     _inbox,
     _meter,
+    _pins,
     _session_config,
     _session_setup,
     _supervise,
@@ -99,7 +100,9 @@ async def test_refusal_routes_to_other_credential(monkeypatch, source, target):
     monkeypatch.setattr(_usage, "_author_engines", lambda: ("claude", "codex"))
     monkeypatch.setattr(_usage, "_hard_pins", False)
     monkeypatch.setattr(_usage, "_child_meter", lambda _: None)
-    decision = _author._author_refusal_route("", _timeline._Timeline(), source, 100000000000)
+    decision = _author._author_refusal_route(
+        _pins.Pin("", False, ""), _timeline._Timeline(), source, 100000000000
+    )
     assert decision.engine == target
 
 
@@ -111,7 +114,9 @@ def test_pin_or_missing_credential_waits(monkeypatch, available, pin, hard):
     monkeypatch.setattr(_usage, "_author_engines", lambda: available)
     monkeypatch.setattr(_usage, "_hard_pins", hard)
     monkeypatch.setattr(_usage, "_child_meter", lambda _: None)
-    decision = _author._author_refusal_route(pin, _timeline._Timeline(), "claude", 100000000000)
+    decision = _author._author_refusal_route(
+        _pins.Pin(pin, hard, "test"), _timeline._Timeline(), "claude", 100000000000
+    )
     assert decision.deferred
 
 
@@ -122,7 +127,9 @@ def test_both_exhausted_wait_for_earliest_reset(monkeypatch):
     monkeypatch.setattr(
         _usage, "_child_meter", lambda e: _meter.Meter(e, "test", now, limited_until=now + 100)
     )
-    decision = _author._author_refusal_route("", _timeline._Timeline(), "claude", now + 200)
+    decision = _author._author_refusal_route(
+        _pins.Pin("", False, ""), _timeline._Timeline(), "claude", now + 200
+    )
     assert decision.deferred and decision.retry_at == now + 100
 
 
@@ -132,7 +139,10 @@ async def test_saved_owner_wins_over_older_transcripts(tmp_path, monkeypatch):
     (tmp_path / "author-conversation.json").write_text(json.dumps({"engine": "claude"}))
     monkeypatch.setattr(CodexAuthor, "saved_thread", lambda _: "older-codex-thread")
     assert (
-        await _author._choose_author_engine("", ("claude", "codex"), True, _timeline._Timeline()) == "claude"
+        await _author._choose_author_engine(
+            _pins.Pin("", False, ""), ("claude", "codex"), True, _timeline._Timeline()
+        )
+        == "claude"
     )
     monkeypatch.setattr(_usage, "_hard_pins", False)
     monkeypatch.setattr(_usage, "_meters", None)
@@ -140,7 +150,9 @@ async def test_saved_owner_wins_over_older_transcripts(tmp_path, monkeypatch):
     # An explicit pin beats the owner's stickiness (it used to keep a handoff's engine): the pinned
     # engine takes the project back unless it is exhausted (see test_pin_and_credential.py).
     assert (
-        await _author._choose_author_engine("codex", ("claude", "codex"), True, _timeline._Timeline())
+        await _author._choose_author_engine(
+            _pins.Pin("codex", False, "engine input"), ("claude", "codex"), True, _timeline._Timeline()
+        )
         == "codex"
     )
 
@@ -282,7 +294,6 @@ async def test_handoff_uses_fresh_process_with_findings_and_direction(
         session,
         _state.ProjectState(tmp_path, ""),
         timeline,
-        pin="",
         brief="Build the feature",
     )
     try:
@@ -336,7 +347,10 @@ async def test_handoff_uses_fresh_process_with_findings_and_direction(
         assert snapshots[-1]["thread"]
         assert _session_config._author_handoff_records()[0]["new_thread"] == snapshots[-1]["thread"]
         assert any(f"author handoff {source} -> {target}" in row for _, _, row in timeline._rows)
-        assert await _author._choose_author_engine("", ("claude", "codex"), True, timeline) == target
+        assert (
+            await _author._choose_author_engine(_pins.Pin("", False, ""), ("claude", "codex"), True, timeline)
+            == target
+        )
     finally:
         await session.stop(grace=1)
 
@@ -370,6 +384,7 @@ async def test_an_unknown_reset_does_not_checkpoint_on_every_pump_tick(tmp_path,
     # Owner rule 2: full meters no longer make a deferral, so the retry with no known reset comes from a
     # hard pin to an engine this slot cannot use. This used two 100% readings with no reset.
     monkeypatch.setattr(_usage, "_hard_pins", True)
+    monkeypatch.setattr(_pins, "engine_input", "codex")
     monkeypatch.setattr(_usage, "_author_engines", lambda: ("claude",))
     monkeypatch.setattr(_usage, "_child_meter", lambda e: _meter.Meter(e, "test", now, 100))
     snapshots = []
@@ -381,7 +396,7 @@ async def test_an_unknown_reset_does_not_checkpoint_on_every_pump_tick(tmp_path,
     monkeypatch.setattr(_state, "save_checkpoint", save)
     session = AuthorSession(Process(), tmp_path / "pending.json")
     callback = _author._author_handoff(
-        session, _state.ProjectState(tmp_path, ""), _timeline._Timeline(), pin="codex", brief="brief"
+        session, _state.ProjectState(tmp_path, ""), _timeline._Timeline(), brief="brief"
     )
     assert not await callback(now + 1000, "interrupted")
     retry_at = session.retry_at
@@ -401,6 +416,7 @@ async def test_a_stalled_checkpoint_on_a_deferred_limit_is_bounded_and_retried(t
     monkeypatch.setattr(_usage, "_author_engine", "claude")
     monkeypatch.setattr(_usage, "_meters", None)
     monkeypatch.setattr(_usage, "_hard_pins", True)
+    monkeypatch.setattr(_pins, "engine_input", "codex")
     monkeypatch.setattr(_usage, "_author_engines", lambda: ("claude",))
     monkeypatch.setattr(_usage, "_child_meter", lambda e: _meter.Meter(e, "test", now, 100))
     monkeypatch.setattr(_author, "_HANDOFF_STEP_TIMEOUT_S", 0.2)
@@ -413,9 +429,7 @@ async def test_a_stalled_checkpoint_on_a_deferred_limit_is_bounded_and_retried(t
     monkeypatch.setattr(_state, "save_checkpoint", stall)
     session = AuthorSession(Process(), tmp_path / "pending.json")
     timeline = _timeline._Timeline()
-    callback = _author._author_handoff(
-        session, _state.ProjectState(tmp_path, ""), timeline, pin="codex", brief="b"
-    )
+    callback = _author._author_handoff(session, _state.ProjectState(tmp_path, ""), timeline, brief="b")
     async with asyncio.timeout(30):
         assert not await callback(now + 1000, "")
         # Not remembered as saved, so the next tick tries again.
@@ -448,7 +462,7 @@ async def _restart_paused(tmp_path, monkeypatch, now):
     from flyte_agent_factory import _state
 
     session.on_limit = _author._author_handoff(
-        session, _state.ProjectState(tmp_path, ""), _timeline._Timeline(), pin="", brief="b"
+        session, _state.ProjectState(tmp_path, ""), _timeline._Timeline(), brief="b"
     )
     stop = asyncio.Event()
     pump = asyncio.create_task(_supervise._pump(_Queue(), session, _timeline._Timeline(), stop))  # type: ignore[arg-type]  # fakes
@@ -576,7 +590,6 @@ def _handoff_rig(tmp_path, monkeypatch, steps, *, source="claude"):
             session,
             _state.ProjectState(tmp_path, ""),
             _timeline._Timeline(),
-            pin="",
             brief="Build the feature",
         )
 
@@ -1052,6 +1065,8 @@ async def test_project_propagates_a_handoff_restart(project, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "token")
     monkeypatch.setattr(agent, "assert_claude_available", lambda: None)
     monkeypatch.setenv("AGENT_FACTORY_AUTHOR_ENGINE", "codex")
+    # Since #125 a pin is hard unless fallback is allowed, and a hard pin waits instead of handing off.
+    monkeypatch.setenv("AGENT_FACTORY_ENGINE_FALLBACK", "allow")
     monkeypatch.setattr(_supervise, "_pump", pump)
     with pytest.raises(_author.AuthorHandoffRestart):
         await agent.project.func("brief", browser=False)
@@ -1071,7 +1086,8 @@ async def test_restart_isolates_a_detached_tool_with_an_empty_environment(tmp_pa
         r"""import asyncio, json, os, shutil, sys
 from pathlib import Path
 from types import SimpleNamespace
-from flyte_agent_factory import _author, _session_config, _session_setup, _state, _timeline, _usage, agent
+from flyte_agent_factory import _author, _pins, _session_config, _session_setup, _state, _timeline
+from flyte_agent_factory import _usage, agent
 from flyte_agent_factory._author_session import AuthorSession
 from flyte_agent_factory._process import ClaudeProcess
 
@@ -1125,11 +1141,13 @@ async def main():
         await session.submit('queued direction')
         try:
             await _author._author_handoff(session, _state.ProjectState(root, ''), _timeline._Timeline(),
-                pin='', brief='work')(_author.time.time() + 3600, '')
+                brief='work')(_author.time.time() + 3600, '')
         except _author.AuthorHandoffRestart:
             return 75
         raise AssertionError('handoff did not require a restart')
-    chosen = await _author._choose_author_engine('', ('claude', 'codex'), True, _timeline._Timeline())
+    chosen = await _author._choose_author_engine(
+        _pins.Pin('', False, ''), ('claude', 'codex'), True, _timeline._Timeline()
+    )
     assert chosen == 'codex'
     current = _author._start_codex_author(_timeline._Timeline(), model='', effort='')
     session = AuthorSession(current, root / 'author-pending.json')
@@ -1194,3 +1212,16 @@ os._exit(asyncio.run(main()))
             if proc is not None and proc.returncode is None:
                 proc.kill()
                 await proc.wait()
+
+
+def test_a_bridge_that_cannot_reach_the_owner_does_not_stop_the_pause_row():
+    class Unreachable:
+        def notify_owner(self, text: str, timeout_s: float) -> str:
+            raise OSError("socket closed")
+
+    timeline = _timeline._Timeline()
+    timeline.bridge = Unreachable()  # type: ignore[assignment]
+    _author._ask_human(timeline, "set ENGINE_FALLBACK")
+    texts = [text for _, _, text in timeline._rows]
+    assert any("a human needs to look: set ENGINE_FALLBACK" in t for t in texts)
+    assert any("could not ask the owner: OSError: socket closed" in t for t in texts)

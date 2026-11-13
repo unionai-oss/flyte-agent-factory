@@ -74,6 +74,7 @@ from flyte_agent_factory import (
     _pull_requests,
     _review,
     _reviewer,
+    _router,
     _session_config,
     _session_log,
     _session_setup,
@@ -497,7 +498,7 @@ async def project(
 
     # --- sign in -------------------------------------------------------- #
     author_engine = _usage._author_engine = await _author._choose_author_engine(
-        engine, _usage._author_engines(), state.resumed, timeline
+        _author._engine_input_pin(engine), _usage._author_engines(), state.resumed, timeline
     )
     os.environ["AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE"] = author_engine
     if previous_owner := _author._record_author_choice(author_engine, state.resumed, timeline):
@@ -621,11 +622,13 @@ async def project(
     bridge.browser_gate = gate
     bridge.judge = functools.partial(_judgement.run_judge, timeline=timeline)
 
+    # After a handoff this start is the new author taking over, not a fresh start that lost the work.
+    taking_over = _author._takeover_row(author_engine)
     if author_engine == "codex":
         # The thread the checkpoint saved, if any. `_start_codex_author` reads the same file.
         resume = state.resumed and CodexAuthor.saved_thread(_author._CODEX_THREAD_FILE) is not None
         if state.resumed and not resume:
-            timeline.row("ℹ️", "restored state holds no Codex thread; starting fresh")
+            timeline.row("ℹ️", taking_over or "restored state holds no Codex thread; starting fresh")
     else:
         argv = _author._author_argv(project_name, mode, model, effort)
         if browser:
@@ -661,8 +664,8 @@ async def project(
                 # that id keeps the journal and the real session in agreement; any other id would
                 # make the next restart resume a conversation that is not there.
                 argv += ["--session-id", planned]
-        if state.resumed and not resume:
-            timeline.row("ℹ️", "restored state holds no conversation; starting fresh")
+        if state.resumed and (taking_over or not resume):
+            timeline.row("ℹ️", taking_over or "restored state holds no conversation; starting fresh")
         candidates = _author.session_argv_candidates(argv, resume=resume)
         if resume and owner_file.is_file():
             saved_owner = json.loads(owner_file.read_text())
@@ -689,9 +692,12 @@ async def project(
     session: asyncio.Future[ClaudeProcess] = asyncio.get_running_loop().create_future()
     # Duck-typed: ClaudeProcess, CodexAuthor, _NoSession and AuthorSession share the surface used below.
     proc: Any
+    on_engine = functools.partial(_author._direct_engine, session)
     inbox = asyncio.create_task(
         _supervise_support._supervised(
-            _inbox._inbox_loop(session, timeline, stop, _supervise_support._grant_round, credentials),
+            _inbox._inbox_loop(
+                session, timeline, stop, _supervise_support._grant_round, credentials, on_engine=on_engine
+            ),
             "inbox",
             timeline,
             stop,
@@ -744,15 +750,7 @@ async def project(
         proc = AuthorSession(proc, _session_config.STATE_ROOT / "author-pending.json")
         saved_owner = json.loads(owner_file.read_text())
         _author._restore_refusal(proc, saved_owner)
-        static_engine, pinned = _usage._static_engine("author")
-        author_pin = engine.strip().lower() or (static_engine if pinned else "")
-        proc.on_limit = _author._author_handoff(
-            proc,
-            state,
-            timeline,
-            pin=author_pin,
-            brief=brief,
-        )
+        proc.on_limit = _author._author_handoff(proc, state, timeline, brief=brief)
     timeline.proc = proc
     session.set_result(proc)
     waiter = asyncio.create_task(
@@ -1078,16 +1076,18 @@ async def subagent(
 
     _auth.set_non_dumpable()  # as in `project`: the sub-agent's children cannot read this process's secrets
     route_blob = None
-    routes = []
+    routes: list[dict[str, Any]] = []
     refusals: dict[str, float] = {}
     unusable: list[str] = []
-    available = tuple(
-        name
-        for name, variable in (
-            ("claude", "CLAUDE_CODE_OAUTH_TOKEN"),
-            ("codex", _session_config.CODEX_TOKEN_ENV_VAR),
-        )
-        if os.environ.get(variable, "").strip()
+    # `available` is taken now: the Claude runner strips its credential from os.environ, and a refusal
+    # seen after that must still be recorded against Claude when the call is routed again.
+    reroute = functools.partial(
+        _subagent_run._reroute_after_limit,
+        hard_pin=hard_pin,
+        available=_subagent_run._available_engines(),
+        refusals=refusals,
+        unusable=unusable,
+        routes=routes,
     )
     pin = engine
     if not routed:
@@ -1235,9 +1235,10 @@ async def subagent(
                 payload = {}
             observed = _meter.from_claude_events([payload], _session_config._claude_account())
             if observed:
-                reset = _usage._reset_at(str(payload.get("result") or ""))
-                if observed.limited_until and reset:
-                    observed.limited_until = reset
+                if observed.limited_until:
+                    observed.limited_until = _usage._keep_later_reset(
+                        str(payload.get("result") or ""), observed.limited_until
+                    )
                 try:
                     await flyte.report.log.aio(_meter.report_comment(observed), do_flush=True)
                 except (*_usage._METER_ERRORS, *REMOTE_ERRORS, RuntimeError) as exc:
@@ -1287,32 +1288,29 @@ async def subagent(
             ), await Dir.from_local(str(work))
 
         except RuntimeError as exc:
-            if routed or _usage.USAGE_LIMIT_MARK not in str(exc):
+            if _usage.USAGE_LIMIT_MARK not in (error := str(exc)):
                 raise
-            refusals[engine] = _usage._reset_at(str(exc)) or time.time() + _session_config.LIMIT_RETRY_S
-            if engine == "codex" and _usage._CODEX_LOGIN_UNUSABLE in str(exc):
-                # The supervisor's meters are where a dead login is kept out of routing; this child's
-                # router forgets it on exit, so the report says so (`_ingest_subagent_usage`).
-                refusals[engine] = time.time() + _usage._CODEX_BROKEN_S
-                unusable.append(engine)
-            # The Claude runner strips its credential from os.environ. Keep the original
-            # candidate set so that refusal is recorded even after that credential is removed.
-            engine, model, effort, route_blob = await _subagent_run._route_direct_subagent(
-                role,
-                pin,
-                model,
-                effort,
-                hard_pin=hard_pin,
-                available=available,
-                refusals=refusals,
-                unusable=unusable,
-                routes=routes,
-            )
-            routes.append(route_blob)
-            await _subagent_run._subagent_result(
-                "", route_blob, routes=routes, refusals=refusals, unusable=unusable
-            )
-            continue
+            # A stale reset (its time already passed) says nothing about now; the fallback does.
+            until = _usage._refusal_until(error) or time.time() + _session_config.LIMIT_RETRY_S
+            deferred: _router.RouterDeferred | None = None  # an unrouted call with no engine left
+            if not routed:  # a routed caller re-runs the brief with a fresh worker itself
+                try:
+                    engine, model, effort, route_blob = await reroute(
+                        role, pin, model, effort, engine, error, until
+                    )
+                    continue
+                except _router.RouterDeferred as no_engine:
+                    deferred = no_engine  # `engine` is still the refused one
+            # A delegate's work so far would be lost with this worker: hand it back, as at the turn limit.
+            if partial_base and not answer_only and _usage._CODEX_LOGIN_UNUSABLE not in error:
+                handback = await _subagent_run._limit_handback(work, partial_base, engine, until, routed)
+                if handback is not None:
+                    return await _subagent_run._subagent_result(
+                        handback, route_blob, routes=routes, refusals=refusals, unusable=unusable
+                    ), await Dir.from_local(str(work))
+            if deferred is not None:
+                raise deferred from exc
+            raise
 
 
 _reviewer.subagent_task = subagent

@@ -296,11 +296,11 @@ def test_checks_sh_runs_both_lanes_at_once_and_leaves_their_junit(tmp_path):
     }
     subprocess.run(["bash", str(repo / "factory-improvement/checks.sh")], cwd=repo, env=env, check=True)
     calls = log.read_text().splitlines()
-    lane_calls = [c for c in calls if "pytest" in c or "_slow_lane" in c]
+    lane_calls = [c for c in calls if "-m pytest" in c]
     assert len(lane_calls) == 2
-    # The slow lane goes through `_slow_lane`, which runs it in a child action when asked to.
-    assert any(f"-m not slow --junitxml {junit}/fast.xml" in c and "pytest" in c for c in lane_calls)
-    assert any(c.endswith(f"-m flyte_agent_factory._slow_lane --junit {junit}/slow.xml") for c in lane_calls)
+    # No launcher (AGENT_FACTORY_TEST_LANE) and no request for a child action: both lanes run here.
+    assert any(f"-m not slow --junitxml {junit}/fast.xml" in c for c in lane_calls)
+    assert any(f"-m slow --junitxml {junit}/slow.xml" in c for c in lane_calls)
     assert (junit / "head").read_text().strip() == git(repo, "rev-parse", "HEAD")
     assert [c.split()[3:5] for c in calls if "ruff" in c] == [["ruff", "check"], ["ruff", "format"]]
 
@@ -435,7 +435,8 @@ def test_every_file_checks_sh_runs_to_make_junit_is_test_harness():
         if module.split(".")[0] == "flyte_agent_factory":
             executed.add("src/" + module.replace(".", "/") + ".py")
     executed.update(re.findall(r"(?:^|\s)((?:\./)?[\w/.-]+\.(?:py|sh))\b", script, re.MULTILINE))
-    assert "src/flyte_agent_factory/_slow_lane.py" in executed
+    # The launcher AGENT_FACTORY_TEST_LANE names runs `_slow_lane`, and a lane it cannot place runs here.
+    assert _gates._TEST_HARNESS.search("src/flyte_agent_factory/_slow_lane.py")
     for path in sorted(executed):
         assert (ROOT / path.removeprefix("./")).is_file(), path
         assert _gates._TEST_HARNESS.search(path), path
@@ -479,20 +480,39 @@ def test_checks_sh_sends_both_lanes_through_the_launcher_when_asked_for_child_ac
     uv.chmod(0o755)
     junit = tmp_path / "junit"
     junit.mkdir()
+    lane = tmp_path / "test-lane"
+    lane.write_text(f'#!/bin/bash\necho "lane $*" >> {log}\n')
+    lane.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
         _gate_tests.PYTEST_JUNIT_ENV: str(junit),
         _gate_tests.SLOW_LANE_ENV: "child",
+        _gate_tests.TEST_LANE_ENV: str(lane),
     }
     subprocess.run(["bash", str(repo / "factory-improvement/checks.sh")], cwd=repo, env=env, check=True)
-    lane_calls = [c for c in log.read_text().splitlines() if "_slow_lane" in c]
+    lane_calls = [c for c in log.read_text().splitlines() if c.startswith("lane ")]
     assert sorted(lane_calls) == sorted(
-        [
-            f"run python -m flyte_agent_factory._slow_lane --junit {junit}/fast.xml -m not slow",
-            f"run python -m flyte_agent_factory._slow_lane --junit {junit}/slow.xml",
-        ]
+        [f"lane --junit {junit}/fast.xml -m not slow", f"lane --junit {junit}/slow.xml"]
     )
+    assert not [c for c in log.read_text().splitlines() if "-m pytest" in c], "a lane ran here"
+
+
+def test_checks_sh_runs_both_lanes_here_when_no_launcher_is_given(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    log = tmp_path / "uv.log"
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    uv.write_text(f'#!/bin/bash\necho "$*" >> {log}\n')
+    uv.chmod(0o755)
+    env = {
+        **{k: v for k, v in os.environ.items() if k != _gate_tests.TEST_LANE_ENV},
+        "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
+        _gate_tests.SLOW_LANE_ENV: "child",
+    }
+    subprocess.run(["bash", str(repo / "factory-improvement/checks.sh")], cwd=repo, env=env, check=True)
+    ran = log.read_text().splitlines()
+    assert [c for c in ran if "-m not slow" in c] and [c for c in ran if "-m slow" in c]
 
 
 def _child_lane_project(tmp_path: Path, *, lock: bool = True, tests: bool = True, slow: bool = True) -> Path:
@@ -548,6 +568,9 @@ def lane_processes(monkeypatch: pytest.MonkeyPatch) -> LaneProcesses:
         return code, "ok\n"
 
     monkeypatch.setattr(_gate_base, "_run", fake)
+    # Inside a run, which the image lookup needs; a fresh cache, so each test sees its own lookup.
+    monkeypatch.setenv("FLYTE_INTERNAL_EXECUTION_ID", "run-under-test")
+    monkeypatch.setattr(_gate_tests, "_RUN_IMAGES", {})
     return calls
 
 

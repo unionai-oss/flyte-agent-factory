@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -113,6 +114,18 @@ async def _read_direct_meters() -> dict[str, _meter.Meter | None]:
         return dict(found)
 
 
+def _available_engines() -> tuple[str, ...]:
+    """Return the engines whose credential this process holds now."""
+    return tuple(
+        name
+        for name, variable in (
+            ("claude", "CLAUDE_CODE_OAUTH_TOKEN"),
+            ("codex", _session_config.CODEX_TOKEN_ENV_VAR),
+        )
+        if os.environ.get(variable, "").strip()
+    )
+
+
 async def _route_direct_subagent(
     role: str,
     engine: str,
@@ -131,18 +144,7 @@ async def _route_direct_subagent(
     to are replaced by the role's Codex setting when the router moves the call to Codex. The last item
     is the decision as a record, for the sub-agent to hand back to its parent (`_with_route`).
     """
-    available = (
-        available
-        if available is not None
-        else tuple(
-            name
-            for name, variable in (
-                ("claude", "CLAUDE_CODE_OAUTH_TOKEN"),
-                ("codex", _session_config.CODEX_TOKEN_ENV_VAR),
-            )
-            if os.environ.get(variable, "").strip()
-        )
-    )
+    available = available if available is not None else _available_engines()
     purpose = role or "subagent"
     meters = await _read_direct_meters()
     for refused, until in (refusals or {}).items():
@@ -229,20 +231,28 @@ async def _ask_remaining_work(
 
 
 async def _partial_handback(
-    work: Path, base: str, max_turns: int, payload: dict[str, Any], ask_plan: Callable[[], Awaitable[str]]
+    work: Path,
+    base: str,
+    max_turns: int,
+    payload: dict[str, Any],
+    ask_plan: Callable[[], Awaitable[str]],
+    *,
+    cause: str = "",
 ) -> str:
-    """Write a turn-limited delegate's work to `work` and return its summary.
+    """Write a stopped delegate's work to `work` and return its summary.
 
     `factory.partial.patch` is everything changed since `base`, untracked files included (`add -N`
     records them as intent-to-add so `git diff` shows them), and `plan.md` is what remains. The plan
     is the final assistant text when the CLI gave one, else what `ask_plan()` returns; a worker
-    that cannot produce one still hands its patch back.
+    that cannot produce one still hands its patch back. `cause` opens the summary when the worker
+    stopped for something other than its turn limit.
     """
+    stopped = cause or f"the worker hit its {max_turns}-turn limit"
     repo = work / "repo"
     if not repo.is_dir():
-        # The worker ran out of turns before it extracted the repo: there is no tree to diff.
+        # The worker stopped before it extracted the repo: there is no tree to diff.
         return (
-            f"PARTIAL: the worker hit its {max_turns}-turn limit before it had extracted the repo, "
+            f"PARTIAL: {stopped} before it had extracted the repo, "
             "so there is no work to hand back. Run it again, with a narrower brief if it is large."
         )
     # Disarms the tree: the worker is finished, and `Dir.from_local(work)` ships this copy back.
@@ -256,7 +266,69 @@ async def _partial_handback(
     plan = plan or "(the worker gave no plan; read the partial patch and the brief to see what is left)"
     (work / PLAN).write_text(plan + "\n")
     (work / PARTIAL_PATCH).write_bytes(diff)
-    return f"PARTIAL: the worker hit its {max_turns}-turn limit before finishing.\n\nRemaining work:\n{plan}"
+    return f"PARTIAL: {stopped} before finishing.\n\nRemaining work:\n{plan}"
+
+
+async def _no_plan() -> str:
+    """Answer `ask_plan` for a usage-limited worker: its engine cannot be asked; its refusal is no plan."""
+    return ""
+
+
+async def _reroute_after_limit(
+    role: str,
+    pin: str,
+    model: str,
+    effort: str,
+    refused: str,
+    error: str,
+    until: float,
+    **route: Any,
+) -> tuple[str, str, str, dict[str, Any]]:
+    """Record `refused`'s usage limit and route a direct sub-agent call again, away from it.
+
+    `route` is `_route_direct_subagent`'s keywords; its `refusals`, `unusable` and `routes` are updated
+    in place. Raises `RouterDeferred` when no engine is left, as routing does.
+    """
+    refusals, unusable = route["refusals"], route["unusable"]
+    refusals[refused] = until
+    if refused == "codex" and _usage._CODEX_LOGIN_UNUSABLE in error:
+        # The supervisor's meters are where a dead login is kept out of routing; this child's
+        # router forgets it on exit, so the report says so (`_ingest_subagent_usage`).
+        refusals[refused] = time.time() + _usage._CODEX_BROKEN_S
+        unusable.append(refused)
+    engine, model, effort, route_blob = await _route_direct_subagent(role, pin, model, effort, **route)
+    route["routes"].append(route_blob)
+    await _subagent_result("", route_blob, routes=route["routes"], refusals=refusals, unusable=unusable)
+    return engine, model, effort, route_blob
+
+
+async def _limit_handback(
+    work: Path, base: str, engine: str, until: float | None, routed: bool = False
+) -> str | None:
+    """Hand back a usage-limited delegate's work as `_partial_handback` does; None if it changed nothing.
+
+    A limit used to fail the worker, and its caller re-ran the brief from scratch, so the work done
+    until then was lost. With nothing to keep (or a tree that cannot be diffed) the caller re-raises the
+    limit, and the job waits or re-routes. A `routed` caller notes a limit it sees raised; this one is
+    returned instead, so it rides in the usage trailer the caller ingests (`_ingest_subagent_usage`).
+    """
+    repo = work / "repo"
+    try:
+        changed = repo.is_dir() and bool(await asyncio.to_thread(work_diff, repo, base))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        # The limit error must reach the caller intact: it is what makes the job wait, not fail.
+        _timeline._log_line(f"[delegate] no partial patch at the limit: {type(exc).__name__}", err=True)
+        return None
+    if not changed:
+        return None
+    resets = f" (resets {_router._reset_text(until)})" if until is not None else ""
+    # The refusal's own text is no plan, and the limited engine cannot be asked for one.
+    summary = await _partial_handback(
+        work, base, 0, {}, _no_plan, cause=f"usage limit on {engine}{resets}: the worker stopped"
+    )
+    if routed and until is not None:
+        summary += f"{_usage._USAGE_MARK}{json.dumps({'refusals': {engine: until}})}-->"
+    return summary
 
 
 # "You've hit your limit" is the subscription refusal; older CLIs say "Claude AI usage limit reached".
@@ -279,7 +351,7 @@ def _raise_on_cli_error(stdout: str, *, only_limit: bool = False) -> None:
         meter = _meter.from_claude_events([payload], _session_config._claude_account())
         if meter and meter.limited_until:
             # Carry any observed reset to the supervisor's refusal cache: a failed action has no outputs.
-            meter.limited_until = _usage._reset_at(result) or meter.limited_until
+            meter.limited_until = _usage._keep_later_reset(result, meter.limited_until)
             observation = f" {_meter.report_comment(meter)}"
             raise RuntimeError(f"{_usage.USAGE_LIMIT_MARK} {result}{observation}")
         if not only_limit:
@@ -449,7 +521,8 @@ async def _run_codex(
         if observed:
             if _CODEX_LIMIT.search(detail):
                 observed.limited_until = (
-                    _usage._reset_at(detail) or time.time() + _session_config.LIMIT_RETRY_S
+                    _usage._keep_later_reset(detail, observed.limited_until)
+                    or time.time() + _session_config.LIMIT_RETRY_S
                 )
             # A failed action has no return value; its report must retain the last backend observation.
             try:

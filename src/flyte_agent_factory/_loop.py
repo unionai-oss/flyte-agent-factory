@@ -114,11 +114,14 @@ class Spend(TypedDict):
     usd_total: float
 
 
-def classify(pr_files: Sequence[str | ChangedFile], changed_files: int | None = None) -> str:
+def classify(pr_files: Sequence[str | ChangedFile], changed_files: int | None = None, path: str = "") -> str:
     """Return `needs_owner`, `docs_only` or `benchmark`.
 
     `changed_files` is the PR's own count: a listing that does not account for every changed file
     (GitHub stops at 3000) cannot show that no owner file changed.
+
+    `path` is the subtree holding the engine (`[loop] path`). Its files are judged relative to it, as the
+    owner's patterns name the engine's own layout; a file outside it is not the engine, so not the loop's.
     """
     if changed_files is not None and (len(pr_files) != changed_files or len(pr_files) >= MAX_LISTED_FILES):
         return "needs_owner"
@@ -130,9 +133,16 @@ def classify(pr_files: Sequence[str | ChangedFile], changed_files: int | None = 
             paths.append(item["filename"])
             if item.get("previous_filename"):
                 paths.append(item["previous_filename"])
-    if not paths or any(_owner(path) for path in paths):
+    if path:
+        prefix = _normal(path) + "/"
+        # Normalised first: `projects/engine/../../x` must not look like it is inside the subtree.
+        paths = [_normal(p) for p in paths]
+        if not all(p.startswith(prefix) for p in paths):
+            return "needs_owner"
+        paths = [p[len(prefix) :] for p in paths]
+    if not paths or any(_owner(p) for p in paths):
         return "needs_owner"
-    return "docs_only" if all(path.startswith(_DOCS_PATHS) for path in paths) else "benchmark"
+    return "docs_only" if all(p.startswith(_DOCS_PATHS) for p in paths) else "benchmark"
 
 
 def decide(verdict: Mapping[str, object], classify_result: str, review_passed: bool) -> str:

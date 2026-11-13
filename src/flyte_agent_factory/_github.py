@@ -106,43 +106,18 @@ def clone_url(repo: str, token: str) -> str:
     return f"https://x-access-token:{token}@github.com/{repo}.git"
 
 
-class GithubApp:
-    """One GitHub App's identity, with an installation token cached per repo."""
+class _GithubReader:
+    """The read calls the deployer makes, over whichever `_call` the subclass authenticates with."""
 
-    def __init__(
-        self,
-        app_id: str,
-        private_key: str,
-        *,
-        client: httpx.Client | None = None,
-        clock: Callable[[], float] = time.time,
-    ) -> None:
-        self._app_id = app_id
-        self._key = private_key
+    def __init__(self, client: httpx.Client | None = None) -> None:
         self._http = client or httpx.Client(base_url=API, timeout=30)
-        self._clock = clock
-        self._tokens: dict[str, tuple[str, float]] = {}  # repo -> (token, expiry epoch)
-        #: URL with its query -> (ETag, the body it tagged), for conditional GETs (`issue_comments_since`).
-        self._etags: dict[str, tuple[str, list[Json]]] = {}
-
-    def app_jwt(self) -> str:
-        now = int(self._clock())
-        claims = {"iss": self._app_id, "iat": now - _JWT_BACK, "exp": now + _JWT_AHEAD}
-        # Imported here: `_profile` imports this module for `parse_repo`, and images built before the
-        # deployer carry no jwt.
-        import jwt
-
-        try:
-            return jwt.encode(claims, self._key, algorithm="RS256")
-        except (jwt.PyJWTError, ValueError) as exc:
-            # A malformed key: the class only, as for any other GitHub failure, never key material.
-            raise GithubError(f"github app key unusable: {type(exc).__name__}") from exc
 
     def redact(self, text: str) -> str:
-        """`text` with every token this app has handed out replaced, for error output."""
-        for token, _ in self._tokens.values():
-            text = text.replace(token, "***")
+        """`text` with any secret this client holds replaced, for error output."""
         return text
+
+    def _call(self, repo: str, method: str, path: str, **kwargs: Any) -> Any:
+        raise NotImplementedError
 
     def _response(
         self, method: str, path: str, bearer: str, *, headers: dict[str, str] | None = None, **kwargs: Any
@@ -153,7 +128,8 @@ class GithubApp:
                 method,
                 path,
                 headers={
-                    "Authorization": f"Bearer {bearer}",
+                    # No bearer: an anonymous read of a public repository.
+                    **({"Authorization": f"Bearer {bearer}"} if bearer else {}),
                     "Accept": "application/vnd.github+json",
                     **(headers or {}),
                 },
@@ -185,48 +161,6 @@ class GithubApp:
             raise GithubError(
                 f"github {method} {path}: HTTP {response.status_code} body is not JSON", response.status_code
             ) from exc
-
-    def installation_token(self, repo: str) -> str:
-        cached = self._tokens.get(repo)
-        if cached and self._clock() < cached[1] - TOKEN_MARGIN:
-            return cached[0]
-        app = self.app_jwt()
-        try:
-            installation = self._request("GET", f"/repos/{repo}/installation", app)
-        except GithubError as exc:
-            if "HTTP 404" in str(exc):
-                raise GithubError(
-                    f"the GitHub App (id {self._app_id}) is not installed on {repo}", 404
-                ) from exc
-            raise
-        installation_id = _field(installation, "id", int, f"installation of {repo}")
-        issued = self._request("POST", f"/app/installations/{installation_id}/access_tokens", app)
-        what = "issued an unusable installation token"
-        token = _field(issued, "token", str, what)
-        expires_at = _field(issued, "expires_at", str, what)
-        try:
-            expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
-        except ValueError as exc:
-            # The class only: the body holds the token.
-            raise GithubError(
-                f"github {what}: `expires_at` is not a timestamp ({type(exc).__name__})"
-            ) from exc
-        self._tokens[repo] = (token, expires)
-        return token
-
-    def _call(self, repo: str, method: str, path: str, **kwargs: Any) -> Any:
-        """Make one call as the installation.
-
-        On a 401 the cached token is gone (revoked or expired early): drop it and retry once with a
-        fresh one.
-        """
-        try:
-            return self._request(method, path, self.installation_token(repo), **kwargs)
-        except GithubError as exc:
-            if exc.status != 401:
-                raise
-        self._tokens.pop(repo, None)
-        return self._request(method, path, self.installation_token(repo), **kwargs)
 
     def _get(self, repo: str, path: str, **kwargs: Any) -> Json:
         body: Json = self._call(repo, "GET", path, **kwargs)
@@ -277,7 +211,7 @@ class GithubApp:
         """`("ok"|"pending"|"failing"|"none", detail)` from the commit's statuses and check-runs.
 
         Failing wins over pending. The detail names the context that decided it. "none" means
-        nothing reported at all, which the caller treats as deployable. An App without the
+        nothing reported at all. An App without the
         "Checks: read" permission gets 403 on check-runs; health then rests on statuses alone and
         the detail says so, rather than every tick failing.
 
@@ -286,6 +220,9 @@ class GithubApp:
         jobs are queued, so the runs alone look done (or absent) in between. Another App's suite with
         no runs is ignored (an App that never posts one stays queued forever); an Actions suite counts
         either way. A suites listing the App may not read is ignored too.
+
+        "ok" needs at least one success (a status or a check-run): skipped and neutral runs alongside
+        one do not hold it back, but alone they are "none".
         """
         statuses = self._get_all(repo, f"/repos/{repo}/commits/{sha}/status", "statuses")
         try:
@@ -321,7 +258,104 @@ class GithubApp:
                 return "pending", f"{run['name']} pending"
         if running is not None:
             return "pending", _suite_detail(running)
-        return "ok", f"{len(statuses) + len(runs)} passing"
+        # A skipped or neutral run ran nothing: only a success is evidence the tests passed, so a commit
+        # whose every check was skipped (a `paths:` filter, a draft guard) is "none", not "ok".
+        passing = len(statuses) + sum(run["conclusion"] == "success" for run in runs)
+        if not passing:
+            return "none", "no successful check (only skipped or neutral results)"
+        return "ok", f"{passing} passing"
+
+
+class PublicGithub(_GithubReader):
+    """Anonymous reads of a public repository: what the deployer has when the App is not installed on it.
+
+    GitHub allows 60 unauthenticated requests an hour per address, so callers read heads some other way
+    (`git ls-remote`) and ask for `commit_health` only for a head they mean to deploy.
+    """
+
+    def _call(self, repo: str, method: str, path: str, **kwargs: Any) -> Any:
+        return self._request(method, path, "", **kwargs)
+
+
+class GithubApp(_GithubReader):
+    """One GitHub App's identity, with an installation token cached per repo."""
+
+    def __init__(
+        self,
+        app_id: str,
+        private_key: str,
+        *,
+        client: httpx.Client | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._app_id = app_id
+        self._key = private_key
+        super().__init__(client)
+        self._clock = clock
+        self._tokens: dict[str, tuple[str, float]] = {}  # repo -> (token, expiry epoch)
+        #: URL with its query -> (ETag, the body it tagged), for conditional GETs (`issue_comments_since`).
+        self._etags: dict[str, tuple[str, list[Json]]] = {}
+
+    def app_jwt(self) -> str:
+        now = int(self._clock())
+        claims = {"iss": self._app_id, "iat": now - _JWT_BACK, "exp": now + _JWT_AHEAD}
+        # Imported here: `_profile` imports this module for `parse_repo`, and images built before the
+        # deployer carry no jwt.
+        import jwt
+
+        try:
+            return jwt.encode(claims, self._key, algorithm="RS256")
+        except (jwt.PyJWTError, ValueError) as exc:
+            # A malformed key: the class only, as for any other GitHub failure, never key material.
+            raise GithubError(f"github app key unusable: {type(exc).__name__}") from exc
+
+    def redact(self, text: str) -> str:
+        """`text` with every token this app has handed out replaced, for error output."""
+        for token, _ in self._tokens.values():
+            text = text.replace(token, "***")
+        return text
+
+    def installation_token(self, repo: str) -> str:
+        cached = self._tokens.get(repo)
+        if cached and self._clock() < cached[1] - TOKEN_MARGIN:
+            return cached[0]
+        app = self.app_jwt()
+        try:
+            installation = self._request("GET", f"/repos/{repo}/installation", app)
+        except GithubError as exc:
+            if "HTTP 404" in str(exc):
+                raise GithubError(
+                    f"the GitHub App (id {self._app_id}) is not installed on {repo}", 404
+                ) from exc
+            raise
+        installation_id = _field(installation, "id", int, f"installation of {repo}")
+        issued = self._request("POST", f"/app/installations/{installation_id}/access_tokens", app)
+        what = "issued an unusable installation token"
+        token = _field(issued, "token", str, what)
+        expires_at = _field(issued, "expires_at", str, what)
+        try:
+            expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+        except ValueError as exc:
+            # The class only: the body holds the token.
+            raise GithubError(
+                f"github {what}: `expires_at` is not a timestamp ({type(exc).__name__})"
+            ) from exc
+        self._tokens[repo] = (token, expires)
+        return token
+
+    def _call(self, repo: str, method: str, path: str, **kwargs: Any) -> Any:
+        """Make one call as the installation.
+
+        On a 401 the cached token is gone (revoked or expired early): drop it and retry once with a
+        fresh one.
+        """
+        try:
+            return self._request(method, path, self.installation_token(repo), **kwargs)
+        except GithubError as exc:
+            if exc.status != 401:
+                raise
+        self._tokens.pop(repo, None)
+        return self._request(method, path, self.installation_token(repo), **kwargs)
 
     def workflow_runs(self, repo: str, sha: str, limit: int = 20) -> list[Json]:
         """Return the newest GitHub Actions runs on commit `sha` (needs "Actions: read")."""

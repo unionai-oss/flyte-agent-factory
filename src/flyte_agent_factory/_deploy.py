@@ -324,10 +324,12 @@ def reconcile_minutes(profile: _profile.Profile) -> int:
     """How often the deployer runs on a schedule.
 
     With the webhook a push starts the deployer, so its schedule is only a backstop for missed
-    deliveries and pending CI. Without it the deployer polls, every 5 minutes. The queue sweep does
-    not follow this: see `QUEUE_SWEEP_MINUTES`.
+    deliveries and pending CI. Without it the deployer polls, every 5 minutes. The webhook only counts
+    when `[deploy] webhook` says pushes to the deploy repo reach it: a repository without the App never
+    delivers, and an hourly poll would leave its merges an hour late. The queue sweep does not follow
+    this: see `QUEUE_SWEEP_MINUTES`.
     """
-    return RECONCILE_MINUTES if profile.github.webhook_secret else 5
+    return RECONCILE_MINUTES if profile.github.webhook_secret and profile.deploy.webhook else 5
 
 
 #: Minutes between queue sweeps, webhook or not. The queue is dispatched on every launch and every
@@ -741,6 +743,23 @@ def worktree(repo: Path, sha: str, prefix: str) -> Iterator[Path]:
             yield tree
         finally:
             subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(tree)], check=False)
+
+
+def public_head(repo: str) -> str:
+    """Return the head SHA of `repo`'s default branch, read anonymously by git; "" when it cannot be read."""
+    try:
+        done = subprocess.run(
+            ["git", "ls-remote", f"https://github.com/{repo}.git", "HEAD"],
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    sha = done.stdout.split("\t")[0]
+    return sha if done.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else ""
 
 
 @contextlib.contextmanager

@@ -28,9 +28,9 @@ from flyte_agent_factory import (
     _checkpoint,
     _inbox,
     _meter,
+    _pins,
     _profile,
     _review,
-    _reviewer,
     _session_config,
     _session_setup,
     _state,
@@ -283,9 +283,13 @@ def choose(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_usage, "_read_meters", noop)
 
+    monkeypatch.setattr(_pins, "engine_input", "")  # `_engine_input_pin` sets it, as `project` does
+
     async def run(pin="", available=("claude", "codex"), resumed=False):
         timeline = _timeline._Timeline()
-        engine = await _author_module._choose_author_engine(pin, available, resumed, timeline)
+        engine = await _author_module._choose_author_engine(
+            _author_module._engine_input_pin(pin), available, resumed, timeline
+        )
         return engine, [text for _, icon, text in timeline._rows if icon == "🔀"]
 
     return run
@@ -863,7 +867,6 @@ async def test_a_codex_only_judge_runs_through_the_subagent_task(tmp_path, monke
     monkeypatch.setattr(_session_config, "CODEX_TOKEN_SECRET", "codex_token")
     monkeypatch.setattr(_usage, "_author_engine", "codex")
     monkeypatch.setattr(_usage, "_meters", None)
-    monkeypatch.setattr(_reviewer, "_limited_reason", {})
     for var in ("CLAUDE_CODE_OAUTH_TOKEN", "AGENT_FACTORY_CLAUDE_TOKEN_SECRET"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv(_session_config.CODEX_TOKEN_ENV_VAR, "codex-access-token")
@@ -884,13 +887,13 @@ async def test_a_codex_only_judge_runs_through_the_subagent_task(tmp_path, monke
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(agent.subagent, "override", lambda **_: SimpleNamespace(aio=agent.subagent.func))
-    unreviewed: list[Any] = []
+    outcomes: dict[str, _review._JudgeOutcome] = {}
     timeline = _timeline._Timeline()
     judge, passed, _ = await _review._one_judge(
-        "correctness", "Review the change", cast(Any, None), "brief", "", 1, timeline, unreviewed
+        "correctness", "Review the change", cast(Any, None), "brief", "", 1, timeline, outcomes=outcomes
     )
     assert judge == "correctness" and passed
-    assert not unreviewed
+    assert outcomes["correctness"].outcome == _review.PASS
     assert any("correctness -> codex" in text for _, _, text in timeline._rows)
     assert len(list((tmp_path / ".codex-subagents").glob("*/threads/*"))) == 1
 
@@ -1120,8 +1123,32 @@ async def test_a_refused_access_token_says_to_replace_the_token_not_to_sign_in(p
         assert "bootstrap" not in text and "secret_name" not in text
 
 
+async def test_a_dead_login_on_the_codex_engine_input_ends_and_marks_codex_broken(project, monkeypatch):
+    """A dead login with the `engine` input codex ends for a human, as hard pins do, and marks codex broken.
+
+    Replaces `..._hands_the_author_to_claude_...` with the same inputs: the `engine` input is a pin, and
+    since #125 a pin is hard unless `ENGINE_FALLBACK` is "allow" (the test below keeps the handoff).
+    """
+    import flyte.errors
+
+    monkeypatch.setenv("FAKE_CODEX_AUTH", "reused")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "t")
+    monkeypatch.setattr(_supervise, "_pump", _idle_pump)
+    with pytest.raises(flyte.errors.NonRecoverableError, match="store a new token"):
+        await agent.project.func("brief", browser=False, engine="codex")
+    assert not list((project.state_root / "author-handoffs").glob("*.json"))
+    assert _usage._meters is not None
+    assert _usage._meters.latest["codex"].error == "codex login unusable"
+    rows = [text for _, _, text in project.timeline._rows]
+    [stop] = [text for _, icon, text in project.timeline._rows if icon == "🛑"]
+    assert "pinned to Codex" in stop
+    # Codex cannot be waited for, so the pause says a human is needed and how to unblock it.
+    assert any("a human needs to look" in text and "codex_token" in text for text in rows)
+
+
 async def test_a_dead_login_hands_the_author_to_claude_and_marks_codex_broken(project, monkeypatch):
-    """A dead login hands the author to claude and marks codex broken."""
+    """A dead login hands the author to claude and marks codex broken, when ENGINE_FALLBACK allows it."""
+    monkeypatch.setenv("AGENT_FACTORY_ENGINE_FALLBACK", "allow")
     monkeypatch.setenv("FAKE_CODEX_AUTH", "reused")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "t")
     monkeypatch.setattr(_supervise, "_pump", _idle_pump)

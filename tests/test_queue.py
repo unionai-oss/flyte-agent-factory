@@ -569,9 +569,10 @@ def test_entries_read_an_object_store(state_uri, monkeypatch):
     assert [e.request.name for e in _queue.pending(queue) if e.request] == ["alpha"]
 
 
-# --- engine changes run one at a time -------------------------------------------------------------------
+# --- projects on one repository share the slots --------------------------------------------------------
 
 ENGINE = "git@example.org:team/engine.git"
+OTHER = "git@example.org:team/other.git"
 
 
 @pytest.fixture
@@ -582,42 +583,29 @@ def engine_repo(monkeypatch):
     )
 
 
-def test_an_engine_launch_waits_while_an_engine_project_runs(flyte_world, engine_repo, capsys):
-    flyte_world.add("running-engine", _factory_base.SLOTS[0], inputs={"repo": ENGINE})
-    _queue.enqueue(flyte_world.queue, request("alpha", repo=ENGINE))
-    assert factory.dispatch() == []
-    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["alpha"]
-    assert "alpha waits: engine_busy: running-engine" in capsys.readouterr().out
-    flyte_world.runs["running-engine"].phase = "SUCCEEDED"
-    assert len(factory.dispatch()) == 1
-
-
-def test_other_repos_launch_beside_a_running_engine_project(flyte_world, engine_repo):
-    flyte_world.add("running-engine", _factory_base.SLOTS[0], inputs={"repo": ENGINE})
-    _queue.enqueue(flyte_world.queue, request("alpha", repo="git@example.org:team/other.git"))
-    assert len(factory.dispatch()) == 1
-
-
-def test_one_sweep_starts_one_engine_project(flyte_world, engine_repo):
-    _queue.enqueue(flyte_world.queue, request("alpha", at=1, repo=ENGINE))
-    _queue.enqueue(flyte_world.queue, request("bravo", at=2, repo=ENGINE))
+@pytest.mark.parametrize("repo", [ENGINE, OTHER])
+def test_a_launch_starts_beside_a_running_project_on_its_repo(flyte_world, engine_repo, repo):
+    flyte_world.add("running", _factory_base.SLOTS[0], inputs={"repo": repo})
+    _queue.enqueue(flyte_world.queue, request("alpha", repo=repo))
     assert [run.split("-")[0] for run in factory.dispatch()] == ["alpha"]
-    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["bravo"]
 
 
-def test_an_engine_project_is_held_by_an_alias_of_the_engine_repo(flyte_world, monkeypatch):
-    old = "git@example.org:team/engine-old.git"
-    profile = _factory_base.PROFILE
-    monkeypatch.setattr(
-        _factory_base,
-        "PROFILE",
-        dataclasses.replace(
-            profile, repos={**profile.repos, "factory": ENGINE}, repo_aliases={"factory": (old,)}
-        ),
-    )
-    flyte_world.add("running-engine", _factory_base.SLOTS[0], inputs={"repo": old})
+@pytest.mark.parametrize("repo", [ENGINE, OTHER])
+def test_projects_on_one_repo_start_in_one_sweep_while_slots_are_free(flyte_world, engine_repo, repo):
+    _queue.enqueue(flyte_world.queue, request("alpha", at=1, repo=repo))
+    _queue.enqueue(flyte_world.queue, request("bravo", at=2, repo=repo))
+    assert [run.split("-")[0] for run in factory.dispatch()] == ["alpha", "bravo"]
+    assert _queue.pending(flyte_world.queue) == []
+
+
+def test_projects_on_one_repo_wait_for_a_slot_and_start_when_it_frees(flyte_world, engine_repo, capsys):
+    for slot, name in zip(_factory_base.SLOTS, ("one", "two"), strict=False):
+        flyte_world.add(name, slot, inputs={"repo": ENGINE})
     _queue.enqueue(flyte_world.queue, request("alpha", repo=ENGINE))
     assert factory.dispatch() == []
+    assert "engine_busy" not in capsys.readouterr().out
+    flyte_world.runs["one"].phase = "SUCCEEDED"
+    assert [run.split("-")[0] for run in factory.dispatch()] == ["alpha"]
 
 
 # --- a running project keeps the engine it started on ---------------------------------------------------
@@ -638,37 +626,6 @@ def test_a_deploy_does_not_change_the_engine_of_a_running_project(flyte_world):
     third = flyte_world.runs[factory.launch_project("brief", "charlie")["run"]]
     assert (third.task, third.task_version) == (slot, "v2")  # a new launch resolves the new deploy
     assert first.task_version == "v1"
-
-
-@pytest.fixture
-def two_engine_projects(monkeypatch, engine_repo):
-    monkeypatch.setattr(
-        _factory_base, "PROFILE", dataclasses.replace(_factory_base.PROFILE, factory_projects=2)
-    )
-
-
-def test_the_third_engine_project_waits_naming_both_holders(flyte_world, two_engine_projects, capsys):
-    # Both on one slot, so the slot cap is not what holds the request back.
-    for name in ("engine-a", "engine-b"):
-        flyte_world.add(name, _factory_base.SLOTS[0], inputs={"repo": ENGINE})
-    _queue.enqueue(flyte_world.queue, request("alpha", repo=ENGINE))
-    assert factory.dispatch() == []
-    out = capsys.readouterr().out
-    assert "alpha waits: engine_busy: " in out and "engine-a" in out and "engine-b" in out
-    assert "(limit 2)" in out
-
-
-def test_the_second_engine_project_starts_when_the_limit_is_two(flyte_world, two_engine_projects):
-    flyte_world.add("running-engine", _factory_base.SLOTS[0], inputs={"repo": ENGINE})
-    _queue.enqueue(flyte_world.queue, request("alpha", repo=ENGINE))
-    assert [run.split("-")[0] for run in factory.dispatch()] == ["alpha"]
-
-
-def test_two_engine_projects_start_in_one_sweep(flyte_world, two_engine_projects):
-    for at, name in enumerate(("alpha", "bravo", "charlie"), 1):
-        _queue.enqueue(flyte_world.queue, request(name, at=at, repo=ENGINE))
-    assert [run.split("-")[0] for run in factory.dispatch()] == ["alpha", "bravo"]
-    assert [e.name for e in _queue.pending(flyte_world.queue)] == ["charlie"]
 
 
 @pytest.mark.parametrize("rows", [0, 1, 40])

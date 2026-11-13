@@ -230,7 +230,7 @@ def _dual_engine_rig(tmp_path, monkeypatch, limits):
     monkeypatch.setattr(_checkpoint, "_handoff_git_out", no_git)
     session = _Session(_Stoppable(), tmp_path / "author-pending.json")
     handoff = _author._author_handoff(
-        session, _state.ProjectState(tmp_path, ""), _timeline._Timeline(), pin="", brief="brief"
+        session, _state.ProjectState(tmp_path, ""), _timeline._Timeline(), brief="brief"
     )
     session.on_limit_calls = 0
 

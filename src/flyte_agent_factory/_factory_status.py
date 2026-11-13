@@ -6,6 +6,8 @@ import re
 import time
 from typing import Any
 
+from flyte_agent_factory import _dashboard
+
 _HTML_ROW = re.compile(r"<tr><td><code>([^<]*)</code></td><td>([^<]*)</td><td>(.*?)</td></tr>", re.DOTALL)
 _HTML_STATUS = re.compile(r"<p><b>Status:</b> (.*?)</p>", re.DOTALL)
 
@@ -24,6 +26,11 @@ def _html_timeline(page: str) -> list[dict[str, Any]]:
         for at, icon, text in _HTML_ROW.findall(table)
     ]
     return rows[::-1]  # the table is newest first
+
+
+def phase_fields(phase: dict[str, Any]) -> dict[str, Any]:
+    """Return the `phase` label and, while the author waits on a usage limit, the structured `paused`."""
+    return {"phase": _dashboard.phase_label(phase), "paused": phase.get("paused")}
 
 
 #: What `factory.status` carries of each decision the factory made in the owner's place.
@@ -90,7 +97,11 @@ def _review(data: dict[str, Any]) -> dict[str, Any]:
     """Return the supervisor's review state: findings per round, the open ones, whether it converges."""
     phase = data.get("phase") or {}
     snapshot = data.get("review") or {}
-    review = {key: snapshot[key] for key in ("scores", "converging", "rulings") if key in snapshot}
+    review = {
+        key: snapshot[key]
+        for key in ("scores", "converging", "rulings", "judges", "no_verdict")
+        if key in snapshot
+    }
     if "open" in snapshot:
         review["open"] = list(snapshot["open"])[:10]
     for key in ("round", "max_rounds"):
