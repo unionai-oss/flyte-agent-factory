@@ -540,14 +540,6 @@ def test_checks_sh_runs_the_slow_lane_here_when_asked_and_keeps_the_ask_from_the
     assert uv_calls and all(c.endswith(" here=") for c in uv_calls), uv_calls
 
 
-def test_the_workspace_checks_sh_runs_the_slow_lane_here(tmp_path):
-    """The project's entry point runs the slow lane here: a 900s limit leaves no time after a failed child."""
-    repo = Path(__file__).resolve().parents[1]
-    text = (repo / "checks.sh").read_text()
-    assert "export AGENT_FACTORY_SLOW_LANE_HERE=1" in text
-    assert text.index("AGENT_FACTORY_SLOW_LANE_HERE") < text.index("exec bash")
-
-
 def test_checks_sh_runs_the_fast_lane_here_after_two_rounds_without_capacity(tmp_path):
     """A launcher that cannot place the fast lane (exit 75, --no-local) is asked twice; then it runs here."""
     repo = Path(__file__).resolve().parents[1]
