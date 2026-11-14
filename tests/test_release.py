@@ -1400,6 +1400,25 @@ async def test_round_start_reopens_the_supervisors_done_item(rig, monkeypatch):
         await rig.finish()
 
 
+@pytest.mark.parametrize("pr, status", [("https://github.com/x/y/pull/3", "In review"), ("", "Done")])
+async def test_the_release_move_is_in_review_while_its_pull_request_awaits_a_merge(
+    rig, monkeypatch, pr, status
+):
+    from flyte_agent_factory import _board
+    from tests.test_reconcile import ISSUE, URL, Board, board_profile
+
+    board = Board({ISSUE: {"status": "In flight", "texts": {"Flyte": URL}}}).install(monkeypatch)
+    monkeypatch.setattr(
+        _supervise_support, "_board_worker", _board.supervisor(board_profile(), "token", ISSUE)
+    )
+    await passed(rig)
+    rig.timeline.pr_url = pr
+    await rig.advance(HALF_HOUR + 120)
+    await wait_for(lambda: board.items[ISSUE]["status"] == status, what="the release move")
+    assert rig.released
+    await rig.finish()
+
+
 def test_withdrawing_a_legacy_pass_keeps_its_round(tmp_path, monkeypatch):
     path = tmp_path / "passed.json"
     path.write_text('{"round": 2, "sha": "abc", "review_round": 2}')

@@ -32,6 +32,7 @@ from . import (
     _issues,
     _profile,
     _pull_requests,
+    _queue,
 )
 from ._errors import REMOTE_ERRORS
 from ._images import agent_image
@@ -143,6 +144,7 @@ class RunIndex:
         self._by_issue: dict[str, list[remote.Run]] = {}
         self._seen = {r.name for r in runs}
         self._fetched: dict[str, remote.Run | None] = {}
+        self._snapshots: dict[str, _issues.Snapshot | None] = {}
         # Newest first. A run that never started (aborted while queued) has no report and no start time:
         # it is not a run the item could show, as in `heal_milestones`.
         started = [(at, r) for r in runs if (at := _started_at(r)) is not None]
@@ -209,16 +211,50 @@ class RunIndex:
         """
         runs = self._by_issue.get(_issues.issue_label(ref), [])
         live = [r for r in runs if _factory_base._phase(r) in _factory_base.LIVE]
-        # The fallback represents an issue with no indexed run.
-        run = (live or cast(list[remote.Run | None], runs) or [None])[0]
-        if run is None or not (live or _ended_within(run, BOARD_WINDOW, self.now)):
+        # An issue with no indexed run has no run to project.
+        candidates = live or runs
+        if not candidates:
+            return None
+        run = candidates[0]
+        if not (live or _ended_within(run, BOARD_WINDOW, self.now)):
             return None
         return bool(live), _board.run_url(PROFILE, run.name), _board_snapshot(run)
+
+    def newest(self, ref: str) -> tuple[bool, datetime | None, _issues.Snapshot | None] | None:
+        """Return `(live, ended_at, snapshot)` of issue `ref`'s newest indexed run, however long ago it ended.
+
+        `latest` is for projecting a run onto its card and goes quiet after `BOARD_WINDOW`; the truth pass
+        needs the run a stale card last showed. The index holds runs updated in the last day, plus the
+        ones the board still shows (`include_shown`).
+        """
+        runs = self._by_issue.get(_issues.issue_label(ref), [])
+        live = [r for r in runs if _factory_base._phase(r) in _factory_base.LIVE]
+        candidates = live or runs
+        if not candidates:
+            return None
+        run = candidates[0]
+        if run.name not in self._snapshots:
+            self._snapshots[run.name] = _board_snapshot(run)
+        return bool(live), _ended_at(run), self._snapshots[run.name]
 
 
 def latest_run(ref: str, now: float | None = None) -> tuple[bool, str, _issues.Snapshot | None] | None:
     """`RunIndex.latest` of a fresh listing: for one issue. A tick indexes once for all its items."""
     return RunIndex(project_runs(), now).latest(ref)
+
+
+def queued_issues(profile: _profile.Profile) -> set[str]:
+    """Lower-case `owner/repo#N` of each issue a pending launch request names; none without `[state]`."""
+    if not profile.state.uri:
+        return set()
+    queued = set()
+    for entry in _queue.pending(_queue.root(profile.state.uri)):
+        if entry.request and entry.request.issue:
+            try:
+                queued.add(_board.normalise_issue(entry.request.issue, profile.repos.values()))
+            except ValueError:
+                log.warning("Queued launch %s links an issue the board cannot name", entry.name)
+    return queued
 
 
 def _run_issue(profile: _profile.Profile, labels: dict[str, str]) -> str:
@@ -341,14 +377,20 @@ async def reconcile(completion_run: str = "") -> str:
             failed.append(exc)
     if PROFILE.board and milestones:
         try:
+            # After the run projection. The one board audit: it needs the App for the pull requests,
+            # commits and comments its facts come from; without it Status is not guessed.
             rows = await asyncio.to_thread(
                 _board_events.drift,
                 PROFILE,
                 token,
                 _github.GithubApp(PROFILE.github.app_id, key),
                 index.latest,
+                newest=index.newest,
+                queued=await asyncio.to_thread(queued_issues, PROFILE),
             )
-            done.append(f"{len(rows)} board drift row(s)")
+            corrections = sum(map(_board_events.is_correction, rows))
+            done.append(f"{corrections} board truth correction(s)")
+            done.append(f"{len(rows) - corrections} board drift row(s)")
         except REMOTE_ERRORS as exc:
             failed.append(exc)
     if milestones:
@@ -359,6 +401,8 @@ async def reconcile(completion_run: str = "") -> str:
             done.append(f"{count} milestone(s) posted")
         except REMOTE_ERRORS as exc:
             failed.append(exc)
+    if PROFILE.board and not milestones:
+        log.info("Board truth skipped: it needs the GitHub App for pull requests, commits and comments")
     if failed:
         raise failed[0]
     return "; ".join(done) or "nothing to reconcile"

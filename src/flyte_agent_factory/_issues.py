@@ -97,7 +97,13 @@ class _Deliverables(TypedDict, total=False):
     pr_at: float
 
 
+class _Phase(TypedDict, total=False):
+    kind: str
+    since: float
+
+
 class Snapshot(TypedDict, total=False):
+    phase: _Phase
     review: _Review
     deliverables: _Deliverables
 
