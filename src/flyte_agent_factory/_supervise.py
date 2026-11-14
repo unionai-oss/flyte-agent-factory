@@ -672,6 +672,17 @@ async def _pump(
                                 time.monotonic() - checks_started, checks_seconds, work
                             ),
                         )
+                        if work.harness_faults and not problems:
+                            declared_done = True
+                            await _supervise_support._escalate_harness_fault(
+                                proc, timeline, "\n".join(work.harness_faults)
+                            )
+                            continue
+                        if problems and work.harness_faults:
+                            problems.append(
+                                "The gate also hit a fault of the factory's (not yours; the next DONE reruns "
+                                "the gate): " + "; ".join(work.harness_faults)
+                            )
                         if problems:
                             failures = "\n".join(f"{i}. {problem}" for i, problem in enumerate(problems, 1))
                             if preflight_bounces >= _supervise_support._PREFLIGHT_MAX_BOUNCES:

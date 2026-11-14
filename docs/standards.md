@@ -140,9 +140,24 @@ from `languages/configs/`. A missing tool is reported as tool unavailable (an im
 
 For a rule in a language pack, a failure that the starting tree already had passes as pre-existing debt: only
 new findings block.
-The starting tree is the branch head with the project's own commits undone. When a merge from main joined
-upstream lines to a project change so that it no longer undoes, it is the upstream side of the branch's newest
-merge.
+
+The starting tree is where the project's own change begins. It is `base` with the newest upstream commit merged
+into the branch (the factory-mandated `git merge origin/main`) merged in, when the history shows one: the commits
+that are not the project's and do not build on its commits, with a single newest head that `origin/main` contains
+(that descends from `base`, when the workspace has no `origin/main`). The branch's own merge on top of `base` is
+not an upstream head; a merge on main is. For a project begun from main that start is the upstream commit's own
+tree; for a resumed project, whose `base` is an earlier head of its branch, the earlier run's work stays in it, so
+only this run's change is judged. A path on which `base` and upstream conflict takes upstream's text, so a
+resolution to main's line is not a change. Everything `HEAD` differs from the start by is the project's change,
+merge-commit content (a conflict resolution) included, so a path changed only in a merge is scope-checked. Without
+such a commit the start is `HEAD` with each project commit reverse-applied, newest first.
+
+When neither works (for example another author's commit edits the project's lines), the factory cannot compute
+the project's changes. That is a **harness fault**, not the project's failure: `scope` and `factory:fail-to-pass`
+are recorded as `harness fault` (and so is a failing language-pack rule or `factory:module-size`, since neither can be compared with a start).
+It does not block, but it holds review: the supervisor escalates to a human, tells the session it is not at
+fault and to `ask-human`, and bounces nothing. After the operator fixes the factory, `/review-again` resumes
+the hold. If the project also has real failures, DONE bounces with those, and the next DONE reruns the gate.
 
 ### `Enforced: lint <linter> <codes>`: a linter rule selection
 

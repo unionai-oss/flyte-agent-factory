@@ -118,6 +118,18 @@ def test_standards_results_runs_the_check_when_the_rule_is_selected(tmp_path):
     assert "SIZE-1" not in results
 
 
+def test_without_a_start_tree_because_of_a_harness_fault_the_check_does_not_fail_the_whole_tree(tmp_path):
+    """The start tree could not be built: an inherited big module is not the project's fault."""
+    _write(tmp_path, "big.py", LIMIT + 1)
+    rules = {"engineering.md": "## SIZE-1 MUST\nEnforced: check factory:module-size\n"}
+    work = _gate_tests.GateWork(start_fault="cannot reverse project changes: boom")
+    results = {r.rule: r for r in _gates.standards_results(tmp_path, rules, configs=tmp_path, work=work)}
+    result = results["factory:module-size"]
+    assert result.status is _gate_base.Status.HARNESS_FAULT
+    assert not result.status.blocks
+    assert "cannot compare with the starting tree" in result.output and "big.py" in result.output
+
+
 def test_standards_results_does_not_run_the_check_when_no_rule_maps_it(tmp_path):
     _write(tmp_path, "big.py", LIMIT + 1)
     rules = {"engineering.md": "## SIZE-1 MUST\nEnforced: judgement\n"}
@@ -129,9 +141,10 @@ def test_this_repository_does_not_grow_past_the_limit_from_its_own_head():
     if subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True).returncode:
         pytest.skip("not a git checkout")
     with _gate_start._start_tree(root, "HEAD", None) as start:
-        code, output = _module_size.check(root, start, _gate_tests._is_test)
+        code, output = _module_size.check(root, start.path, _gate_tests._is_test)
     assert code == 0, output
     assert "_bench_suite.py" not in output, "the bench suite was split under the limit; it must stay there"
+    assert output == "no module over the size limit"
 
 
 def _git(root: Path, *args: str) -> None:

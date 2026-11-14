@@ -30,6 +30,9 @@ class Status(enum.Enum):
     NOT_RUN = "not run"
     #: A FAIL the owner accepted in `waivers.toml`. It does not block.
     WAIVED = "WAIVED"
+    #: The factory could not do its part of the check (it could not compute the project's changes), which is
+    #: not the project's failure: it does not block, but it holds the work back from review (`holds`).
+    HARNESS_FAULT = "harness fault"
 
     @classmethod
     def from_exit(cls, code: int) -> Status:
@@ -41,6 +44,11 @@ class Status(enum.Enum):
     @property
     def blocks(self) -> bool:
         return self in {Status.FAIL, Status.TOOL_UNAVAILABLE}
+
+    @property
+    def holds(self) -> bool:
+        """Whether the work must not go to review, though it is not the project's failure."""
+        return self is Status.HARNESS_FAULT
 
 
 _SKIP_DIRS = {".git", ".claude-flyte", "node_modules", ".venv"}

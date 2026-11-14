@@ -139,27 +139,7 @@ def _project_commits(workspace: Path, name: str, base: str) -> tuple[int, str]:
     )
 
 
-def _changed_paths(workspace: Path, commits: list[str]) -> tuple[int, list[str]]:
-    paths: set[str] = set()
-    for commit in commits:
-        code, output = _gate_base._run(
-            [
-                "git",
-                "diff-tree",
-                "--root",
-                "--no-commit-id",
-                "--name-only",
-                "--no-renames",
-                "-r",
-                "-z",
-                commit,
-            ],
-            workspace,
-        )
-        if code:
-            return code, [output]
-        paths.update(p for p in output.split("\0") if p)
-    return 0, sorted(paths)
+_changed_paths = _gate_start.list_changed_paths  # the commit-path lister lives with the start tree
 
 
 #: Files that decide what a pytest run reports. The session can write them, so a junit `checks.sh` left is
@@ -366,9 +346,18 @@ def _judge_project(
     """
     tested = f"[{', '.join(fail_to_pass_rules)}] "
 
+    def record_fault(reason: str) -> None:
+        record("scope", _gate_base.Status.HARNESS_FAULT, _gate_start.describe_harness_fault(reason))
+        if fail_to_pass_rules:
+            record(
+                _standards.FAIL_TO_PASS,
+                _gate_base.Status.HARNESS_FAULT,
+                tested + _gate_start.describe_harness_fault(reason),
+            )
+
     code, output = _project_commits(workspace, name, base)
     if code:
-        record("scope", _gate_base.Status.from_exit(code), output)
+        record_fault(f"git rev-list failed: {output}")
         return
     commits = output.splitlines()
     identity = commit_identity(name)
@@ -408,37 +397,32 @@ def _judge_project(
             return
         record("attribution", _gate_base.Status.NOT_APPLICABLE, "no project changes yet")
     try:
-        with _gate_start._start_tree(workspace, base, commits) as start:
+        with _gate_start._start_tree(workspace, base, commits) as built:
+            start = built.path
             code, touched = _changed_paths(workspace, commits)
             if code:
-                record("scope", _gate_base.Status.from_exit(code), "".join(touched))
-                return
+                raise _gate_start._GateError(f"git diff-tree failed: {''.join(touched)}")
+            touched = _gate_start.add_merge_paths(workspace, built, touched)
             changes = _net_changes(workspace, start, touched)
+            changes += _gate_start.find_authored_paths(
+                workspace, built, base, commits, sorted(set(touched) - set(changes))
+            )
             code, directories = _gate_base._run(
                 ["git", "ls-tree", "-d", "--name-only", "-z", base], workspace
             )
             if code:
-                record("scope", _gate_base.Status.from_exit(code), directories)
-                owned = None
-            else:
-                owned = set(directories.split("\0"))
-                code, history = _gate_base._run(
-                    ["git", "rev-list", "--no-merges", f"{base}..HEAD"], workspace
-                )
-                if not code:
-                    code, upstream_paths = _changed_paths(
-                        workspace, sorted(set(history.splitlines()) - set(commits))
-                    )
-                    if code:
-                        history = "".join(upstream_paths)
-                if code:
-                    record("scope", _gate_base.Status.from_exit(code), history)
-                    owned = None
-                else:
-                    owned.update(PurePosixPath(p).parts[0] for p in upstream_paths if "/" in p)
-                state = workspace / ".claude-flyte"
-                if owned is not None and state.is_dir():
-                    owned.update(p.name for p in state.iterdir() if p.is_dir())
+                raise _gate_start._GateError(f"git ls-tree failed: {directories}")
+            owned = set(directories.split("\0"))
+            code, history = _gate_base._run(["git", "rev-list", "--no-merges", f"{base}..HEAD"], workspace)
+            if code:
+                raise _gate_start._GateError(f"git rev-list failed: {history}")
+            code, upstream_paths = _changed_paths(workspace, sorted(set(history.splitlines()) - set(commits)))
+            if code:
+                raise _gate_start._GateError(f"git diff-tree failed: {''.join(upstream_paths)}")
+            owned.update(PurePosixPath(p).parts[0] for p in upstream_paths if "/" in p)
+            state = workspace / ".claude-flyte"
+            if state.is_dir():
+                owned.update(p.name for p in state.iterdir() if p.is_dir())
             violations = _gate_scope.scope_violations(changes, name, brief, owned, layout)
             flagged = _gate_scope.scope_flagged(changes, name, brief, owned, layout)
             outside = (
@@ -471,7 +455,7 @@ def _judge_project(
                 tested + output,
             )
     except _gate_start._GateError as exc:
-        record("scope", _gate_base.Status.FAIL, str(exc))
+        record_fault(str(exc))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -771,7 +755,13 @@ def standards_results(
     all_rules = _standards.rules(files)
     standards_dir = standards_dir or configs.parent.parent
 
+    # Rules judged against the start tree; without one, their failure is the factory's
+    # (`fault_failure_without_start`)
+    language_idents = {r.ident for r in all_rules if r.language_pack} | {_standards.MODULE_SIZE}
+
     def record(rule: str, status: _gate_base.Status, output: str) -> None:
+        if rule in language_idents and work:
+            status, output = _gate_start.fault_failure_without_start(status, output, work.start_fault)
         results.append(Result(rule, status, output))
 
     if not all_rules:
@@ -948,6 +938,8 @@ def standards_results(
             if _gate_base.Status.FAIL in statuses
             else _gate_base.Status.TOOL_UNAVAILABLE
             if _gate_base.Status.TOOL_UNAVAILABLE in statuses
+            else _gate_base.Status.HARNESS_FAULT
+            if _gate_base.Status.HARNESS_FAULT in statuses
             else _gate_base.Status.PASS,
             labelled(
                 ids,
@@ -1279,7 +1271,9 @@ def run(
                     )
             except (OSError, ValueError, TypeError):
                 pass
-        icon = "🚧" if status.blocks else "⚠️" if status is _gate_base.Status.UNKNOWN else "ℹ️"
+        if status.holds:
+            work.harness_faults.append(f"{rule}: {output}")
+        icon = "🚧" if status.blocks else "⚠️" if status is _gate_base.Status.UNKNOWN or status.holds else "ℹ️"
         timeline.row(icon, f"{rule}: {status.value}: {output}")
 
     if waiver_note:
@@ -1325,11 +1319,11 @@ def run(
             try:
                 start = stack.enter_context(
                     _gate_start._start_tree(workspace, base, None if code else output.splitlines())
-                )
+                ).path
             except _gate_start._GateError as exc:
-                # `scope` reports a failure to list the commits, not this one: without a start tree
-                # the language rules below judge the whole tree, so say so rather than fail quietly.
-                record("scope", _gate_base.Status.FAIL, f"{exc}; the language rules judged the whole tree")
+                # `scope` reports this once, in `_judge_project`. Without a start tree a language rule
+                # cannot tell inherited debt from the project's: its failure is the factory's fault.
+                work.start_fault = str(exc)
         for result in standards_results(
             project, files, configs=configs, shell_scripts=scripts, changed=changed, start=start, work=work
         ):

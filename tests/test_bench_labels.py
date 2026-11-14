@@ -18,6 +18,7 @@ from flyte_agent_factory import (
     _bench_store,
     _dashboard,
     _factory_base,
+    _gate_base,
     _session_config,
     _timeline,
 )
@@ -393,6 +394,10 @@ def test_every_gate_status_survives_compaction(report):
     report["standards_results"] = _dashboard.compact_standards_results(rows)
     gates = [r for r in _bench.labels_from_report(report, None, "SUCCEEDED") if r["kind"] == "gate"]
     assert sorted((r["verdict"] for r in gates), key=len) == statuses
+
+
+def test_a_harness_fault_is_a_gate_label():
+    assert _gate_base.Status.HARNESS_FAULT.value in _bench._GATE_STATUSES
 
 
 def test_an_unreadable_pr_drops_only_the_merge_row(origin, report, monkeypatch):
