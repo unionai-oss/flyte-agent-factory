@@ -654,3 +654,120 @@ def test_the_grant_page_adds_no_mcp_tool():
     assert factory.app.enabled_tools == set(factory.TOOLS)
     assert factory.app.mcp is not None
     assert {tool.name for tool in factory.app.mcp._tool_manager.list_tools()} == set(factory.TOOLS)
+
+
+# --- signal_condition: any answer to an ask reaches the project ---------------------------------
+
+
+class _Cond:
+    """A condition as `Condition.get`/`listall` return it, recording what it is signalled."""
+
+    def __init__(self, name, phase="ACTION_PHASE_PAUSED", expected=str, refuse=False):
+        self.name, self.phase, self.expected, self.refuse = name, phase, expected, refuse
+        self.signalled: list[Any] = []
+        self.pb2 = SimpleNamespace(expected=expected)
+        self.signal = SimpleNamespace(aio=self._signal)
+
+    async def _signal(self, payload):
+        if self.refuse:
+            from connectrpc.code import Code
+            from connectrpc.errors import ConnectError
+
+            raise ConnectError(
+                Code.FAILED_PRECONDITION, f"{self.name}: condition is TIMED_OUT, expected PAUSED"
+            )
+        self.signalled.append(payload)
+
+
+@pytest.fixture
+def conditions(remote, monkeypatch):
+    """A run holding `Cond`s by name; `Condition.get` and `listall` read them."""
+    import flyte.remote
+    import flyte.remote._condition as stock
+
+    held: dict[str, _Cond] = {}
+
+    async def get(name, run_name):
+        return held.get(name)
+
+    async def listall(run_name, limit=100):
+        for condition in held.values():
+            yield condition
+
+    monkeypatch.setattr(flyte.remote.Condition, "get", SimpleNamespace(aio=get))
+    monkeypatch.setattr(flyte.remote.Condition, "listall", SimpleNamespace(aio=listall))
+    monkeypatch.setattr(stock, "resolve_condition_expected_type", lambda pb2: pb2.expected)
+    return held
+
+
+async def _signal(name="ask-a0-001", value="yes", **extra):
+    return await call("signal_condition", name=name, run_name="run1", value=value, **extra)
+
+
+async def test_a_yes_to_a_bool_ask_is_signalled_as_true(conditions):
+    conditions["ask-a0-001"] = ask = _Cond("ask-a0-001", expected=bool)
+    result = await _signal(value="Yes, go ahead")
+    assert ask.signalled == [True] and result["signaled"] is True and "rerouted" not in result
+
+
+async def test_a_text_ask_gets_any_value_as_text(conditions):
+    conditions["ask-a0-001"] = ask = _Cond("ask-a0-001")
+    await _signal(value="hold off until Monday")
+    assert ask.signalled == ["hold off until Monday"]
+
+
+async def test_an_answer_to_an_ask_that_ended_goes_to_the_direct_inbox(conditions):
+    conditions["ask-a0-001"] = ask = _Cond("ask-a0-001", phase="ACTION_PHASE_ABORTED")
+    conditions["direct-a0-004"] = inbox = _Cond("direct-a0-004")
+    result = await _signal(value="yes, go ahead")
+    assert ask.signalled == [] and inbox.signalled == ["/late-answer ask-a0-001 yes, go ahead"]
+    assert result["rerouted"] is True and result["signaled"] is True
+    assert result["delivered_to"] == "direct-a0-004" and result["run_name"] == "run1"
+    assert "ABORTED" in result["reason"] and result["name"] == "ask-a0-001"
+
+
+async def test_an_answer_the_ask_refuses_because_it_just_ended_goes_to_the_direct_inbox(conditions):
+    conditions["ask-a0-001"] = _Cond("ask-a0-001", refuse=True)
+    conditions["direct-a0-004"] = inbox = _Cond("direct-a0-004")
+    result = await _signal(value="no")
+    assert inbox.signalled == ["/late-answer ask-a0-001 no"] and result["rerouted"] is True
+
+
+async def test_an_answer_that_cannot_be_coerced_goes_to_the_direct_inbox(conditions):
+    conditions["ask-a0-001"] = ask = _Cond("ask-a0-001", expected=bool)
+    conditions["direct-a0-004"] = inbox = _Cond("direct-a0-004")
+    result = await _signal(value="hold off until Monday")
+    assert ask.signalled == []
+    assert inbox.signalled == ["/late-answer ask-a0-001 hold off until Monday"] and result["rerouted"] is True
+
+
+async def test_a_direct_inbox_that_is_not_open_is_not_used(conditions):
+    conditions["ask-a0-001"] = _Cond("ask-a0-001", phase="ACTION_PHASE_ABORTED")
+    conditions["direct-a0-003"] = old = _Cond("direct-a0-003", phase="ACTION_PHASE_SUCCEEDED")
+    with pytest.raises(ToolError, match="NOT delivered.*no open direct- inbox"):
+        await _signal()
+    assert old.signalled == []
+
+
+async def test_an_empty_answer_to_an_ask_that_ended_is_not_reported_as_delivered(conditions):
+    conditions["ask-a0-001"] = _Cond("ask-a0-001", phase="ACTION_PHASE_TIMED_OUT")
+    conditions["direct-a0-004"] = inbox = _Cond("direct-a0-004")
+    with pytest.raises(ToolError, match="NOT delivered.*empty"):
+        await _signal(value="  ")
+    assert inbox.signalled == []
+
+
+async def test_a_value_the_condition_cannot_take_is_still_an_error_outside_asks(conditions):
+    conditions["direct-a0-004"] = _Cond("direct-a0-004", expected=bool)
+    with pytest.raises(ToolError, match="neither yes nor no"):
+        await _signal(name="direct-a0-004", value="soon")
+
+
+async def test_signal_condition_still_refuses_another_project(conditions):
+    with pytest.raises(ToolError, match="other-project"):
+        await _signal(project="other-project")
+
+
+def test_instructions_say_plain_answers_are_fine_and_late_ones_are_rerouted():
+    assert "Plain yes or no, or a sentence" in factory.INSTRUCTIONS
+    assert "rerouted" in factory.INSTRUCTIONS and "NOT delivered" in factory.INSTRUCTIONS

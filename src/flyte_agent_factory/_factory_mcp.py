@@ -27,6 +27,9 @@ from mcp.server.fastmcp import (
 from mcp.server.fastmcp.exceptions import ToolError
 
 from . import _factory, _grant_page, _profile
+from ._bridge import _ENDED_PHASES, _ended_on_server
+from ._bridge_common import parse_approval
+from ._errors import REMOTE_ERRORS
 from ._factory import DOMAIN, PROJECT
 from ._factory_base import PROFILE, SLOTS, cap
 from ._images import agent_image
@@ -145,7 +148,11 @@ project). Decide an engineering-judgement ask- yourself (design, structure, how 
 tooling): do what is the right thing to do, never a waiver, lowered threshold, removed rule or skipped test.
 Signal a value that starts "Operator decision (engineering judgement): " with the reasoning, and tell the
 user what you decided. Relay only owner-reserved asks ({_relay_list()}) to the user, one at a time, stated
-plainly with your recommendation, and signal_condition their answer verbatim. The factory's own judge already
+plainly with your recommendation, and signal_condition their answer verbatim. Plain yes or no, or a sentence,
+is fine for any ask, including a yes/no one: do not convert it to true or false. If the ask had already closed
+(timed out, or replaced by a newer one), the answer is not lost: signal_condition sends it to the project's
+inbox and returns rerouted: true; an error saying it was NOT delivered means the project has no open inbox,
+so tell the user. The factory's own judge already
 decides engineering asks before they open: factory.status returns those as decisions, with reasoning. The user
 overrules one by sending direction that names its id, such as "overrule decision-003: ...".
 Prefer /stop over abort_run; abort loses uncheckpointed work.
@@ -372,6 +379,87 @@ def _get_only_the_factory_project(stock: ToolFn) -> ToolFn:
     return get_project
 
 
+def _signal_condition_that_reaches_the_project(environment: FlyteMCPAppEnvironment, stock: ToolFn) -> ToolFn:
+    """`signal_condition` that takes any answer to an ask, and sends a late one to the project's inbox.
+
+    A chat relays the owner's words as they are. The stock tool fails on a sentence for a bool condition
+    and on a condition that has ended, and either way the owner's answer was lost to the project. Here an
+    ask's answer that cannot be signalled to it goes to the run's open `direct-` condition instead, as
+    `/late-answer <condition> <value>`, which the session's inbox hands to its bridge (`Bridge.late_answer`).
+    """
+
+    @functools.wraps(stock)
+    async def signal_condition(
+        name: str,
+        run_name: str,
+        value: bool | int | float | str,
+        project: str | None = None,
+        domain: str | None = None,
+        ctx: MCPContext | None = None,  # type: ignore[type-arg]  # bare on purpose, see above
+    ) -> dict:  # type: ignore[type-arg]  # bare on purpose, see above
+        from flyte.remote._condition import coerce_condition_payload, resolve_condition_expected_type
+
+        with environment._scoped(project, domain):
+            condition = await cast(Any, flyte.remote.Condition.get).aio(name, run_name=run_name)
+            if condition is None:
+                raise ToolError(f"Condition '{name}' was not found in run '{run_name}'.")
+            is_ask = name.startswith("ask-")
+            phase = str(getattr(condition, "phase", "") or "").removeprefix("ACTION_PHASE_")
+            late = f"{name} had already ended ({phase})" if is_ask and phase in _ENDED_PHASES else ""
+            payload: Any = value
+            if not late:
+                expected = resolve_condition_expected_type(condition.pb2)
+                try:
+                    if expected is bool:
+                        # An approve ask from before they took text: coerce "yes" or a sentence.
+                        payload = parse_approval(value)
+                        if payload is None:
+                            raise ValueError(f"{value!r} is neither yes nor no")
+                    elif expected is not None:
+                        payload = coerce_condition_payload(value, expected)
+                except (ValueError, TypeError) as e:
+                    if not is_ask:
+                        raise ToolError(f"{name}: {e}") from e
+                    late = f"{name} takes {expected.__name__ if expected else 'another type'}: {e}"
+            if not late:
+                try:
+                    await condition.signal.aio(payload)
+                except REMOTE_ERRORS as e:
+                    if not (is_ask and _ended_on_server(e)):
+                        raise
+                    late = f"{name} had already ended"
+                else:
+                    return {"name": condition.name, "run_name": run_name, "signaled": True, "value": payload}
+
+            if not str(value).strip():
+                raise ToolError(
+                    f"The answer to {name} was NOT delivered: {late}, and an empty answer says nothing."
+                )
+            inbox = None
+            async for candidate in cast(Any, flyte.remote.Condition.listall).aio(
+                run_name=run_name, limit=500
+            ):
+                if candidate.name.startswith("direct-") and "PAUSED" in str(candidate.phase):
+                    inbox = candidate
+                    break
+            if inbox is None:
+                raise ToolError(
+                    f"The answer to {name} was NOT delivered: {late}, and run '{run_name}' has no open "
+                    "direct- inbox right now. Tell the user it did not arrive and try again shortly."
+                )
+            await inbox.signal.aio(f"/late-answer {name} {value}")
+            return {
+                "name": name,
+                "run_name": run_name,
+                "signaled": True,
+                "rerouted": True,
+                "delivered_to": inbox.name,
+                "reason": f"{late}; sent to the project's inbox as a late answer",
+            }
+
+    return signal_condition
+
+
 def _scope_tools_to_the_factory(environment: FlyteMCPAppEnvironment) -> None:
     """Swap every registered tool that takes a `project` or `domain` for one that refuses the wrong ones.
 
@@ -386,6 +474,10 @@ def _scope_tools_to_the_factory(environment: FlyteMCPAppEnvironment) -> None:
             replacement = _list_only_the_factory_project(fn)
         elif name == "get_project":
             replacement = _get_only_the_factory_project(fn)
+        elif name == "signal_condition":
+            replacement = _scoped_to_the_factory(
+                name, _signal_condition_that_reaches_the_project(environment, fn)
+            )
         elif {"project", "domain"} & set(inspect.signature(fn).parameters):
             replacement = _scoped_to_the_factory(name, fn)
         else:

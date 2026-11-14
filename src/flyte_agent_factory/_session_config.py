@@ -64,6 +64,9 @@ _INBOX_DIR = INBOX_SUBDIR  # defined in _bridge, which also drops late answers h
 #: modification, and a project committed it by accident.
 _BRIEF_FILE = ".claude-flyte/BRIEF.md"
 
+#: The linked GitHub issue, written by the supervisor (`_issue_file`): the session holds no credential.
+_ISSUE_FILE = ".claude-flyte/ISSUE.md"
+
 #: The deployment profile, if one is selected (see `_profile`); a pod gets its text from the env.
 _PROFILE = _profile.current()
 

@@ -310,6 +310,16 @@ async def _prepare_workspace(
         timeline.row("⚠️", "no role definitions found; the swarm roles are unavailable")
 
 
+def _kickoff_prompt() -> str:
+    """Return the session's first prompt: one short line per file; the brief is never typed in."""
+    return (
+        f"Read {_session_config._BRIEF_FILE} and get started on it now. If {_session_config._ISSUE_FILE} "
+        "exists it holds the GitHub issue this project was launched from; read it too. Other directories "
+        "in this repo are finished work from unrelated projects -- not yours, not context you need, and "
+        f"not a reason to pause. Ask me with ask-human if {_session_config._BRIEF_FILE} itself is unclear."
+    )
+
+
 def _exclude_harness(workspace: Path) -> None:
     """Keep the harness's files out of `git status` in a cloned workspace.
 

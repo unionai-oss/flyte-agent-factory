@@ -382,13 +382,13 @@ def test_merge_into_topic_does_not_complete(world):
 
 
 # The factory lifecycle; Todo was removed from the board (inbox 036).
-@pytest.mark.parametrize("status", ["Backlog", "Ready", "In flight", "In review", "Done"])
+@pytest.mark.parametrize("status", ["Backlog", "Ready", "In flight", "In review", "Upstream", "Done"])
 def test_unmerged_pr_only_rolls_review_back(world, status):
     profile, board, app = world
     board.items[f"{REPO}#49"]["status"] = status
     pull = {"title": "board #49", "merged": False}
     _board_events.process(profile, "token", app, "pull_request", event(action="closed", pull_request=pull))
-    expected = "Done" if status == "Done" else "In flight"
+    expected = status if status in ("Upstream", "Done") else "In flight"
     assert board.items[f"{REPO}#49"]["status"] == expected
     assert app.closed == []
 
@@ -459,7 +459,8 @@ def test_one_status_list_drives_ranks_and_order():
     from flyte_agent_factory import _board
 
     assert _board.STATUSES == _board.SELECTS["Status"] == _board._STATUS_ORDER
-    assert _board.STATUSES == ("Backlog", "Ready", "In flight", "In review", "Done")
+    assert _board.STATUSES == ("Backlog", "Ready", "In flight", "In review", "Upstream", "Done")
+    assert _board._rank("In review") < _board._rank("Upstream") < _board._rank("Done")
 
 
 # --- QA round 2 (N7-N10) ----------------------------------------------------------------------- #

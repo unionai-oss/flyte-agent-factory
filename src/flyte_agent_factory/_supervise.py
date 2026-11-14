@@ -1428,8 +1428,10 @@ async def _pump(
                 )
                 timeline.phase("released")
                 timeline.activity("released -- launch the same name again to continue")
+                # As `_board.desired`: a pull request still awaits its merge, which makes the card Done.
+                has_pr = bool(timeline.snapshot()["deliverables"]["pr"])
                 await _supervise_support._move_board(
-                    "Done", timeline, Engine=_supervise_support._engines_used()
+                    "In review" if has_pr else "Done", timeline, Engine=_supervise_support._engines_used()
                 )
                 _supervise_support._release_note = "released after idle (passed review)"
                 _supervise_support._released = True

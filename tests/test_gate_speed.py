@@ -471,7 +471,11 @@ def test_every_package_module_the_slow_lane_launcher_imports_is_test_harness():
 
 
 def test_checks_sh_sends_both_lanes_through_the_launcher_when_asked_for_child_actions(tmp_path):
-    """With AGENT_FACTORY_SLOW_LANE=child the fast lane is a child action too, each with its own marker."""
+    """With AGENT_FACTORY_SLOW_LANE=child the fast lane is a child action too.
+
+    Each lane has its own marker. The fast lane, the dearer one on a 4-CPU pod, goes on-demand when spot has
+    no room and leaves the fallback to checks.sh; the slow lane tries spot, then the launcher runs it here.
+    """
     repo = Path(__file__).resolve().parents[1]
     log = tmp_path / "uv.log"
     uv = tmp_path / "bin" / "uv"
@@ -493,9 +497,108 @@ def test_checks_sh_sends_both_lanes_through_the_launcher_when_asked_for_child_ac
     subprocess.run(["bash", str(repo / "factory-improvement/checks.sh")], cwd=repo, env=env, check=True)
     lane_calls = [c for c in log.read_text().splitlines() if c.startswith("lane ")]
     assert sorted(lane_calls) == sorted(
-        [f"lane --junit {junit}/fast.xml -m not slow", f"lane --junit {junit}/slow.xml"]
+        [
+            f"lane --on-demand --no-local --junit {junit}/fast.xml -m not slow",
+            f"lane --junit {junit}/slow.xml",
+        ]
     )
     assert not [c for c in log.read_text().splitlines() if "-m pytest" in c], "a lane ran here"
+
+
+def test_checks_sh_runs_the_slow_lane_here_when_asked_and_keeps_the_ask_from_the_suite(tmp_path):
+    """AGENT_FACTORY_SLOW_LANE_HERE=1: the fast lane still goes to the launcher; the slow lane runs here.
+
+    The variable is not passed on, so the suite's own runs of checks.sh see the default.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    log = tmp_path / "uv.log"
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    uv.write_text(f'#!/bin/bash\necho "$* here=${{AGENT_FACTORY_SLOW_LANE_HERE:-}}" >> {log}\n')
+    uv.chmod(0o755)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    lane = tmp_path / "test-lane"
+    lane.write_text(f'#!/bin/bash\necho "lane $*" >> {log}\n')
+    lane.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
+        _gate_tests.PYTEST_JUNIT_ENV: str(junit),
+        _gate_tests.SLOW_LANE_ENV: "child",
+        _gate_tests.TEST_LANE_ENV: str(lane),
+        "AGENT_FACTORY_SLOW_LANE_HERE": "1",
+    }
+    subprocess.run(["bash", str(repo / "factory-improvement/checks.sh")], cwd=repo, env=env, check=True)
+    calls = log.read_text().splitlines()
+    assert [c for c in calls if c.startswith("lane ")] == [
+        f"lane --on-demand --no-local --junit {junit}/fast.xml -m not slow"
+    ]
+    here = [c for c in calls if "-m pytest" in c]
+    assert len(here) == 1 and f"-m slow --junitxml {junit}/slow.xml" in here[0], here
+    uv_calls = [c for c in calls if not c.startswith("lane ")]
+    assert uv_calls and all(c.endswith(" here=") for c in uv_calls), uv_calls
+
+
+def test_checks_sh_runs_the_fast_lane_here_after_two_rounds_without_capacity(tmp_path):
+    """A launcher that cannot place the fast lane (exit 75, --no-local) is asked twice; then it runs here."""
+    repo = Path(__file__).resolve().parents[1]
+    log = tmp_path / "uv.log"
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    uv.write_text(f'#!/bin/bash\necho "$*" >> {log}\n')
+    uv.chmod(0o755)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    lane = tmp_path / "test-lane"
+    # Like the launcher: exit 75 only when told not to run the lane here; otherwise it runs it (a no-op).
+    lane.write_text(f'#!/bin/bash\necho "lane $*" >> {log}\n[[ " $* " != *" --no-local "* ]] || exit 75\n')
+    lane.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
+        _gate_tests.PYTEST_JUNIT_ENV: str(junit),
+        _gate_tests.SLOW_LANE_ENV: "child",
+        _gate_tests.TEST_LANE_ENV: str(lane),
+    }
+    run = subprocess.run(
+        ["bash", str(repo / "factory-improvement/checks.sh")],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    calls = log.read_text().splitlines()
+    fast = f"lane --on-demand --no-local --junit {junit}/fast.xml -m not slow"
+    assert [c for c in calls if c.startswith("lane ") and "-m not slow" in c] == [fast, fast]
+    here = [c for c in calls if "-m pytest" in c]
+    assert len(here) == 1 and f"-m not slow --junitxml {junit}/fast.xml" in here[0], here
+    assert "fast lane: running here, the child action could not be placed" in run.stderr
+
+
+def test_checks_sh_fails_when_the_fast_lane_fails_in_its_child_action(tmp_path):
+    """A failing lane in a child action fails the checks; it is not retried or run again here."""
+    repo = Path(__file__).resolve().parents[1]
+    log = tmp_path / "uv.log"
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    uv.write_text(f'#!/bin/bash\necho "$*" >> {log}\n')
+    uv.chmod(0o755)
+    lane = tmp_path / "test-lane"
+    lane.write_text(f'#!/bin/bash\necho "lane $*" >> {log}\nexit 1\n')
+    lane.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
+        _gate_tests.SLOW_LANE_ENV: "child",
+        _gate_tests.TEST_LANE_ENV: str(lane),
+    }
+    run = subprocess.run(["bash", str(repo / "factory-improvement/checks.sh")], cwd=repo, env=env)
+    assert run.returncode == 1
+    calls = log.read_text().splitlines()
+    assert len([c for c in calls if c.startswith("lane ") and "-m not slow" in c]) == 1
+    assert not [c for c in calls if "-m not slow" in c and "-m pytest" in c]
 
 
 def test_checks_sh_runs_both_lanes_here_when_no_launcher_is_given(tmp_path):

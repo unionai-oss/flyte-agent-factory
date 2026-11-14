@@ -79,6 +79,7 @@ async def _inbox_loop(
     credentials: Credentials | None = None,
     *,
     on_engine: Callable[[str], str] | None = None,
+    on_late_answer: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
     """Deliver direction that arrives over Flyte conditions into the session.
 
@@ -87,6 +88,9 @@ async def _inbox_loop(
     credentials and `/revoke-credential` before anything else sees them (`Credentials.handle`).
     `on_engine` takes an engine direction (`engine_direction`) and returns the timeline row saying what
     was done. Without it, such a message is ordinary direction for the session.
+    `on_late_answer` takes `/late-answer <condition> <text>`, the owner's answer to an ask that had already
+    closed, which the factory's MCP server reroutes here (`Bridge.late_answer`); it puts it in the inbox
+    itself. Without it, such a message is ordinary direction.
 
     `proc` may be a future for a session that does not exist yet: the loop is started before the
     session so that `/stop` needs no author. Other messages wait for the session, then arrive once.
@@ -140,6 +144,13 @@ async def _inbox_loop(
                     continue
                 if message.split(None, 1)[0].lower() == "/review-again":
                     deliveries.put_nowait(functools.partial(grant_round, timeline=timeline, message=message))
+                    continue
+                late = message.split(None, 2)
+                if on_late_answer is not None and len(late) == 3 and late[0].lower() == "/late-answer":
+                    try:
+                        await on_late_answer(late[1], late[2])
+                    except OSError as e:  # a lost late answer must not end the inbox
+                        timeline.row("⚠️", f"late answer for {late[1]} not delivered: {type(e).__name__}: {e}")
                     continue
                 if on_engine is not None and (engine := engine_direction(message)):
                     # Acted on here, not delivered: a paused session would only queue it behind the very

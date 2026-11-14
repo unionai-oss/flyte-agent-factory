@@ -49,11 +49,14 @@ class BoardRow(TypedDict, total=False):
     linked_run: str
     title: str
     labels: list[str]
+    #: When Status was last set (ISO 8601) and the type of its setter (`Bot`, `User`); "" if not said.
+    status_at: str
+    status_by: str
 
 
 TOKEN_ENV = "GITHUB_BOARD_PAT"
 SELECTS = {
-    "Status": ("Backlog", "Ready", "In flight", "In review", "Done"),
+    "Status": ("Backlog", "Ready", "In flight", "In review", "Upstream", "Done"),
     "Size": ("S", "M", "L"),
     # Not "Type": GitHub reserves that name for issue types and refuses to create it.
     "Kind": ("feature", "bug", "refactor", "docs", "research"),
@@ -79,6 +82,11 @@ _INVALID_TYPES = {"NOT_FOUND", "UNPROCESSABLE"}
 #: Statuses that need the owner rather than time: an unreadable board, a refused or unauthorised token.
 _OWNER_STATUSES = (400, 401, 403, 404)
 _ISSUE = re.compile(r"(?:([A-Za-z0-9][A-Za-z0-9-]*)/)?([A-Za-z0-9._-]+)#([1-9][0-9]*)")
+#: The Status value and who set it when: the truth pass leaves a card a person just moved alone.
+_STATUS_VALUE = (
+    'fieldValueByName(name:"Status") {... on ProjectV2ItemFieldSingleSelectValue '
+    "{name updatedAt creator {__typename login}}} "
+)
 
 
 def credential_env_vars(secret: str, env: Mapping[str, str]) -> tuple[str, ...]:
@@ -157,6 +165,25 @@ def _graphql_error(errors: list[GraphQL]) -> BoardError:
     return BoardError("board GraphQL request failed", _graphql_status(errors))
 
 
+def _with_options(existing: list[GraphQL], wanted: tuple[str, ...]) -> list[GraphQL]:
+    """`existing` options as they are, plus each of `wanted` they lack, at its place in `wanted`'s order.
+
+    A missing option goes right after the nearest earlier option of `wanted` that is present, else right
+    before the nearest later one, else at the end. Appending would put Upstream after Done. Options not in
+    `wanted` stay beside the neighbours they had. Existing options keep their id, so cards keep their value.
+    """
+    merged = [dict(o) for o in existing]
+    for index, name in enumerate(wanted):
+        if any(o["name"] == name for o in merged):
+            continue
+        earlier, later = set(wanted[:index]), set(wanted[index + 1 :])
+        after = [i for i, o in enumerate(merged) if o["name"] in earlier]
+        before = [i for i, o in enumerate(merged) if o["name"] in later]
+        position = after[-1] + 1 if after else before[0] if before else len(merged)
+        merged.insert(position, {"name": name, "color": "GRAY", "description": ""})
+    return merged
+
+
 class BoardClient:
     def __init__(self, token: str, *, transport: httpx.BaseTransport | None = None) -> None:
         self._http = httpx.Client(
@@ -233,13 +260,10 @@ class BoardClient:
                     raise BoardError(f"board field {name} must be single-select", 400)
                 if not options and ("options" in existing or existing.get("dataType", "TEXT") != "TEXT"):
                     raise BoardError(f"board field {name} must be text", 400)
-                missing = [
-                    opt for opt in options if opt not in {o["name"] for o in existing.get("options", [])}
-                ]
-                if missing:
+                present = {o["name"] for o in existing.get("options", [])}
+                if any(opt not in present for opt in options):
                     # The update API replaces the whole option list; preserve IDs and custom options.
-                    updated = [dict(o) for o in existing["options"]]
-                    updated += [{"name": opt, "color": "GRAY", "description": ""} for opt in missing]
+                    updated = _with_options(existing["options"], options)
                     result = self._query(
                         "mutation UpdateField($input:UpdateProjectV2FieldInput!) {"
                         "updateProjectV2Field(input:$input)"
@@ -334,6 +358,28 @@ class BoardClient:
         content = data.get("content") or {}
         return (data.get("fieldValueByName") or {}).get("name", ""), content.get("state", "OPEN") == "OPEN"
 
+    def pull_request_state(self, issue: str) -> str:
+        """Return the state (OPEN, MERGED, CLOSED) of pull request `owner/repo#N`.
+
+        "" if it is not visible, or if `issue` is not of that form.
+
+        Any repository's public pull requests are readable with the board token.
+        """
+        match = _ISSUE.fullmatch(issue)
+        if not match or not match[1]:
+            return ""
+        owner, name, number = match.groups()
+        body = self._post(
+            "query UpstreamPull($owner:String!,$name:String!,$number:Int!) {"
+            "repository(owner:$owner,name:$name) {pullRequest(number:$number) {state merged}}}",
+            {"owner": owner, "name": name, "number": int(number)},
+        )
+        errors = body.get("errors") or []
+        if any(error.get("type") != "NOT_FOUND" for error in errors):
+            raise _graphql_error(errors)
+        pull = ((body.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
+        return "MERGED" if pull.get("merged") else str(pull.get("state", ""))
+
     def set_status(self, item: str, name: str) -> None:
         try:
             option = next(o["id"] for o in self.fields["Status"]["options"] if o["name"] == name)
@@ -367,8 +413,10 @@ class BoardClient:
         while True:
             data = self._query(
                 "query BoardItems($id:ID!,$after:String) {node(id:$id) {... on ProjectV2 {"
-                'items(first:100,after:$after) {nodes {id fieldValueByName(name:"Status") {'
-                "... on ProjectV2ItemFieldSingleSelectValue {name}} " + _TEXT_VALUES + "content {__typename "
+                "items(first:100,after:$after) {nodes {id "
+                + _STATUS_VALUE
+                + _TEXT_VALUES
+                + "content {__typename "
                 "... on Issue {id number title body state repository {nameWithOwner} "
                 "labels(first:100) {nodes {name}} closedByPullRequestsReferences(first:100) {nodes {"
                 "id number url state repository {nameWithOwner}}}}"
@@ -423,6 +471,7 @@ class BoardClient:
                         "linked_run": (item.get("Flyte") or {}).get("text", ""),
                         "title": content.get("title", ""),
                         "status": (item.get("fieldValueByName") or {}).get("name", ""),
+                        **_status_setter(item.get("fieldValueByName")),
                         "texts": {field: (item.get(field) or {}).get("text", "") for field in TEXT_FIELDS},
                         "labels": [v["name"] for v in (content.get("labels") or {}).get("nodes", [])],
                     }
@@ -430,6 +479,22 @@ class BoardClient:
             if not data["pageInfo"]["hasNextPage"]:
                 return result
             after = data["pageInfo"]["endCursor"]
+
+
+class _StatusSetter(TypedDict):
+    """`BoardRow.status_at`/`status_by`: when Status was last set, and the type of its setter."""
+
+    status_at: str
+    status_by: str
+
+
+def _status_setter(value: Mapping[str, Any] | None) -> _StatusSetter:
+    """Return when a Status value read with `_STATUS_VALUE` was set, and by what type of actor."""
+    value = value or {}
+    return {
+        "status_at": value.get("updatedAt") or "",
+        "status_by": (value.get("creator") or {}).get("__typename", ""),
+    }
 
 
 def warn_expiry(
@@ -467,28 +532,40 @@ def _review_state(data: Mapping[str, Any]) -> tuple[GraphQL, bool]:
     return last, later_round
 
 
+def run_passed(snapshot: Mapping[str, Any] | None) -> bool:
+    """Return whether a run's report says it delivered, whatever became of its pull request since.
+
+    A run passed when its last QA verdict was PASS with no newer review round, a legacy pass was
+    restored, or it was released. `desired()` maps a pass to In review or Done by its pull request;
+    this is the pass alone, so a merge that left the issue open is still a delivered run.
+    """
+    data = snapshot or {}
+    phase = data.get("phase") or {}
+    last, later_round = _review_state(data)
+    review = data.get("review") or {}
+    return bool(
+        phase.get("kind") in {"done", "released"}
+        or (last.get("verdict") == "PASS" and not later_round)
+        or (review.get("passed") and not review.get("verdicts"))
+    )
+
+
 def desired(live: bool, url: str, snapshot: Mapping[str, Any] | None) -> dict[str, str]:
     """Return the board values an issue's newest run implies: its Status, and the text fields it knows.
 
     `live` is whether the run is live in Flyte, `snapshot` its report's status (`_dashboard.from_report`).
     A run whose last QA verdict was PASS with no newer review round, a restored legacy pass, or a
-    released run is Done;
+    released run is Done, unless it has a pull request: that still awaits its merge, so the card is In
+    review and the merge (or the issue closing) makes it Done;
     a live run is In flight, or In review once it has a pull request or a later review round.
     A run that failed or was aborted implies nothing,
     so the item stays where it is. Backlog and Ready are the owner's, and are never desired.
     """
     data = snapshot or {}
     deliverables = data.get("deliverables") or {}
-    phase = data.get("phase") or {}
-    last, later_round = _review_state(data)
-    review = data.get("review") or {}
-    passed = (
-        phase.get("kind") in {"done", "released"}
-        or (last.get("verdict") == "PASS" and not later_round)
-        or (review.get("passed") and not review.get("verdicts"))
-    )
-    if passed:
-        status = "Done"
+    _, later_round = _review_state(data)
+    if run_passed(data):
+        status = "In review" if deliverables.get("pr") else "Done"
     elif live:
         status = "In review" if later_round or deliverables.get("pr") else "In flight"
     else:
@@ -542,9 +619,16 @@ def _forward_only(want: dict[str, str], item: BoardRow, url: str) -> dict[str, s
     it with the first Status). Then a lower Status is a stale report overwriting the supervisor's newer
     move, or an owner's hand-set Done, so it is dropped.
     An item that shows another run (or none) starts over from the new run's Status.
+
+    A Done never takes a card out of Upstream: that is decided by the upstream pull request merging or the
+    issue closing, whichever run the item shows.
     """
     status = want.get("Status")
-    if not status or item.get("texts", {}).get("Flyte") != url or _rank(status) >= _rank(item["status"]):
+    if not status:
+        return want
+    if status == "Done" and item["status"] == "Upstream":
+        return {field: value for field, value in want.items() if field != "Status"}
+    if item.get("texts", {}).get("Flyte") != url or _rank(status) >= _rank(item["status"]):
         return want
     return {field: value for field, value in want.items() if field != "Status"}
 
@@ -573,9 +657,9 @@ def current_item(client: BoardClient, item: BoardRow) -> BoardRow | None:
     """`item` as the board holds it now: the listing a caller started from may predate another write."""
     data = client._query(
         "query BoardItem($id:ID!) {node(id:$id) {... on ProjectV2Item {id "
-        'fieldValueByName(name:"Status") {... on ProjectV2ItemFieldSingleSelectValue {name}} '
+        + _STATUS_VALUE
         + _TEXT_VALUES
-        + "content {... on Issue {state}}}}}",
+        + "content {... on Issue {state} ... on PullRequest {state}}}}}",
         id=item["item_id"],
     )["node"]
     if not data or not data.get("content"):
@@ -583,6 +667,7 @@ def current_item(client: BoardClient, item: BoardRow) -> BoardRow | None:
     return {
         **item,
         "status": (data.get("fieldValueByName") or {}).get("name", ""),
+        **_status_setter(data.get("fieldValueByName")),
         "open": data["content"]["state"] == "OPEN",
         "texts": {field: (data.get(field) or {}).get("text", "") for field in TEXT_FIELDS},
     }
@@ -600,6 +685,8 @@ def _write(
     card shows an earlier run: then Done was that run's, and a new run starts the card over. Without an
     earlier run Done came from GitHub evidence (a merge) or a hand move, and no run may take it back.
     """
+    if values.get("Status") == "Done" and item["status"] == "Upstream":
+        values = {field: value for field, value in values.items() if field != "Status"}
     shown = item.get("texts", {}).get("Flyte", "")
     earlier_run = bool(shown) and shown != values.get("Flyte", shown)
     if item["status"] == "Done" and (not item.get("open", True) or (keep_done and not earlier_run)):

@@ -270,6 +270,12 @@ def snapshot(**parts):
         (True, snapshot(verdicts=[{"round": 1, "verdict": "PASS"}]), {"Status": "Done"}),
         (False, snapshot(phase="released"), {"Status": "Done"}),
         (
+            True,
+            snapshot(pr="https://github.com/x/y/pull/3", verdicts=[{"round": 1, "verdict": "PASS"}]),
+            {"Status": "In review"},
+        ),
+        (False, snapshot(pr="https://github.com/x/y/pull/3", phase="released"), {"Status": "In review"}),
+        (
             False,
             snapshot(verdicts=[{"round": 1, "verdict": "FAIL"}, {"round": 2, "verdict": "PASS"}]),
             {"Status": "Done"},
@@ -1485,11 +1491,14 @@ async def test_board_shown_run_is_fetched_when_listing_misses_it(world, monkeypa
 
 @pytest.mark.parametrize("live", [True, False])
 def test_legacy_pass_snapshot_is_done(live):
-    data = snapshot(phase="done", pr=PR)
+    # A pass with a pull request is In review until it merges (the merge or the issue closing makes it Done).
+    data = snapshot(phase="done", pr="")
     assert _board.desired(live, URL, data)["Status"] == "Done"
     data["phase"]["kind"] = "building"
     data["review"]["passed"] = True
     assert _board.desired(live, URL, data)["Status"] == "Done"
+    data["deliverables"]["pr"] = PR
+    assert _board.desired(live, URL, data)["Status"] == "In review"
 
 
 def test_direct_lookup_without_sdk_run_labels_uses_board_issue(world):
@@ -1580,3 +1589,71 @@ def test_a_completion_written_after_the_listing_is_not_undone_by_the_reconciler(
     _board.Reconciler(board_profile(), "token", completed_meanwhile).tick()
     assert board.items[ISSUE]["status"] == "Done"
     assert (ISSUE, "Status", "In flight") not in board.writes
+
+
+# --- the truth pass runs from the periodic task ----------------------------------------------------- #
+
+
+async def test_reconcile_runs_the_truth_pass_after_the_tick_and_reports_its_corrections(world, monkeypatch):
+    from flyte_agent_factory import _board_events, _github, _reconcile
+
+    calls: list[str] = []
+    seen: dict[str, object] = {}
+
+    def drift(profile, token, app, latest, *, newest, queued):
+        calls.append("drift")
+        seen.update(token=token, queued=queued, newest=newest(ISSUE))
+        return [f"{ISSUE}: Done -> In review: open pull request", f"{ISSUE}: Ready -> Done: issue is closed"]
+
+    monkeypatch.setattr(_board_events, "drift", drift)
+    monkeypatch.setattr(_reconcile, "heal_milestones", lambda *args: 0)
+    monkeypatch.setattr(_reconcile, "queued_issues", lambda profile: {ISSUE.lower()})
+    monkeypatch.setattr(_github, "GithubApp", lambda *args: object())
+    Board({ISSUE: {"status": "Ready"}}).install(monkeypatch)
+    monkeypatch.setattr(_reconcile, "PROFILE", board_profile(app=True))
+    monkeypatch.setattr(_board, "take_token", lambda *a: "token")
+    monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "key")
+    result = await _reconcile.reconcile()
+    assert calls == ["drift"]  # one reconciler: no second board pass
+    assert seen == {"token": "token", "queued": {ISSUE.lower()}, "newest": None}
+    assert "2 board truth correction(s)" in result
+
+
+async def test_reconcile_without_the_app_skips_the_truth_pass(world, monkeypatch, caplog):
+    from flyte_agent_factory import _board_events, _reconcile
+
+    monkeypatch.setattr(_board_events, "drift", lambda *args, **kwargs: pytest.fail("needs the App"))
+    Board({ISSUE: {"status": "Ready"}}).install(monkeypatch)
+    monkeypatch.setattr(_reconcile, "PROFILE", board_profile())
+    monkeypatch.setattr(_board, "take_token", lambda *a: "token")
+    monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "")
+    with caplog.at_level("INFO"):
+        assert await _reconcile.reconcile() == "board"
+    assert "Board truth skipped" in caplog.text
+
+
+def test_newest_run_ignores_the_board_window_and_queued_issues_need_state(world):
+    from flyte_agent_factory import _factory_base, _reconcile
+
+    labels = {_reconcile.LABEL_ISSUE: _issues.issue_label(ISSUE)}
+    run = world.add("old", _factory_base.SLOTS[0], phase="SUCCEEDED", labels=labels)
+    run.report = _dashboard.status_script(snapshot(phase="failed"))
+    ended(run, 30)
+    index = _reconcile.RunIndex([run])
+    assert index.latest(ISSUE) is None  # past BOARD_WINDOW: not the tick's to project
+    newest = index.newest(ISSUE)
+    assert newest is not None
+    live, at, data = newest
+    assert not live and at is not None and data is not None and data["phase"]["kind"] == "failed"
+    assert index.newest("x/y#99") is None
+    assert _reconcile.queued_issues(dataclasses.replace(board_profile(), state=_profile.State())) == set()
+
+
+def test_queued_issues_are_the_pending_requests_issue_references(world):
+    from flyte_agent_factory import _queue, _reconcile
+
+    for name, issue in (("a", "Example/Scratch#8"), ("b", ""), ("c", "nowhere#3")):
+        request = _queue.Request(name, 1, "new", "b", "opus", "r", "", {}, 1.0, issue=issue)
+        _queue.enqueue(world.queue, request)
+    profile = dataclasses.replace(board_profile(), state=world.profile.state)
+    assert _reconcile.queued_issues(profile) == {"example/scratch#8"}
