@@ -264,23 +264,25 @@ supervisors and `factory-reconcile`. Both its explicit environment name and Unio
 name are removed before children start. This shares the App key's same-uid limitation: environment
 removal does not isolate secrets from processes running as the supervisor's user.
 
-The board's Status (Backlog, Ready, In flight, In review, Done), Size, Kind (GitHub reserves `Type`),
+The board's Status (Backlog, Ready, In flight, In review, Upstream, Done), Size, Kind (GitHub reserves `Type`),
 Flyte, Branch and Engine fields are created by `factory-reconcile` whenever one is missing, including
 one deleted by hand later. Project input `issue="owner/repo#123"`, or the issue a factory launch links
 (its queue request's `issue`, with or without issue intake), associates a run with an existing board
 item. Nothing is queued in `[state]`: an item's values are a projection of its issue's newest project
 run, found by the run's `factory-issue` label. A live run is In flight, or In review once it has a
-pull request; a run that passed review is Done; Flyte, Branch and Engine come from the run and its
-report. A failed or aborted run moves nothing, and Backlog and Ready are only ever set by the owner.
+pull request; a run that passed review is Done, or In review while it has a pull request (the merge, or
+the issue closing, makes it Done); Flyte, Branch and Engine come from the run and its report. The supervisor's
+release move follows the same rule. A Done from a run never takes a card out of Upstream. A failed or aborted run moves nothing. The run projection never sets Backlog or Ready; the
+[truth pass](#board-status) moves a card there only on the evidence listed below.
 
 The supervisor writes its moves (start, PR opened, release) as they happen. A write that fails is kept
 in memory, with one ⚠️ row per failing streak (🚨 for a refused token or an item missing from the
 board), and retried every minute for the life of the run; board failures never stop project work.
 `factory-reconcile` looks at every board item, whatever its Status, whose issue has a project run that is
-live or ended in the last two hours, and writes only the values that differ. Past those two hours it
-leaves the item alone, so it never undoes a move the owner made by hand. For a run the item already
+live or ended in the last two hours, and writes only the values that differ. Past those two hours the run
+projection leaves the item alone; the truth pass below still examines it. For a run the item already
 shows (its Flyte field is that run's URL) it only moves Status forward (Backlog, Ready, In flight, In
-review, Done), so a report that lags the supervisor, or a Done the owner set by hand on a live run,
+review, Upstream, Done), so a report that lags the supervisor, or a Done the owner set by hand on a live run,
 is never overwritten. Only the supervisor's direct write when it starts a review round puts a Done
 item back In review. If that write fails and the supervisor cannot retry it, reconciliation does not
 heal the reopen: preserving an owner's Done takes priority. An item that shows another run, or none,
@@ -290,6 +292,55 @@ read or write the board fails, with
 a 🚨 row in its log when the board is not visible or the PAT is refused: the run list in the console
 is the failure streak. Omit `[board]` to skip the board; `factory-reconcile` is still deployed when the
 GitHub App is configured, for the issue milestones (`docs/deploy-webhook.md`).
+
+### Board status
+
+After the run projection, each `factory-reconcile` tick runs the board audit (`_board_events.drift`; with
+the GitHub App configured, since it reads pull requests, commits and comments through the App, and skipped
+and logged without it). It derives every card's Status of the factory's repository from live facts and
+corrects a card that disagrees; whatever it cannot decide it flags for review, as below.
+First rule that applies wins:
+
+1. A pull-request card in Backlog or Ready is In review.
+2. A closed issue is Done (and never leaves Done), whoever set the card's Status.
+3. An upstream pull request merged and none open: Done (a closed one resubmitted and merged counts).
+4. The whole issue referenced by a commit on main: left alone, and flagged for review.
+5. An open local pull request that references the issue (closing keyword or plain `#N`, or linked to
+   it), or a live review round: In review, even for a card that was Done or Upstream.
+6. A live run: In flight, for a card that is behind it.
+7. An open upstream pull request: Upstream.
+8. Upstream pull requests closed, none merged: Ready, with a note on the issue, posted once per pull request.
+9. A Done card on an open issue whose newest run stopped without a pass: Ready.
+10. In flight or In review with no live run, open pull request, queued launch or activity (a branch commit,
+    the newest run's end, the Status's own last change) for two days: Ready.
+11. A card in Backlog whose launch request is waiting in the queue: Ready.
+
+Backlog and Ready otherwise stay the owner's, but the pass reads upstream links on them too, in any
+Status of an open issue: an open upstream pull request moves a card there to Upstream and a merged one to
+Done, while one closed unmerged leaves it where it is.
+
+A Status that a person (not a Bot) set in the last 24 hours is held (except on a closed issue, whose card
+always goes to Done): the pass logs
+`Board truth <ref>: held <from> (set by hand <age> ago); would move to <to>: <reason>` and moves
+nothing; the audit still flags the card where one of its usual checks applies.
+The board PAT may be a person's own, in which case the factory's own writes look like hand moves; the guard
+is deliberately conservative, so a card the factory just moved is left alone for a day. Each correction
+is one WARNING line `Board truth <ref>: <from> -> <to>: <reason>`, and is counted in the tick's result.
+One card's failure does not stop the others; the first error is raised at the end.
+
+**Upstream.** Work handed to another repository's maintainers sits in Upstream, between In review and Done.
+Name the pull request on a line of the issue body or of any issue comment, `Upstream:` in any case:
+
+```
+Upstream: https://github.com/<owner>/<repo>/pull/<N>
+Upstream: <owner>/<repo>#<N>
+```
+
+A line may carry several links. Quoted lines (starting `>`) are ignored, as are links into a repository the
+factory controls (every `[repo]` entry and the deploy repository). Owner and repository must be GitHub
+syntax (`my_org/x#1` and `example.com/x#1` are not links). The board token reads the pull request's
+state (public repositories need no more). A board whose Status lacks Upstream gets it inserted after In
+review the next tick; every existing option, its id included, and any custom option stays where it was.
 
 The issue may also be given in the short form `repo#123` when `repo` is one of the profile's
 `[repo]` repositories; names match case-insensitively. Any other value is reported in the timeline

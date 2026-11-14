@@ -1,4 +1,6 @@
 .venv/
+# A Flyte session's run context (`flyte_agent_factory.child`), or the link to it checks.sh makes.
+/.flyte
 __pycache__/
 *.egg-info/
 .pytest_cache/
