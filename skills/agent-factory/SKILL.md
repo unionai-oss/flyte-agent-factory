@@ -88,6 +88,19 @@ You are the person's default interface to the factory. Four jobs:
 - **Explanation.** Say what is happening in plain terms: current work, the queue, review round and blocking
   findings, meters and reserves, and why something waits or stalled, with the run URL.
 
+### Do what the person asks, with your own tools
+
+When the person asks you to merge, sync, promote or deliver something, that request is their word for that action:
+carry it out yourself, with the tools this chat holds, then report what you did. Merge or update a pull request with
+the GitHub connector; sync, import or deliver a repository with a shell, git and `ops/promote.py` where you have one;
+start, steer or stop factory work through the factory MCP. Do not hand the person shell commands for something a
+tool of yours can reach, and do not ask them to confirm the action they just asked for.
+
+Hand the person commands only when no tool you hold can reach the target, and say which tool or access is missing
+(for example: "this chat has no shell, so I cannot run `ops/promote.py deliver`" or "the GitHub connector cannot
+reach that repository"). Then give the exact commands with the values filled in. The limits above still hold: an
+action the person did not ask for, extra spend, publishing or a credential still needs their explicit word.
+
 ## Architecture and intake
 
 Today each project is a long-lived Claude session on a slot, with delegated workers and independent
@@ -320,11 +333,31 @@ Do not run a slot task directly: it is unsupported, because it skips validation 
 
 ## Factory changes and deployment
 
-The engine is a target repository like any other. Import it into the workspace as a project
-(`PYTHONPATH=src python ops/promote.py import <engine-url> projects/<name>`), then work and review it like any project. When it
-has passed, promote it with `deliver` ([Promotion](https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/architecture-repos.md#promotion)): the operator opens a
-pull request on the public repository, whose CI is rerun first, and the owner merges it. A project never pushes to
-the engine repository. When the work resolves a public issue, record its link on the workspace item when you file or
+The engine is a target repository like any other, and improving the factory is ordinary workspace work. The factory
+never launches a project against the engine repository and never pushes to it: no project, launch or review writes
+there. The only write is your `deliver` (step 4), on the person's word, which pushes one branch and opens a pull
+request. Instead:
+
+1. **Import.** Copy the engine into the workspace as a project folder
+   (`PYTHONPATH=src python ops/promote.py import <engine-url> <workspace checkout>/projects/<name>`, run from an
+   engine checkout; the project argument is a path inside your workspace checkout, never a relative `projects/<name>`
+   in the engine checkout). This commits the copy and its `promote.toml` (the engine commit it is based on) to the
+   workspace.
+2. **Launch on the workspace.** Launch the project on the workspace repository (the default `repo`) with `name`
+   equal to that folder's name. The brief says to make every change inside `projects/<name>/`.
+3. **Review there.** The project is reviewed like any other, on its `factory/<name>` branch of the workspace.
+4. **Deliver.** When it has passed, the operator delivers it upstream, on the person's word, with
+   `PYTHONPATH=src python ops/promote.py deliver <workspace checkout>/projects/<name> <branch>`
+   ([Promotion](https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/architecture-repos.md#promotion)):
+   that opens a pull request on the engine repository, whose CI is rerun first. The owner merges it, or tells you
+   to and you merge it.
+
+**The launch name must equal the engine folder's name.** The gate judges `projects/<launch name>/`, so a launch
+whose name differs from the folder it works in is judged against an empty folder. Until engine issue #224 is fixed,
+give each parallel engine project its own engine folder named after its launch (import again into
+`<workspace checkout>/projects/<launch name>`); never point two launches at one folder.
+
+When the work resolves a public issue, record its link on the workspace item when you file or
 launch it, and pass `--fixes <owner>/<repo>#N` to `deliver`, which writes `Fixes <owner>/<repo>#N` into the pull
 request body. After the owner-approved merge, confirm the public issue closed (close it on the owner's word if
 GitHub did not) and mark the workspace item Done with a link to the merged pull request. Only irreversible actions, extra spend, external publishing or credentials need
@@ -370,9 +403,10 @@ The profile lives in the workspace repo as `profile.toml`. The deployer validate
 the running deployer and the engine version being deployed. So a new key goes in only after the engine pull request
 adding it is deployed, and a retired key leaves the profile first. After any merge or profile edit, check the newest
 `factory-deployer.deploy_if_changed` run and its logs. A push to the direction repo triggers a tick through the
-webhook. The deployer refuses to change its own `[direction]`, so moving onto it or changing it needs one deploy run by
-the person: give them the bootstrap's `--redeploy` command with their values filled in
-([references/setup.md](references/setup.md), First deploy), and do not try it through the factory.
+webhook. The deployer refuses to change its own `[direction]`, so moving onto it or changing it needs one local deploy
+run with the bootstrap's `--redeploy` command ([references/setup.md](references/setup.md), First deploy), never
+through the factory. Run it yourself on the person's word where you have a shell holding their deploy credentials;
+otherwise say that, and give them the command with their values filled in.
 
 ## Related commands
 
