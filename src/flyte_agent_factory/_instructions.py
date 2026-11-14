@@ -558,7 +558,10 @@ def _project_memory(
             f"Finding it is not a sign you are resuming something -- if "
             f"`{_session_config._BRIEF_FILE}` describes work that is not there yet, the work is not done.\n"
         )
-        + f"- The original brief is in `{_session_config._BRIEF_FILE}`. Direction that arrives later is "
+        + f"- The original brief is in `{_session_config._BRIEF_FILE}`. If the project was launched from a "
+        f"GitHub issue, `{_session_config._ISSUE_FILE}` holds that issue (read-only; the supervisor "
+        f"refreshes it on each resume, so read it again after one). You have no GitHub credential. "
+        f"Direction that arrives later is "
         f"written to "
         f"`{_session_config._INBOX_DIR}/` and you will be told to read it.\n"
         "\n"

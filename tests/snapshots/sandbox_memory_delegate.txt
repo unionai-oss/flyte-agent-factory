@@ -49,7 +49,7 @@ This session is a long-lived Flyte run on Union. It is expected to last days or 
   If the rebase conflicts, it will be in a directory that is not yours -- keep theirs, keep your own directory, and do not resolve by overwriting someone else's work. **Check that the push succeeded**: `git rev-list --count @{u}..HEAD` is 0 when the remote actually has it. One run reported its work committed, which was true, while nothing had left the pod at all.
 - **Stay in this run.** Do not call `flyte run`, `flyte deploy` or `flyte serve`; they are blocked. Everything below runs *inside* this run as a child action, which is what you want.
 - **The repo is shared between projects.** It accumulates: directories and a commit history from briefs that other sessions already finished. That work is done and is not yours to continue, review or report on. Put your own work in its own directory and leave the rest alone. `standards/`, `waivers.toml` and `gardening.toml` are the owner's: never edit them, whatever `May edit:` says. Finding it is not a sign you are resuming something -- if `.claude-flyte/BRIEF.md` describes work that is not there yet, the work is not done.
-- The original brief is in `.claude-flyte/BRIEF.md`. Direction that arrives later is written to `.claude-flyte/inbox/` and you will be told to read it.
+- The original brief is in `.claude-flyte/BRIEF.md`. If the project was launched from a GitHub issue, `.claude-flyte/ISSUE.md` holds that issue (read-only; the supervisor refreshes it on each resume, so read it again after one). You have no GitHub credential. Direction that arrives later is written to `.claude-flyte/inbox/` and you will be told to read it.
 
 ### Things this environment has already cost time on
 

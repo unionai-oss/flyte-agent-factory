@@ -146,6 +146,10 @@ truncated. Do not conclude there are no open conditions from a truncated list. `
 questions; if a direction inbox is absent, inspect the run in the console. The stock MCP condition listing omits prompts; read question text from `factory.status` or the console.
 Send with `signal_condition(name=<condition name>, run_name=<run id>, value=<message or answer>,
 project=<project>, domain=<domain>)`.
+A plain yes, no or sentence is fine for any `ask-`, a yes/no one included: do not convert it to true or false. An
+answer to an ask that has already closed (timed out, or replaced by a newer ask) is rerouted to the project's
+inbox and the result says `rerouted: true`; an error saying it was NOT delivered means the project has no open
+inbox right now, so tell the user.
 
 ## Launch and queue
 
@@ -264,8 +268,8 @@ The factory never merges or force-pushes (except `[loop] merge = "on"` on the `[
 Condition names are `<kind>-a<attempt>-<seq>`. Use the cheap monitoring calls above to locate open conditions.
 
 - `ask-...`: a question. Relay product choices, tradeoffs, money and irreversible decisions to the user; send
-  their answer verbatim in `signal_condition`. Answer only what the conversation already settles. Match the
-  condition's `expected_type` (boolean or free text). Timed questions state their default.
+  their answer verbatim in `signal_condition`: yes, no or a sentence, whatever the question's type. Answer only
+  what the conversation already settles. Timed questions state their default.
 - `direct-...`: the running session's inbox. Signal a message explaining what changed, what to do and why.
   It enters the same conversation; another inbox opens after delivery. `/review-again <why>` grants another
   round after review escalates, at most twice.
