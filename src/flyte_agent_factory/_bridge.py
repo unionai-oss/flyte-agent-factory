@@ -52,11 +52,12 @@ if TYPE_CHECKING:
     from . import _names
 
     # `X as X`: re-exported, other modules and tests import these from here.
+    from ._bridge_common import _EXIT_ANSWERED_IN_WORDS as _EXIT_ANSWERED_IN_WORDS
     from ._bridge_common import _EXIT_NO_ANSWER as _EXIT_NO_ANSWER
     from ._bridge_common import _EXIT_WITHDRAWN as _EXIT_WITHDRAWN
     from ._bridge_common import ANSWERS as ANSWERS
     from ._bridge_common import ASK_GRACE_S as ASK_GRACE_S
-    from ._bridge_common import _Close, _withdrawn_close
+    from ._bridge_common import _Close, _withdrawn_close, open_replacement, parse_approval
     from ._bridge_common import _write_atomic as _write_atomic
     from ._bridge_common import gave_up_path as gave_up_path
     from ._bridge_triage import TriageMixin, _print_decided
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
 else:
     from flyte_agent_factory import _names
     from flyte_agent_factory._bridge_common import (
+        _EXIT_ANSWERED_IN_WORDS,
         _EXIT_NO_ANSWER,
         _EXIT_WITHDRAWN,
         ANSWERS,
@@ -76,6 +78,8 @@ else:
         _withdrawn_close,
         _write_atomic,
         gave_up_path,
+        open_replacement,
+        parse_approval,
     )
     from flyte_agent_factory._bridge_triage import (
         TriageMixin,
@@ -131,6 +135,9 @@ _LOOKUP_RETRY_S = 0.25
 _LOOKUP_WINDOW_S = 5.0
 
 _POLL_INTERVAL_S = 2.0
+
+#: Added to what the owner sees for an approve ask: its condition takes text, not a bool.
+_APPROVE_NOTE = "\n\nAnswer yes or no, or reply in words."
 
 
 # Substrings that mark a value as credential-shaped. Used to keep secrets out
@@ -340,9 +347,24 @@ def _read_answer(answer_path: Path, approve: bool) -> int | None:
     if "decided" in answer:
         return _print_decided(answer["decided"], approve)
     value = answer.get("value")
+    if "late_for" in answer:
+        print(
+            f"This is the owner's late answer to {answer['late_for']}, which you moved past; "
+            "it was recorded against this question instead.",
+            file=sys.stderr,
+        )
     if approve:
-        print("approved" if value else "declined")
-        return 0 if value else 1
+        verdict = parse_approval(value)
+        if verdict is None:
+            print(value if isinstance(value, str) else json.dumps(value))
+            print(
+                "The owner answered in words, neither yes nor no. Act on what they said; "
+                "do not read this as approved or declined.",
+                file=sys.stderr,
+            )
+            return _EXIT_ANSWERED_IN_WORDS
+        print("approved" if verdict else "declined")
+        return 0 if verdict else 1
     print(value if isinstance(value, str) else json.dumps(value))
     return 0
 
@@ -356,7 +378,8 @@ def ask_human_cli(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--approve",
         action="store_true",
-        help="Ask for a yes/no decision instead of free text. Prints 'approved' or 'declined'.",
+        help="Ask for a yes/no decision instead of free text. Prints 'approved' (exit 0) or 'declined' "
+        "(exit 1); if the owner answers in words that are neither, prints them and exits 5.",
     )
     parser.add_argument(
         "--browser",
@@ -683,6 +706,14 @@ def note_cli(argv: list[str] | None = None) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def _closes_by_abort(entry: dict[str, Any]) -> bool:
+    """Whether the ask's condition is a bool, which cannot carry a reason, so it is closed by aborting.
+
+    Only an approve ask restored from before approve asks took text: it has no `payload` on its entry.
+    """
+    return entry["kind"] == "approve" and entry.get("payload") != "str"
+
+
 def _default_text(stated: str) -> str:
     """Strip a "Default if no answer:" lead-in: "Default if no answer: use sqlite" -> "use sqlite"."""
     return re.sub(r"^default(?:ing)?\b[^:]*:\s*", "", stated, flags=re.IGNORECASE).strip()
@@ -899,7 +930,7 @@ class Bridge(TriageMixin):
         name = entry["condition"]
         reason = _timeout_reason(entry.get("default") or "")
         try:
-            await self._abandon(name, reason, approve=entry["kind"] == "approve")
+            await self._abandon(name, reason, approve=_closes_by_abort(entry))
         except _ConditionGone:
             self._emit("🗑️", f"closed {name}: gone (not found in Union)")
         # TypeError: a payload the condition rejects.
@@ -1008,13 +1039,14 @@ class Bridge(TriageMixin):
         name = ""
         waiter: asyncio.Future[str | bool] | None = None
         try:
-            # A constrained TypeVar cannot take "bool or str", though either is a valid answer type.
-            condition, used = await open_condition(  # type: ignore[type-var]
+            condition, used = await open_condition(
                 "ask",
                 seq,
-                prompt=prompt or question,
+                prompt=(prompt or question) + (_APPROVE_NOTE if kind == "approve" else ""),
                 prompt_type="markdown",
-                data_type=bool if kind == "approve" else str,
+                # Text even for an approve ask: the owner answers from chat, where "yes" or a sentence
+                # cannot be a bool. `parse_approval` reads it.
+                data_type=str,
                 # Resolves the condition even if this supervisor is gone before it closes it.
                 timeout=deadline,
             )
@@ -1031,7 +1063,7 @@ class Bridge(TriageMixin):
                 await self._supersede(request, f"superseded by {name}")
             # Shielded: if the close at the deadline fails, an answer may still be on its way,
             # and a condition can be waited on only once.
-            # Cast: the condition answers with `data_type`, a bool or a str (see the ignore above).
+            # Cast: the condition answers with `data_type`, a str; a bool is what a test's fake may hand back.
             waiter = asyncio.ensure_future(cast("Awaitable[str | bool]", condition.wait.aio()))
             value = await asyncio.wait_for(asyncio.shield(waiter), timeout=deadline - _CLOSE_MARGIN_S)
         except (asyncio.TimeoutError, flyte.errors.ConditionTimedoutError) as e:
@@ -1043,14 +1075,14 @@ class Bridge(TriageMixin):
                 if name:
                     self._emit("🗑️", f"closed {name}: timed out (closed by Flyte)")
                 return
-            if await self._close(name, kind == "approve", _timeout_reason(entry["default"])):
+            if await self._close(name, False, _timeout_reason(entry["default"])):
                 waiter.cancel()
                 self._forget(request_id)
                 return
             # The close failed, and the likeliest reason is a human answering after the wait gave
             # up and before the close: that answer is the wait's value. Flyte's own timeout, a few
             # seconds on, ends the wait if nobody did.
-            self._spawn(self._late_answer(waiter, question, request_id))
+            self._spawn(self._late_answer(waiter, question, request_id, approve=kind == "approve"))
             return
         # TypeError: a payload the condition rejects. LookupError: `_ConditionGone`.
         except (*REMOTE_ERRORS, TypeError, LookupError) as e:  # surfaced to the model, not swallowed
@@ -1058,29 +1090,31 @@ class Bridge(TriageMixin):
             self._queued.pop(request_id, None)
             closing = self._closed.pop(request_id, None)
             if closing is not None:
-                # Aborting an approve condition ends its wait with an error: that is the close.
+                # Aborting a bool (legacy approve) condition ends its wait with an error: that is the close.
                 _write_atomic(answer_path, {"id": request_id, **closing["outcome"]})
                 return
             _write_atomic(answer_path, {"id": request_id, "error": f"{type(e).__name__}: {e}"})
             self._emit("⚠️", f"ask failed: {type(e).__name__}: {e}")
             return
 
+        if kind != "approve" and not isinstance(value, str):
+            value = str(value)  # a text ask is answered with text, whatever the signal carried
         closing = self._closed.pop(request_id, None)
-        if closing is not None and kind != "approve" and value == closing["signal"]:
+        if closing is not None and value == closing["signal"]:
             # Our own close, come back as the condition's value: neither an answer to hand on
             # nor a late one for the inbox.
             self._forget(request_id)
             _write_atomic(answer_path, {"id": request_id, **closing["outcome"]})
             return
         if closing is not None:
-            # A human answered in Union while our close was on the wire (a bool value is never
-            # ours: we abort those). Theirs wins, and the close is reported as failed.
+            # A human answered in Union while our close was on the wire. Theirs wins, and the close is
+            # reported as failed.
             self._answered_first.add(request_id)
         # Before the forget, which stamps `closed_at`: an answer never comes after the close.
         entry["answered_at"] = time.time()
         self._forget(request_id)
         self._emit("✅", f"answered: {value!r}")
-        if identity and value is True and self.browser_gate is not None:
+        if identity and parse_approval(value) is True and self.browser_gate is not None:
             # Before the answer is written: the session retries the moment it reads "approved".
             self.browser_gate.approve(identity)
             self._emit("🔓", f"browser {identity}: approved by the owner")
@@ -1090,9 +1124,11 @@ class Bridge(TriageMixin):
         if told_closed or gave_up_path(answer_path).exists():
             # The asker stopped waiting (the grace window) or was already told the question
             # closed: nobody will read the answer file, so it goes to the inbox as a late answer.
-            self._write_late(question, value)
+            self._write_late(question, value, approve=kind == "approve")
 
-    async def _late_answer(self, waiting: Awaitable[str | bool], question: str, request_id: str = "") -> None:
+    async def _late_answer(
+        self, waiting: Awaitable[str | bool], question: str, request_id: str = "", *, approve: bool = False
+    ) -> None:
         """Hand an answer that arrives after the asker moved on to the session's inbox.
 
         Only after a close failed, so the question really is still open; it stays on the
@@ -1111,7 +1147,7 @@ class Bridge(TriageMixin):
             return
         finally:
             self._forget(request_id)
-        self._write_late(question, value)
+        self._write_late(question, value, approve=approve)
 
     async def _withdraw(self, request: dict[str, Any]) -> None:
         """Service `ask-human --withdraw`: close the question and tell the CLI how it went."""
@@ -1123,8 +1159,12 @@ class Bridge(TriageMixin):
             answer["closed"] = request["withdraw"]
         _write_atomic(self.root / ANSWERS / f"{request['id']}.json", answer)
 
-    async def close_question(self, target: str, why: str) -> str | None:
-        """Close an open question, found by request id or condition name. Returns an error, or None."""
+    async def close_question(self, target: str, why: str, *, superseded: bool = False) -> str | None:
+        """Close an open question, found by request id or condition name. Returns an error, or None.
+
+        `superseded` marks the closed ask's history entry with `why`, so an owner's answer to it that
+        arrives later can be recorded against the ask that replaced it (`late_answer`).
+        """
         if target in self._unopened:
             self._close_unopened(target, _withdrawn_close(why))
             return None
@@ -1140,6 +1180,9 @@ class Bridge(TriageMixin):
         reason = f"closed: {why}"
         if not await self._close_entry(entry, reason, {"withdrawn": reason}):
             return f"closing {entry['condition']} failed (see the timeline)"
+        if superseded:
+            entry["superseded"] = why
+            self._save()
         return None
 
     async def close_answered_in_session(self, message: str, source: str, at: float) -> None:
@@ -1192,14 +1235,14 @@ class Bridge(TriageMixin):
     ) -> bool:
         """Close an open question and tell its waiting CLI `outcome`. False (and a ⚠️ row) if it failed.
 
-        `reason` is a text condition's signalled value, and an approve condition's abort reason
+        `reason` is a text condition's signalled value, and a bool condition's abort reason
         unless `abort_reason` is given.
         """
-        approve = entry["kind"] == "approve"
-        said = (abort_reason or reason) if approve else reason
+        abort = _closes_by_abort(entry)
+        said = (abort_reason or reason) if abort else reason
         # Before the close: the waiting `_service` wakes up as soon as the condition ends.
-        self._closed[entry["id"]] = {"outcome": outcome, "signal": None if approve else said}
-        closed = await self._close(entry["condition"], approve, said, row, request_id=entry["id"])
+        self._closed[entry["id"]] = {"outcome": outcome, "signal": None if abort else said}
+        closed = await self._close(entry["condition"], abort, said, row, request_id=entry["id"])
         if not closed or entry.get("restored"):
             # No `_service` is waiting on a restored question to collect this.
             self._closed.pop(entry["id"], None)
@@ -1235,7 +1278,12 @@ class Bridge(TriageMixin):
         self._emit("🗑️", f"closed {condition_name}: {row or reason.removeprefix('closed: ')}")
         return True
 
-    def _write_late(self, question: str, value: Any) -> None:
+    def _write_late(self, question: str, value: Any, *, approve: bool = False, condition: str = "") -> None:
+        """Put an answer nobody was waiting for in the session's inbox.
+
+        `condition` is the ask it answers when it came from a `/late-answer` message; `question` is empty
+        when the bridge no longer knows that ask.
+        """
         if value is None or str(value).strip() == "":
             return
 
@@ -1244,26 +1292,65 @@ class Bridge(TriageMixin):
             self._emit("⏳", f"late answer, nowhere to put it: {str(value)[:160]}")
             return
 
+        verdict = parse_approval(value) if approve or isinstance(value, bool) else None
+        if verdict is None:
+            shown = str(value)
+        elif isinstance(value, bool):
+            shown = "approved" if verdict else "declined"
+        else:
+            shown = f"{'approved' if verdict else 'declined'} (in the owner's words: {str(value).strip()})"
         inbox = Path(workspace) / INBOX_SUBDIR
         inbox.mkdir(parents=True, exist_ok=True)
         # Unique: two late answers in the same second used to overwrite each other.
         path = inbox / f"late-{int(time.time())}-{uuid.uuid4().hex[:6]}.md"
+        asked = f"You asked:\n\n> {question}\n\n" if question else ""
+        which = f"It answers {condition}.\n\n" if condition else ""
         path.write_text(
             "# A late answer to a question you already moved past\n\n"
-            f"You asked:\n\n> {question}\n\n"
+            f"{asked}{which}"
             "Nobody answered before your timeout, so you carried on -- correctly. "
             "The answer arrived afterwards:\n\n"
-            f"{('approved' if value else 'declined') if isinstance(value, bool) else value}\n\n"
+            f"{shown}\n\n"
             "Decide whether it changes anything. If you already chose a different route, "
             "say so rather than silently redoing the work.\n"
         )
         self._emit("📬", f"late answer delivered to {path.name}")
 
+    async def late_answer(self, condition: str, value: str) -> None:
+        """Take the owner's answer to the ask `condition`, which was closed before it arrived.
+
+        It goes to the inbox always. If the ask was replaced by a newer one (`--supersedes`, triage) the
+        owner is most likely answering what replaced it, so that ask, followed along any further
+        replacements, is closed with the answer as its outcome if it is still open, and its waiting CLI
+        prints it. An ask that merely timed out, or whose replacement is answered or became a decision,
+        has nothing open replacing it: answering some unrelated open ask with it would be a guess.
+        """
+        entry = next((e for e in reversed(self.ask_history) if e.get("condition") == condition), None)
+        self._write_late(
+            entry["text"] if entry else "",
+            value,
+            approve=entry is not None and entry["kind"] == "approve",
+            condition=condition,
+        )
+        replacement = open_replacement(entry, self.questions.values(), self.ask_history)
+        if replacement is None:
+            return
+        reason = f"answered (late, for {condition}): {value[:500]}"
+        await self._close_entry(
+            replacement,
+            reason,
+            {"value": value, "late_for": condition},
+            abort_reason=reason,
+            row=f"answered by a late answer for {condition}",
+            answered=True,
+        )
+
     async def _abandon(self, condition_name: str, reason: str, *, approve: bool) -> None:
         """End a question on the Flyte side, with `reason` visible to whoever looks at it.
 
-        A bool (approve) condition cannot carry text, so it is closed by aborting its action
-        with the reason; a text condition is signalled with the reason as its value.
+        A bool condition (`approve`: an approve ask from before they took text) cannot carry text, so it
+        is closed by aborting its action with the reason; a text condition is signalled with the reason
+        as its value.
         Raises if it cannot: the caller decides how to report that.
         """
         import flyte.remote

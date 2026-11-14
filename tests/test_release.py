@@ -355,6 +355,8 @@ async def test_release_waits_for_a_listing_still_in_flight(rig):
     finally:
         rig.listing_gate.set()
     await rig.advance(180)
+    # The pending listing lands from a worker thread: under load that takes real time, as in `passed`.
+    await wait_for(lambda: rig.released)
     assert rig.released
     await rig.finish()
 

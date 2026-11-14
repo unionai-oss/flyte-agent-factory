@@ -41,7 +41,7 @@ board's Backlog and Ready on your word, helps you write issues and briefs, and e
 | see what runs and what waits | `factory.queue_list` | `ops/operate.py overview`, `running`, `queue` |
 | see how one project is doing | `factory.status` | `ops/operate.py status` |
 | remove a waiting launch | `factory.queue_cancel` | `ops/operate.py cancel` |
-| send direction, answer a question, stop | `list_conditions`, `signal_condition` | `ops/operate.py answer`, `flyte signal condition` |
+| send direction, answer a question (late answers are rerouted to the inbox), stop | `list_conditions`, `signal_condition` | `ops/operate.py answer`, `flyte signal condition` |
 
 A running project exposes two kinds of Flyte condition, named `direct-a<attempt>-NNN` and `ask-a<attempt>-NNN`
 (`flyte get condition` or `list_conditions` shows the exact names). A `direct-` condition is its inbox: signal it with
@@ -109,7 +109,7 @@ Union auth (the RBAC of the bearer token or API key).
 | `get_action` | reads one action, including its error info |
 | `get_logs` | reads an action's logs |
 | `list_conditions` | lists a run's open conditions (`ask-` questions and `direct-` inboxes) |
-| `signal_condition` | answers a condition: an answer to a question, or direction to a project |
+| `signal_condition` | answers a condition: an answer to a question (plain yes/no or a sentence for any ask; one to an ask that already closed is rerouted to the project's `direct-` inbox as a late answer), or direction to a project |
 | `abort_run` | aborts a run; unsaved work is lost, so prefer `/stop` through `direct-NNN` |
 | `rerun_run` | starts a run again with the same inputs |
 | `abort_action` | aborts one action of a run |
@@ -428,7 +428,7 @@ resumes from its saved thread).
 environment; the session holds a deploy key for one repository and nothing for GitHub's API. The supervisor, which
 holds the App, reads the issue, checks that its author is a listed maintainer, and hands the session the issue text
 as the brief, framed as data to do the work from and not as instructions to change the factory or its security
-settings. The supervisor also posts the status comments. The session works from the brief it was given.
+settings. The supervisor also posts the status comments. The session works from the brief it was given. The supervisor, which holds the App, also writes the linked issue's title, body, labels and comments to `.claude-flyte/ISSUE.md` beside `BRIEF.md` on every start and resume (read-only, allowlisted authors only, tokens redacted), so the session needs no GitHub credential to read it.
 
 **A token swap does not reach running pods.** Union resolves a secret when a pod starts and does not refresh it in a
 running pod. After you replace a setup-token or a Codex access token, projects already running keep the old one. The
@@ -547,6 +547,7 @@ the session role definitions, the browser image files and the workspace template
 | `_loop_flow.py` | `factory-loop.loop_run`: benchmark one reviewed PR and apply the merge rule |
 | `_backlog.py` | improvement contracts from measurements and notes |
 | `_issues.py` | issue intake, direct-condition delivery and milestone comments |
+| `_issue_file.py` | the linked issue (allowlisted authors only, redacted) written read-only to `.claude-flyte/ISSUE.md` on every start and resume |
 | `_board.py` | Projects v2 access |
 | `_board_events.py` | board state derived from GitHub evidence |
 | `_reconcile.py` | board and milestone repair from Flyte runs and GitHub evidence |

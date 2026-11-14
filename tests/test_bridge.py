@@ -17,6 +17,7 @@ import pytest
 
 from flyte_agent_factory import (
     _bridge,
+    _bridge_common,
     _bridge_triage,
     _browser_gate,
     _inbox,
@@ -538,15 +539,15 @@ async def test_at_the_deadline_a_text_question_is_signalled_closed(
 
 
 @pytest.mark.asyncio
-async def test_at_the_deadline_an_approve_question_is_aborted_with_the_reason(bridge_root, monkeypatch):
+async def test_at_the_deadline_an_approve_question_is_signalled_the_reason(bridge_root, monkeypatch):
     remote, opener = _Remote(monkeypatch), _Opener(monkeypatch)
     _fast_deadline(monkeypatch)
     bridge = _bridge.Bridge(bridge_root)
     request = {"id": "r1", "kind": "approve", "question": "Push? Default: no.", "timeout_s": 1}
     await bridge._service(request, 1)
 
-    assert remote.aborted == [("action-of-ask-a0-001", "closed: timed out, default taken: no")]
-    assert remote.signalled == [] and bridge.questions == {}
+    assert remote.signalled == [("ask-a0-001", "closed: timed out, default taken: no")]
+    assert remote.aborted == [] and bridge.questions == {}
     assert not opener.listening("ask-a0-001")
 
 
@@ -624,12 +625,8 @@ async def test_withdraw_closes_with_the_reason_and_unblocks_the_waiting_cli(brid
 
     reason = "closed: answered via direct-a0-012"
     await bridge._withdraw({"id": "withdraw-1", "withdraw": "r1", "reason": "answered via direct-a0-012"})
-    if kind == "approve":
-        assert remote.aborted == [("action-of-ask-a0-001", reason)]
-        opener.release("ask-a0-001", error=RuntimeError("aborted"))
-    else:
-        assert remote.signalled == [("ask-a0-001", reason)]
-        opener.release("ask-a0-001", reason)
+    assert remote.signalled == [("ask-a0-001", reason)]
+    opener.release("ask-a0-001", reason)
     await asker
 
     assert bridge.questions == {}
@@ -723,13 +720,16 @@ async def test_supersedes_closes_the_old_questions_naming_the_new_one(bridge_roo
     new = asyncio.create_task(
         bridge._service({"id": "r3", "question": "Port, again?", "supersedes": ["r1", "ask-a0-002"]}, 3)
     )
-    await wait_for(lambda: remote.signalled and remote.aborted)
+    await wait_for(lambda: len(remote.signalled) == 2)
 
-    assert remote.signalled == [("ask-a0-001", "closed: superseded by ask-a0-003")]
-    assert remote.aborted == [("action-of-ask-a0-002", "closed: superseded by ask-a0-003")]
+    assert remote.signalled == [
+        ("ask-a0-001", "closed: superseded by ask-a0-003"),
+        ("ask-a0-002", "closed: superseded by ask-a0-003"),
+    ]
+    assert remote.aborted == []
     assert list(bridge.questions) == ["r3"]
     opener.release("ask-a0-001", "closed: superseded by ask-a0-003")
-    opener.release("ask-a0-002", error=RuntimeError("aborted"))
+    opener.release("ask-a0-002", "closed: superseded by ask-a0-003")
     opener.release("ask-a0-003", "8080")
     await asyncio.gather(old_text, old_approve, new)
     assert json.loads((bridge_root / _bridge.ANSWERS / "r3.json").read_text())["value"] == "8080"
@@ -786,7 +786,7 @@ async def test_a_human_message_in_the_session_closes_an_open_text_ask_and_the_cl
 
 
 @pytest.mark.asyncio
-async def test_a_human_message_in_the_session_aborts_an_open_approve_ask_with_the_reason(
+async def test_a_human_message_in_the_session_closes_an_open_approve_ask_with_the_reason(
     bridge_root, monkeypatch
 ):
     remote, opener = _Remote(monkeypatch), _Opener(monkeypatch)
@@ -798,10 +798,11 @@ async def test_a_human_message_in_the_session_aborts_an_open_approve_ask_with_th
     await wait_for(lambda: opener.opened)
     await bridge.close_answered_in_session("yes, push it", "Claude app", 200.0)
 
-    assert remote.aborted == [("action-of-ask-a0-001", "closed: answered in session (Claude app)")]
-    assert remote.signalled == []
+    reason = "answered in session (Claude app): yes, push it"
+    assert remote.signalled == [("ask-a0-001", reason)]
+    assert remote.aborted == []
     assert ("🗑️", "closed ask-a0-001: answered in session") in rows
-    opener.release("ask-a0-001", error=RuntimeError("aborted"))
+    opener.release("ask-a0-001", reason)
     await asker
     answer = json.loads((bridge_root / _bridge.ANSWERS / "r1.json").read_text())
     assert answer == {"id": "r1", "value": "yes, push it", "in_session": "Claude app"}
@@ -831,11 +832,12 @@ async def test_every_open_ask_is_closed_and_one_opened_after_the_message_is_not(
     await wait_for(lambda: len(opener.opened) == 3)
     await bridge.close_answered_in_session("9090, and push it", "Claude app", 200.0)
 
-    assert remote.signalled == [("ask-a0-001", "answered in session (Claude app): 9090, and push it")]
-    assert remote.aborted == [("action-of-ask-a0-002", "closed: answered in session (Claude app)")]
+    reason = "answered in session (Claude app): 9090, and push it"
+    assert remote.signalled == [("ask-a0-001", reason), ("ask-a0-002", reason)]
+    assert remote.aborted == []
     assert list(bridge.questions) == ["r3"], "a question asked after the message was not answered by it"
-    opener.release("ask-a0-001", remote.signalled[0][1])
-    opener.release("ask-a0-002", error=RuntimeError("aborted"))
+    opener.release("ask-a0-001", reason)
+    opener.release("ask-a0-002", reason)
     opener.release("ask-a0-003", "db.internal")
     await asyncio.gather(*older, newer)
 
@@ -1144,7 +1146,7 @@ async def test_open_questions_survive_a_restart_and_can_still_be_closed(bridge_r
     after.restore()
     assert list(after.questions) == ["r1"]
     assert await after.close_question("ask-a0-001", "superseded by ask-a1-001") is None
-    assert remote.aborted == [("action-of-ask-a0-001", "closed: superseded by ask-a1-001")]
+    assert remote.signalled == [("ask-a0-001", "closed: superseded by ask-a1-001")]
     assert json.loads(registry.read_text()) == [], "a closed question leaves the registry"
 
 
@@ -2413,3 +2415,322 @@ def test_redact_tokens_removes_registered_source_values_and_aws_shapes() -> None
     assert secret in _bridge.redact_tokens(secret)
     assert _bridge.redact_tokens("ASIAABCDEFGH12345678") == "<redacted>"
     assert _bridge.redact_tokens("aws_session_token = abc123") == "aws_session_token = <redacted>"
+
+
+# --- approve asks take text; the owner may answer in words ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "verdict"),
+    [
+        (True, True),
+        (False, False),
+        ("yes", True),
+        ("Y", True),
+        ("  TRUE ", True),
+        ("approve", True),
+        ("Approved.", True),
+        ("ok", True),
+        ("LGTM!", True),
+        ("1", True),
+        ("no", False),
+        ("n", False),
+        ("False", False),
+        ("decline", False),
+        ("Declined!", False),
+        ("reject", False),
+        ("0", False),
+        ("yes, go ahead", True),
+        ("no -- wait for the migration", False),
+        ("ok but check the logs first", True),
+        (1, True),
+        (0, False),
+        ("hold off until Monday", None),
+        ("not yet", None),
+        ("1 more thing: use sqlite", None),
+        ("yesterday was fine", None),
+        ("", None),
+        ("   ", None),
+        (None, None),
+        (2.5, None),
+    ],
+)
+def test_parse_approval(value, verdict):
+    assert _bridge_common.parse_approval(value) is verdict
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["approve", "text"])
+async def test_every_ask_opens_a_text_condition(bridge_root, monkeypatch, kind):
+    opener = _Opener(monkeypatch)
+    bridge = _bridge.Bridge(bridge_root)
+    task = asyncio.create_task(bridge._service({"id": "r1", "kind": kind, "question": "Push?"}, 1))
+    await wait_for(lambda: opener.opened)
+    assert opener.opened[0]["data_type"] is str
+    assert ("yes or no" in opener.opened[0]["prompt"]) == (kind == "approve")
+    assert bridge.ask_history[0]["payload"] == "str"
+    opener.release("ask-a0-001", "x")
+    await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "code"),
+    [("yes", 0), ("true", 0), (True, 0), ("no", 1), (False, 1), ("hold off until Monday", 5)],
+)
+async def test_an_approve_answered_in_text_reaches_the_cli_as_a_verdict(
+    bridge_root, monkeypatch, capsys, answer, code
+):
+    opener = _Opener(monkeypatch)
+    bridge = _bridge.Bridge(bridge_root)
+    task = asyncio.create_task(bridge._service({"id": "r1", "kind": "approve", "question": "Push?"}, 1))
+    await wait_for(lambda: opener.opened)
+    opener.release("ask-a0-001", answer)
+    await task
+
+    assert _bridge._read_answer(bridge_root / _bridge.ANSWERS / "r1.json", True) == code
+    out, err = capsys.readouterr()
+    if code == 5:
+        assert out.strip() == answer and "in words" in err
+        assert "approved" not in out and "declined" not in out
+        assert _bridge._EXIT_ANSWERED_IN_WORDS == 5
+    else:
+        assert out.strip() == ("approved" if code == 0 else "declined")
+    assert "answered_at" in bridge.ask_history[0], "an answer in words is still an answer"
+    assert json.loads((bridge_root / _bridge.ANSWERS / "r1.json").read_text())["value"] == answer
+
+
+@pytest.mark.asyncio
+async def test_a_text_ask_answered_with_a_bool_delivers_its_text(bridge_root, monkeypatch, capsys):
+    opener = _Opener(monkeypatch)
+    bridge = _bridge.Bridge(bridge_root)
+    task = asyncio.create_task(bridge._service({"id": "r1", "question": "Enable it?"}, 1))
+    await wait_for(lambda: opener.opened)
+    opener.release("ask-a0-001", True)
+    await task
+    assert _bridge._read_answer(bridge_root / _bridge.ANSWERS / "r1.json", False) == 0
+    assert capsys.readouterr().out.strip() == "True"
+
+
+@pytest.mark.asyncio
+async def test_a_new_approve_ask_is_closed_by_signalling_the_reason(bridge_root, monkeypatch):
+    remote, opener = _Remote(monkeypatch), _Opener(monkeypatch)
+    bridge = _bridge.Bridge(bridge_root)
+    asker = asyncio.create_task(bridge._service({"id": "r1", "kind": "approve", "question": "Push?"}, 1))
+    await wait_for(lambda: opener.opened)
+    assert await bridge.close_question("r1", "no longer needed") is None
+    assert remote.signalled == [("ask-a0-001", "closed: no longer needed")] and remote.aborted == []
+    opener.release("ask-a0-001", "closed: no longer needed")  # our own close, coming back
+    await asker
+    answer = json.loads((bridge_root / _bridge.ANSWERS / "r1.json").read_text())
+    assert answer == {"id": "r1", "withdrawn": "closed: no longer needed"}
+    assert not bridge._closed and not (bridge_root / "late").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_restored_approve_ask_from_before_text_asks_is_still_closed_by_abort(
+    bridge_root, tmp_path, monkeypatch
+):
+    remote = _Remote(monkeypatch)
+    registry = _restored(tmp_path, kind="approve", deadline_in=300)  # no "payload": a bool condition
+    bridge = _bridge.Bridge(bridge_root, registry=registry)
+    bridge.restore()
+    assert await bridge.close_question("r1", "no longer needed") is None
+    assert remote.aborted == [("action-of-ask-a0-004", "closed: no longer needed")]
+    assert remote.signalled == []
+
+
+@pytest.mark.asyncio
+async def test_at_the_deadline_an_approve_question_is_aborted_with_the_reason(tmp_path, monkeypatch):
+    """A restored approve ask from before text asks has a bool condition: its deadline still aborts it."""
+    remote = _Remote(monkeypatch)
+    registry = _restored(tmp_path, kind="approve")  # no "payload": a bool condition, past its deadline
+    registry.write_text(json.dumps([{**json.loads(registry.read_text())[0], "default": "no"}]))
+    bridge = _bridge.Bridge(tmp_path / "bridge", registry=registry)
+    bridge.restore()
+    await wait_for(lambda: bridge.questions == {})
+    assert remote.aborted == [("action-of-ask-a0-004", "closed: timed out, default taken: no")]
+    assert remote.signalled == []
+
+
+@pytest.mark.asyncio
+async def test_a_human_message_in_the_session_aborts_an_open_approve_ask_with_the_reason(
+    tmp_path, monkeypatch
+):
+    """The same restored bool-typed approve ask, closed by a reply in the session: aborted, as before."""
+    remote = _Remote(monkeypatch)
+    registry = _restored(tmp_path, kind="approve", deadline_in=300)
+    bridge = _bridge.Bridge(tmp_path / "bridge", registry=registry)
+    bridge.restore()
+    await bridge.close_answered_in_session("yes, push it", "Claude app", time.time())
+    assert remote.aborted == [("action-of-ask-a0-004", "closed: answered in session (Claude app)")]
+    assert remote.signalled == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("answer", "opens"), [("yes", True), ("True", True), ("no", False), ("wait", False)])
+async def test_the_browser_gate_opens_only_on_a_parsed_approval(bridge_root, monkeypatch, answer, opens):
+    opener = _Opener(monkeypatch)
+    bridge = _browser_bridge(bridge_root)
+    task = asyncio.create_task(bridge._service(_browser_request(), 1))
+    await wait_for(lambda: opener.opened)
+    opener.release("ask-a0-001", answer)
+    await task
+    assert bridge.browser_gate.approved("github") is opens
+
+
+@pytest.mark.parametrize(("value", "word"), [("yes", "approved"), ("No.", "declined")])
+def test_a_late_approve_in_text_reads_as_a_decision(tmp_path, monkeypatch, value, word):
+    monkeypatch.setenv("AGENT_FACTORY_WORKSPACE", str(tmp_path))
+    _bridge.Bridge(tmp_path / "b")._write_late("Force-push?", value, approve=True)
+    [late] = (tmp_path / _bridge.INBOX_SUBDIR).glob("late-*.md")
+    assert word in late.read_text() and value in late.read_text()
+
+
+# --- /late-answer: the owner's answer to an ask that had already closed ------------------------
+
+
+async def _two_asks(bridge_root, monkeypatch, tmp_path, *, supersede):
+    """ask-a0-001 closed (superseded by ask-a0-002, or timed out); ask-a0-002 open. Returns the pieces."""
+    remote, opener = _Remote(monkeypatch), _Opener(monkeypatch)
+    monkeypatch.setenv("AGENT_FACTORY_WORKSPACE", str(tmp_path / "ws"))
+    bridge = _bridge.Bridge(bridge_root)
+    first = asyncio.create_task(bridge._service({"id": "r1", "kind": "approve", "question": "Push?"}, 1))
+    await wait_for(lambda: opener.opened)
+    if supersede:
+        request = {"id": "r2", "kind": "approve", "question": "Push to main?", "supersedes": ["r1"]}
+    else:
+        request = {"id": "r2", "kind": "approve", "question": "Push to main?"}
+        assert await bridge.close_question("r1", "timed out") is None
+    second = asyncio.create_task(bridge._service(request, 2))
+    await wait_for(lambda: len(opener.opened) == 2)
+    # The condition's value is the reason the bridge signalled to close it; any other value would be
+    # read as an owner's answer and put in the inbox.
+    [closing] = [reason for name, reason in remote.signalled if name == "ask-a0-001"]
+    opener.release("ask-a0-001", closing)
+    await first
+    return bridge, remote, opener, second
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_for_a_superseded_ask_answers_the_newest_open_one(
+    bridge_root, tmp_path, monkeypatch, capsys
+):
+    bridge, remote, opener, second = await _two_asks(bridge_root, monkeypatch, tmp_path, supersede=True)
+    assert bridge.ask_history[0]["superseded"] == "superseded by ask-a0-002"
+
+    await bridge.late_answer("ask-a0-001", "yes, go ahead")
+
+    [late] = list((tmp_path / "ws" / _bridge.INBOX_SUBDIR).glob("late-*.md"))
+    assert "Push?" in late.read_text() and "ask-a0-001" in late.read_text()
+    assert "yes, go ahead" in late.read_text()
+    assert ("ask-a0-002", "answered (late, for ask-a0-001): yes, go ahead") in remote.signalled
+    assert bridge.questions == {} and "answered_at" in bridge.ask_history[1]
+    answer = json.loads((bridge_root / _bridge.ANSWERS / "r2.json").read_text())
+    assert answer == {"id": "r2", "value": "yes, go ahead", "late_for": "ask-a0-001"}
+    assert _bridge._read_answer(bridge_root / _bridge.ANSWERS / "r2.json", True) == 0
+    assert capsys.readouterr().out.strip() == "approved"
+    opener.release("ask-a0-002", "answered (late, for ask-a0-001): yes, go ahead")
+    await second
+
+
+async def _open_third(bridge, opener, request):
+    """Open one more ask after `_two_asks`; returns its service task once its condition is open."""
+    third = asyncio.create_task(bridge._service(request, 3))
+    await wait_for(lambda: len(opener.opened) == 3)
+    return third
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_for_a_superseded_ask_answers_its_replacement_not_a_newer_unrelated_ask(
+    bridge_root, tmp_path, monkeypatch
+):
+    bridge, remote, opener, second = await _two_asks(bridge_root, monkeypatch, tmp_path, supersede=True)
+    third = await _open_third(bridge, opener, {"id": "r3", "kind": "text", "question": "Which region?"})
+
+    await bridge.late_answer("ask-a0-001", "yes")
+
+    assert ("ask-a0-002", "answered (late, for ask-a0-001): yes") in remote.signalled
+    assert not any(name == "ask-a0-003" for name, _ in remote.signalled), "the unrelated ask is untouched"
+    assert list(bridge.questions) == ["r3"]
+    assert not (bridge_root / _bridge.ANSWERS / "r3.json").exists()
+    opener.release("ask-a0-002", "answered (late, for ask-a0-001): yes")
+    opener.release("ask-a0-003", "eu-west-1")
+    await asyncio.gather(second, third)
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_whose_replacement_is_already_answered_answers_nothing_else(
+    bridge_root, tmp_path, monkeypatch
+):
+    bridge, remote, opener, second = await _two_asks(bridge_root, monkeypatch, tmp_path, supersede=True)
+    opener.release("ask-a0-002", "no")
+    await second
+    third = await _open_third(
+        bridge, opener, {"id": "r3", "kind": "approve", "question": "Delete the prod DB?"}
+    )
+    signalled = list(remote.signalled)
+
+    await bridge.late_answer("ask-a0-001", "yes")
+
+    assert len(list((tmp_path / "ws" / _bridge.INBOX_SUBDIR).glob("late-*.md"))) == 1
+    assert remote.signalled == signalled and list(bridge.questions) == ["r3"], "the open ask is untouched"
+    assert not (bridge_root / _bridge.ANSWERS / "r3.json").exists()
+    opener.release("ask-a0-003", "no")
+    await third
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_follows_a_chain_of_replacements_to_the_open_ask(
+    bridge_root, tmp_path, monkeypatch
+):
+    bridge, remote, opener, second = await _two_asks(bridge_root, monkeypatch, tmp_path, supersede=True)
+    request = {"id": "r3", "kind": "approve", "question": "Push to main now?", "supersedes": ["r2"]}
+    third = await _open_third(bridge, opener, request)
+    [closing] = [reason for name, reason in remote.signalled if name == "ask-a0-002"]
+    opener.release("ask-a0-002", closing)
+    await second
+
+    await bridge.late_answer("ask-a0-001", "yes")
+
+    assert ("ask-a0-003", "answered (late, for ask-a0-001): yes") in remote.signalled
+    assert bridge.questions == {}
+    answer = json.loads((bridge_root / _bridge.ANSWERS / "r3.json").read_text())
+    assert answer == {"id": "r3", "value": "yes", "late_for": "ask-a0-001"}
+    opener.release("ask-a0-003", "answered (late, for ask-a0-001): yes")
+    await third
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_for_a_timed_out_ask_only_reaches_the_inbox(bridge_root, tmp_path, monkeypatch):
+    bridge, remote, opener, second = await _two_asks(bridge_root, monkeypatch, tmp_path, supersede=False)
+    assert "superseded" not in bridge.ask_history[0]
+    signalled = list(remote.signalled)
+
+    await bridge.late_answer("ask-a0-001", "yes")
+
+    assert len(list((tmp_path / "ws" / _bridge.INBOX_SUBDIR).glob("late-*.md"))) == 1
+    assert remote.signalled == signalled and list(bridge.questions) == ["r2"], "the open ask is untouched"
+    assert not (bridge_root / _bridge.ANSWERS / "r2.json").exists()
+    opener.release("ask-a0-002", "x")
+    await second
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_for_a_superseded_ask_with_nothing_open_only_reaches_the_inbox(
+    bridge_root, tmp_path, monkeypatch
+):
+    bridge, remote, opener, second = await _two_asks(bridge_root, monkeypatch, tmp_path, supersede=True)
+    opener.release("ask-a0-002", "no")
+    await second
+    await bridge.late_answer("ask-a0-001", "yes")
+    assert len(list((tmp_path / "ws" / _bridge.INBOX_SUBDIR).glob("late-*.md"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_for_an_unknown_ask_still_reaches_the_inbox(bridge_root, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_FACTORY_WORKSPACE", str(tmp_path / "ws"))
+    bridge = _bridge.Bridge(bridge_root)
+    await bridge.late_answer("ask-a9-001", "use sqlite")
+    [late] = list((tmp_path / "ws" / _bridge.INBOX_SUBDIR).glob("late-*.md"))
+    assert "ask-a9-001" in late.read_text() and "use sqlite" in late.read_text()

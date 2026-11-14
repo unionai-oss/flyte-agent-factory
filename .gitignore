@@ -20,3 +20,6 @@ profiles/*.toml
 !profiles/example-codex-personal.toml
 
 profiles/.default
+
+# The run context the supervisor writes for child actions (checks.sh links the workspace root's here).
+/.flyte

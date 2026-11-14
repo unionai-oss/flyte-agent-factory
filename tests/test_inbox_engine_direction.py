@@ -101,8 +101,12 @@ async def grant_round(*args, **kwargs):
     raise AssertionError("no /review-again was sent")
 
 
-def loop(session, timeline, stop, on_engine=None) -> asyncio.Task[None]:
-    return asyncio.create_task(_inbox._inbox_loop(session, timeline, stop, grant_round, on_engine=on_engine))
+def loop(session, timeline, stop, on_engine=None, on_late_answer=None) -> asyncio.Task[None]:
+    return asyncio.create_task(
+        _inbox._inbox_loop(
+            session, timeline, stop, grant_round, on_engine=on_engine, on_late_answer=on_late_answer
+        )
+    )
 
 
 async def stop_loop(inbox, task: asyncio.Task[None], stop: asyncio.Event) -> None:
@@ -274,3 +278,22 @@ async def test_review_again_is_handed_to_grant_round_and_its_failure_ends_the_lo
     with pytest.raises(ExceptionGroup) as failure:
         await asyncio.wait_for(task, 30)
     assert [str(e) for e in failure.value.exceptions] == ["no /review-again was sent"]
+
+
+async def test_a_late_answer_goes_to_the_bridge_hook_and_is_not_written_as_direction(inbox, tmp_path):
+    """`/late-answer <condition> <text>` is the owner's answer to a closed ask: the bridge takes it."""
+    session, engine, timeline = paused_session(tmp_path)
+    taken: list[tuple[str, str]] = []
+
+    async def on_late_answer(condition: str, value: str) -> None:
+        taken.append((condition, value))
+
+    stop = asyncio.Event()
+    task = loop(session, timeline, stop, on_late_answer=on_late_answer)
+    await wait_for(lambda: inbox.opened)
+    await inbox.messages.put("/late-answer ask-a0-001 yes,  go ahead")
+    await wait_for(lambda: len(inbox.opened) == 2)
+    await stop_loop(inbox, task, stop)
+
+    assert taken == [("ask-a0-001", "yes,  go ahead")]
+    assert list(inbox.dir.glob("*.md")) == [] and session.pending == []

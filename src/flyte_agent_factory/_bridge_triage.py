@@ -135,7 +135,7 @@ class TriageMixin:
             prompt: str = "",
             prepared: tuple[str, str, float, str] | None = None,
         ) -> None: ...
-        async def close_question(self, target: str, why: str) -> str | None: ...
+        async def close_question(self, target: str, why: str, *, superseded: bool = False) -> str | None: ...
 
     def _decisions_path(self) -> Path:
         return cast(Path, self._registry).with_name("decisions.json")
@@ -201,6 +201,8 @@ class TriageMixin:
             "default": stated.group(0).strip() if stated else "",
             "condition": "",
             "timed_out": False,
+            # Every ask opens a text condition; an entry restored without this is a bool (approve) one.
+            "payload": "str",
         }
         self._remember(entry)
         self._save()
@@ -335,7 +337,7 @@ class TriageMixin:
     async def _supersede(self, request: dict[str, Any], why: str) -> None:
         for old in request.get("supersedes") or []:
             if old != request["id"]:
-                await self.close_question(old, why)
+                await self.close_question(old, why, superseded=True)
 
     def _close_unopened(self, request_id: str, close: _Close) -> None:
         """Close an ask that has no condition and will get none: tell its CLI now, and `_service` drops it."""

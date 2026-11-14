@@ -64,6 +64,7 @@ from flyte_agent_factory import (
     _grants_supervisor,
     _inbox,
     _instructions,
+    _issue_file,
     _issues,
     _judgement,
     _local_browser,
@@ -544,6 +545,7 @@ async def project(
     )
     await _session_setup._start_pull_requests(repo, app_key, timeline)
     await _supervise_support._start_board(issue, project_name, board_token, timeline)
+    await _issue_file.refresh(timeline, milestone_app)
     if not state.resumed:
         # Once, at creation: a resumed project's base is the one saved in its checkpoint, or the
         # root of history for legacy projects -- never the HEAD it resumed at.
@@ -693,11 +695,10 @@ async def project(
     # Duck-typed: ClaudeProcess, CodexAuthor, _NoSession and AuthorSession share the surface used below.
     proc: Any
     on_engine = functools.partial(_author._direct_engine, session)
+    inbox_loop = functools.partial(_inbox._inbox_loop, on_engine=on_engine, on_late_answer=bridge.late_answer)
     inbox = asyncio.create_task(
         _supervise_support._supervised(
-            _inbox._inbox_loop(
-                session, timeline, stop, _supervise_support._grant_round, credentials, on_engine=on_engine
-            ),
+            inbox_loop(session, timeline, stop, _supervise_support._grant_round, credentials),
             "inbox",
             timeline,
             stop,
@@ -765,11 +766,7 @@ async def project(
     # Gated on whether we actually resumed, not on whether state came back. A
     # restored config dir with no resumable conversation starts a fresh
     # session, and that session has never been told the brief.
-    kickoff = (
-        f"Read {_session_config._BRIEF_FILE} and get started on it now. Other directories in this repo are "
-        "finished work from unrelated projects -- not yours, not context you need, and not a "
-        f"reason to pause. Ask me with ask-human if {_session_config._BRIEF_FILE} itself is unclear."
-    )
+    kickoff = _session_setup._kickoff_prompt()
 
     # Wrapped, because these are the run's senses and controls and all four
     # fail silently otherwise: they are gathered with `return_exceptions=True`
