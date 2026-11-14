@@ -5412,6 +5412,81 @@ async def test_review_again_reopens_preflight_with_a_fresh_bounce_budget(tmp_pat
     assert _session_config._granted_rounds == grants and _session_config._max_rounds() == ceiling
 
 
+def _gate_with_fault(problem: str):
+    def gate(*args):
+        args[9].harness_faults.append("scope: harness fault: cannot compute the project's changes")
+        return problem
+
+    return gate
+
+
+@pytest.mark.asyncio
+async def test_a_harness_fault_alone_holds_review_without_a_bounce_and_review_again_resumes(
+    tmp_path, monkeypatch
+):
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    checks.write_text("exit 0\n")
+    reviewed = []
+
+    async def ready(*args):
+        return ""
+
+    async def review(*args):
+        reviewed.append(args[3])
+        return True, "", True, ""
+
+    monkeypatch.setattr(_supervise_support, "_done_preflight", ready)
+    monkeypatch.setattr(_review, "_review_round", review)
+    monkeypatch.setattr(_supervise_support, "_escalated", False)
+    monkeypatch.setattr(_supervise_support, "_preflight_escalated", False)
+    monkeypatch.setattr(_session_config, "POLL_EVERY_S", 0.0)
+    monkeypatch.setattr(_session_config, "_applicable_standards", dict)
+    monkeypatch.setattr(_gates, "run", _gate_with_fault(""))
+    proc = _Proc()
+    timeline = await _pump_with_workspace(
+        _Bridge(["DONE: delivered"]),
+        proc,
+        tmp_path,
+        until=lambda tl: any("ask-human" in m for m in proc.submitted),
+    )
+    assert reviewed == []
+    assert timeline.preflight_bounces == 0
+    assert not any("Not done yet" in m for m in proc.submitted)
+    escalation = [m for m in proc.submitted if "ask-human" in m]
+    assert len(escalation) == 1
+    assert "not your failure" in escalation[0] and "/review-again" in escalation[0]
+    assert "cannot compute the project's changes" in escalation[0]
+    assert any(icon == "🚨" and "harness fault" in row for _, icon, row in timeline._rows)
+    # A tuple comparison, not `assert x and y`: mypy would keep both narrowed to True past the await.
+    assert (_supervise_support._escalated, _supervise_support._preflight_escalated) == (True, True)
+    await _grant_round(proc, timeline, "/review-again fixed")
+    assert not _supervise_support._escalated and not _supervise_support._preflight_escalated
+
+
+@pytest.mark.asyncio
+async def test_a_harness_fault_with_a_real_failure_bounces_with_the_project_problems(tmp_path, monkeypatch):
+    async def ready(*args):
+        return ""
+
+    monkeypatch.setattr(_supervise_support, "_done_preflight", ready)
+    monkeypatch.setattr(_supervise_support, "_escalated", False)
+    monkeypatch.setattr(_session_config, "POLL_EVERY_S", 0.0)
+    monkeypatch.setattr(_session_config, "_applicable_standards", dict)
+    monkeypatch.setattr(_gates, "run", _gate_with_fault("gate-rule: the-gate-output"))
+    proc = _Proc()
+    timeline = await _pump_with_workspace(
+        _Bridge(["DONE: delivered"]),
+        proc,
+        tmp_path,
+        until=lambda tl: any("Not done yet" in m for m in proc.submitted),
+    )
+    bounce = next(m for m in proc.submitted if "Not done yet" in m)
+    assert "the-gate-output" in bounce and "cannot compute the project's changes" in bounce
+    assert timeline.preflight_bounces == 1
+    assert not _supervise_support._escalated
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("checks_present", [False, True])
 async def test_done_reports_all_failures_in_one_bounce(tmp_path, monkeypatch, checks_present):

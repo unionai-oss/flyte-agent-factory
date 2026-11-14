@@ -1191,6 +1191,7 @@ def test_status_values_are_the_labels_in_standards_results_json():
         "TOOL_UNAVAILABLE": "tool unavailable",
         "WAIVED": "WAIVED",
         "NOT_RUN": "not run",
+        "HARNESS_FAULT": "harness fault",
     }
 
 

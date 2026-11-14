@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import re
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -20,48 +20,154 @@ class _GateError(Exception):
     """The start tree could not be built; the message says why."""
 
 
+def _run_git(args: list[str], cwd: Path, *, stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run git and return its result, whatever the exit code; a timeout is a `_GateError`."""
+    try:
+        return subprocess.run(
+            _secret_env.git_argv(*args),
+            cwd=cwd,
+            env=_secret_env.child_env(),
+            input=stdin,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _GateError(f"git {args[0]} timed out after {exc.timeout:g} s") from exc
+
+
 def _git_bytes(args: list[str], cwd: Path) -> bytes:
-    result = subprocess.run(
-        _secret_env.git_argv(*args),
-        cwd=cwd,
-        env=_secret_env.child_env(),
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
+    result = _run_git(args, cwd)
     if result.returncode:
         raise _GateError(f"git {args[0]} failed: {result.stderr.decode(errors='replace')}")
     return result.stdout
 
 
+#: Where the mandated `git merge origin/main` takes upstream from; trusted only if the workspace has it.
+_MAIN_REF = "refs/remotes/origin/main"
+
+
+@dataclasses.dataclass(frozen=True)
+class StartTree:
+    """The tree a project is judged against.
+
+    `upstream` is the upstream tip HEAD is compared against, or None when the tree was built by undoing
+    the project's commits on HEAD. The tree is `base` with that tip merged in, which is the tip's own tree
+    when `base` is on main.
+    """
+
+    path: Path
+    upstream: str | None = None
+
+
+def _is_ancestor(workspace: Path, ancestor: str, descendant: str) -> bool:
+    # Exit 1 is the answer "no"; _git_bytes would call it a failure.
+    return _run_git(["merge-base", "--is-ancestor", ancestor, descendant], workspace).returncode == 0
+
+
+def find_upstream_tip(workspace: Path, base: str, commits: list[str]) -> str | None:
+    """Return the newest upstream commit merged into HEAD, or None when it cannot be told.
+
+    A project commit and the mandated merge of main can touch adjacent lines: git merges them, but the
+    project commit's reverse patch no longer applies to the merged file. The merged upstream tree itself
+    does not have that problem. A commit is "tainted" when it is a project commit or has a tainted parent;
+    the rest is upstream. Everything HEAD differs from the upstream tip by, merge-commit content included,
+    is the project's change.
+
+    None means "not a history we can read": two unrelated upstream heads, another author's commit built on
+    project work, a tip that `origin/main` does not contain (a merge's second parent is the project's
+    choice, so it is not trusted), or, when `origin/main` is absent, one that does not descend from `base`.
+    The caller falls back to undoing the project's commits.
+
+    A merge whose first parent is `base` and that `origin/main` does not contain is the branch's own
+    mandated merge, so it is tainted too. A resumed project's base is an earlier branch head that nothing
+    on main descends from; `origin/main` containing the tip is the evidence there.
+    """
+    listing = _git_bytes(["rev-list", "--parents", "--topo-order", "--reverse", f"{base}..HEAD"], workspace)
+    parents: dict[str, list[str]] = {}
+    for line in listing.decode().splitlines():
+        sha, *rest = line.split()
+        parents[sha] = rest
+    project = set(commits)
+    start = _git_bytes(["rev-parse", "--verify", f"{base}^{{commit}}"], workspace).decode().strip()
+    has_main = not _run_git(["rev-parse", "--verify", "--quiet", _MAIN_REF], workspace).returncode
+    tainted: set[str] = set()
+    for sha, above in parents.items():  # oldest first: parents are decided before their children
+        if (
+            sha in project
+            or any(parent in tainted for parent in above)
+            or _is_own_merge(workspace, start, sha, above, has_main=has_main)
+        ):
+            tainted.add(sha)
+            if sha not in project and len(above) == 1:
+                return None
+    upstream = [sha for sha in parents if sha not in tainted]
+    heads = [sha for sha in upstream if not any(sha in parents[other] for other in upstream)]
+    if len(heads) != 1:
+        return None
+    tip = heads[0]
+    if has_main:
+        # origin/main vouches for the tip wherever it forked: a resumed project's base is not on main.
+        return tip if _is_ancestor(workspace, tip, _MAIN_REF) else None
+    # Without origin/main the only evidence a tip is upstream is that it continues `base`.
+    return tip if _is_ancestor(workspace, base, tip) else None
+
+
+def _is_own_merge(workspace: Path, start: str, sha: str, above: list[str], *, has_main: bool) -> bool:
+    """Tell whether `sha` is the branch's mandated merge on top of `base`, not an upstream merge."""
+    if len(above) < 2 or above[0] != start:
+        return False
+    # A merge on main (a pull request merged right after `base`) also has `base` as its first parent.
+    return not (has_main and _is_ancestor(workspace, sha, _MAIN_REF))
+
+
 @contextlib.contextmanager
-def _start_tree(workspace: Path, base: str, commits: list[str] | None) -> Iterator[Path]:
-    """Where the project started: HEAD with the project's own commits reverse-applied.
+def _start_tree(workspace: Path, base: str, commits: list[str] | None) -> Iterator[StartTree]:
+    """Where the project started: `base` with the newest upstream merged in, else HEAD, its commits undone.
 
     The project is judged by its net change. Judging each commit against its parent blocked forever
     on a skip that was added and later removed, and pushed history cannot be rewritten. Without
     `commits` (no attribution available) the start is simply `base`.
-
-    A merge from main whose resolution joined upstream lines to a project hunk can leave a project
-    commit that no longer reverses. The start is then the upstream side of the newest merge on the
-    branch: all of upstream that HEAD holds, and none of the project's work.
     """
+    tip = None if commits is None else find_upstream_tip(workspace, base, commits)
     with tempfile.TemporaryDirectory(prefix="factory-start-") as directory:
         checkout = Path(directory)
-        _extract(workspace, "HEAD" if commits is not None else base, checkout)
-        try:
+        if tip:
+            tree, conflicted = _merge_tree(workspace, base, tip)
+            _extract(workspace, tree, checkout)
+            _take_upstream(workspace, checkout, tip, conflicted)
+        else:
+            _extract(workspace, "HEAD" if commits is not None else base, checkout)
             _reverse(workspace, checkout, commits or [])
-        except _GateError:
-            if not (upstream := _merged_upstream(workspace, base)):
-                raise
-            shutil.rmtree(checkout)
-            checkout.mkdir()
-            _extract(workspace, upstream, checkout)
-        yield checkout
+        yield StartTree(checkout, tip)
 
 
-def _extract(workspace: Path, ref: str, checkout: Path) -> None:
-    archive = _git_bytes(["archive", ref], workspace)
+def _merge_tree(workspace: Path, base: str, tip: str) -> tuple[str, list[str]]:
+    """Return the tree of `base` with the upstream `tip` merged in, and the paths the two conflict on.
+
+    When `base` is on `tip`'s history (a project begun from main) that is `tip`'s own tree. A resumed
+    project's base is an earlier branch head: its work stays in the start, so only this run's is judged.
+    """
+    result = _run_git(
+        ["merge-tree", "--write-tree", "--no-messages", "--name-only", "-z", base, tip], workspace
+    )
+    if result.returncode not in (0, 1):  # 1 is "merged with conflicts"
+        raise _GateError(f"git merge-tree failed: {result.stderr.decode(errors='replace')}")
+    tree, *conflicted = result.stdout.split(b"\0")  # with -z the tree id is NUL-terminated too
+    return tree.decode(), [path.decode(errors="replace") for path in conflicted if path]
+
+
+def _take_upstream(workspace: Path, checkout: Path, tip: str, paths: list[str]) -> None:
+    """Give the conflicted `paths` upstream's text, as a resolution to main's line is not a change."""
+    kept = [path for path in paths if _read_blob_id(workspace, tip, path) is not None]
+    for path in set(paths) - set(kept):
+        (checkout / path).unlink(missing_ok=True)
+    if kept:
+        _extract(workspace, tip, checkout, kept)
+
+
+def _extract(workspace: Path, ref: str, checkout: Path, paths: list[str] | None = None) -> None:
+    archive = _git_bytes(["archive", ref, "--", *(paths or [])], workspace)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(checkout, filter="data")
 
@@ -85,23 +191,94 @@ def _reverse(workspace: Path, checkout: Path, commits: list[str]) -> None:
 
 
 def _apply_reverse(checkout: Path, patch: bytes, *options: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        _secret_env.git_argv("apply", "--reverse", "--binary", *options),
-        cwd=checkout,
-        env=_secret_env.child_env(),
-        input=patch,
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
+    return _run_git(["apply", "--reverse", "--binary", *options], checkout, stdin=patch)
 
 
-def _merged_upstream(workspace: Path, base: str) -> str | None:
-    """Return the second parent of the newest merge on HEAD's first-parent line since `base`, or None."""
-    merge = _git_bytes(
-        ["rev-list", "--first-parent", "--merges", "--max-count=1", f"{base}..HEAD"], workspace
-    )
-    return f"{merge.decode().strip()}^2" if merge.strip() else None
+def describe_harness_fault(reason: str) -> str:
+    """Return the message for a start tree the factory could not build."""
+    return f"harness fault (the factory's, not the project's): cannot compute the project's changes: {reason}"
+
+
+def list_changed_paths(workspace: Path, commits: list[str]) -> tuple[int, list[str]]:
+    """Return the exit code and the sorted paths `commits` changed; on a failure, its output as the list."""
+    paths: set[str] = set()
+    for commit in commits:
+        code, output = _gate_base._run(
+            [
+                "git",
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                "-z",
+                commit,
+            ],
+            workspace,
+        )
+        if code:
+            return code, [output]
+        paths.update(p for p in output.split("\0") if p)
+    return 0, sorted(paths)
+
+
+def list_merge_paths(workspace: Path, upstream: str) -> list[str]:
+    """Return the paths HEAD differs from `upstream` by: the project's, merge-commit content included."""
+    diff = ["diff", *_secret_env.GIT_NO_DRIVERS, "--name-only", "--no-renames", "-z", upstream, "HEAD"]
+    return [p for p in _git_bytes(diff, workspace).decode(errors="replace").split("\0") if p]
+
+
+def add_merge_paths(workspace: Path, built: StartTree, touched: list[str]) -> list[str]:
+    """Add what a merge commit changed (a conflict resolution) to the project's touched paths."""
+    if not built.upstream:
+        return touched
+    return sorted({*touched, *list_merge_paths(workspace, built.upstream)})
+
+
+def _read_blob_id(workspace: Path, rev: str, path: str) -> str | None:
+    result = _run_git(["rev-parse", "--verify", "--quiet", f"{rev}:{path}"], workspace)
+    return result.stdout.decode().strip() if not result.returncode else None
+
+
+def find_authored_paths(
+    workspace: Path, built: StartTree, base: str, commits: list[str], touched: list[str]
+) -> list[str]:
+    """Return the touched paths whose HEAD content a project commit wrote and the upstream tip changed too.
+
+    Against an upstream tip such a path looks unchanged, though the project wrote it: another author's
+    commit with the identical change, merged in, would otherwise hide it. A path the project changed and
+    then undid (HEAD as `base`), or one where a merge kept upstream's text over the project's, is not one.
+    A deletion counts too.
+    """
+    if not built.upstream:
+        return []
+    found = []
+    for path in touched:
+        head = _read_blob_id(workspace, "HEAD", path)
+        if head == _read_blob_id(workspace, base, path) or head != _read_blob_id(
+            workspace, built.upstream, path
+        ):
+            continue
+        # Introduced: the commit left the path as HEAD has it (absent, for a deletion) and its parent did
+        # not, so a state upstream reached and a later project commit only inherited is not the project's.
+        # Project commits are non-merges, so `commit^` is the one parent.
+        if any(
+            _read_blob_id(workspace, c, path) == head != _read_blob_id(workspace, f"{c}^", path)
+            for c in commits
+        ):
+            found.append(path)
+    return found
+
+
+def fault_failure_without_start(
+    status: _gate_base.Status, output: str, fault: str
+) -> tuple[_gate_base.Status, str]:
+    """Turn a language rule's failure into a harness fault when the start tree could not be built."""
+    if fault and status is _gate_base.Status.FAIL:
+        message = f"harness fault: cannot compare with the starting tree: {fault}\n{output}"
+        return _gate_base.Status.HARNESS_FAULT, message
+    return status, output
 
 
 #: ruff's concise format: `path:line:col: CODE message`.

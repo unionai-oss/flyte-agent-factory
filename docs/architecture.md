@@ -265,6 +265,9 @@ Any one blocking finding fails the round and the findings go back to the coordin
 DONE again. From round 3 the planner's convergence call decides whether another round is worth it; a loop that
 circles escalates to a person. The limit is eight rounds. After an escalation, `/review-again [why]` grants one more
 round, at most twice. A pass marks the PR ready.
+A gate that reports only a `harness fault` (the factory could not compute the project's changes, which is not
+the project's failure) holds review the same way a pre-review escalation does, without a bounce; `/review-again`
+resumes it (see [standards](standards.md)).
 
 #### Judge outcomes
 

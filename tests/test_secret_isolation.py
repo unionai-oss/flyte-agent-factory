@@ -589,7 +589,7 @@ async def test_supervisor_git_calls_run_none_of_the_workspace_programs(seeded, h
     assert _gates.changed_lines(repo, base) is not None
     assert _gates._uncommitted(repo, "pkg", "root") == ["pkg/data.txt"]
     with _gate_start._start_tree(repo, base, [head]) as start:
-        assert (start / "pkg/data.txt").read_text() == "one\n"
+        assert (start.path / "pkg/data.txt").read_text() == "one\n"
     _session_setup._exclude_harness(repo)
     assert _demo_checks._committed_files(repo, repo / "pkg") == [repo / "pkg/data.txt"]
     assert await _checkpoint._git_head(repo)

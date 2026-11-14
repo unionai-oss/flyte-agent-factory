@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from flyte_agent_factory import _gate_base, _gate_start, _gates
+from flyte_agent_factory import _gate_base, _gate_start, _gate_tests, _gates
 
 pytestmark = pytest.mark.real_factory_gates
 
@@ -355,17 +355,65 @@ def test_done_gate_passes_the_start_tree_for_root_layout_only(project, gate_call
 
 
 def test_done_gate_reports_a_start_tree_it_cannot_build(project, gate_calls, monkeypatch):
-    """A failed start tree is a blocking result, not a silent fall back to judging the whole tree."""
+    """A failed start tree is reported, as the factory's fault, and is not a silent whole-tree judgement."""
     monkeypatch.setattr(_gates, "_project_commits", lambda *args: (128, "bad revision"))
 
     def refuse(*args: Any) -> Any:
         raise _gate_start._GateError("git archive failed: boom")
 
     monkeypatch.setattr(_gate_start, "_start_tree", refuse)
+    faults: list[str] = []
+    works: list[Any] = []
+
+    def told(*args: Any, **kwargs: Any) -> list[_gates.Result]:
+        faults.append(kwargs["work"].start_fault)
+        works.append(kwargs["work"])
+        return []
+
+    monkeypatch.setattr(_gates, "standards_results", told)
     failures = _gates.run(project, "app", "", "", "DONE", {}, _Timeline(), "root")
-    assert gate_calls == [None]
-    assert "git archive failed: boom" in failures
-    assert "whole tree" in failures
+    assert faults == [
+        "git archive failed: boom"
+    ]  # the language rules are told, and none judges the whole tree
+    assert "whole tree" not in failures
+    # What `scope` itself could not do is the factory's fault: held for, not blocked on.
+    assert "bad revision" not in failures
+    scope = [fault for fault in works[0].harness_faults if fault.startswith("scope: harness fault")]
+    assert len(scope) == 1 and "bad revision" in scope[0]
+
+
+def test_a_failing_language_rule_without_a_start_tree_is_a_harness_fault(tmp_path, tool):
+    """Nothing tells inherited debt from the project's, so the failure is neither a pass nor the project's."""
+    results = _gates.standards_results(
+        _tree(tmp_path / "head", 3),
+        tool,
+        configs=tmp_path / "configs",
+        work=_gate_tests.GateWork(start_fault="cannot reverse project changes: boom"),
+    )
+    by_rule = {r.rule: r for r in results}
+    assert by_rule["LANG-901"].status is _gate_base.Status.HARNESS_FAULT
+    assert "cannot compare with the starting tree: cannot reverse project changes: boom" in (
+        by_rule["LANG-901"].output
+    )
+    assert by_rule["factory:language-summary"].status is _gate_base.Status.HARNESS_FAULT
+    assert not any(r.status.blocks for r in results)
+
+
+def test_a_passing_language_rule_without_a_start_tree_stays_a_pass(tmp_path, tool):
+    results = _gates.standards_results(
+        _tree(tmp_path / "head", None),
+        tool,
+        configs=tmp_path / "configs",
+        work=_gate_tests.GateWork(start_fault="boom"),
+    )
+    assert {r.rule: r.status for r in results}["LANG-901"] is _gate_base.Status.PASS
+
+
+def test_a_harness_fault_holds_but_does_not_block():
+    status = _gate_base.Status.HARNESS_FAULT
+    assert status.holds and not status.blocks
+    assert not any(s.holds for s in _gate_base.Status if s is not status)
+    assert _gate_base.Status(status.value) is status
 
 
 @pytest.fixture

@@ -1069,7 +1069,14 @@ _LABEL_FIELDS = {
     "title",
     "evidence_kind",
 }
-_GATE_STATUSES = {"PASS", "FAIL", "not applicable", "unknown (legacy history)", "tool unavailable"}
+_GATE_STATUSES = {
+    "PASS",
+    "FAIL",
+    "not applicable",
+    "unknown (legacy history)",
+    "tool unavailable",
+    "harness fault",
+}
 
 
 def validate_label(row: Mapping[str, Any]) -> None:

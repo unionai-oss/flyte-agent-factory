@@ -1734,9 +1734,17 @@ def test_a_hung_tree_child_is_killed_with_what_it_started(tmp_path, monkeypatch)
         check(src)
     pid = int(pid_file.read_text())
     deadline = time.monotonic() + 5
-    while Path(f"/proc/{pid}").exists() and "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2]:
+    while _alive(pid):
         assert time.monotonic() < deadline, "the deploy child's own child outlived the timeout"
         time.sleep(0.1)
+
+
+def _alive(pid: int) -> bool:
+    """Whether `pid` runs and is not a zombie; a process reaped between two reads of /proc is gone."""
+    try:
+        return "Z" not in Path(f"/proc/{pid}/stat").read_text().split()[2]
+    except FileNotFoundError:
+        return False
 
 
 def test_a_deploy_that_reports_nothing_is_a_deploy_error(tmp_path):

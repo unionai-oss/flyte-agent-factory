@@ -451,6 +451,10 @@ class GateWork:
     #: The pre-review sets this: the head run sends its lanes to child actions (see `_run_head_pytest`).
     child_lanes: bool = False
     head_sha: str = ""
+    #: Why a root-layout start tree could not be built: a failing language rule then cannot be compared.
+    start_fault: str = ""
+    #: The gate's harness faults (the factory could not do its part), for the supervisor: they never block.
+    harness_faults: list[str] = dataclasses.field(default_factory=list)
     seconds: dict[str, float] = dataclasses.field(default_factory=lambda: {"gate": 0.0, "base": 0.0})
     slow_seconds: float = 0.0
     pytest_reused: bool = False
@@ -520,16 +524,17 @@ def fail_to_pass(
     `changes` are the project's net changed paths. `start` is the tree the project started from;
     it is built here from `base` or `commits` when the caller has not already done so.
 
-    Returns an exit code, or `_gate_base.Status.NOT_APPLICABLE` when there is nothing to test.
+    Returns an exit code, `_gate_base.Status.NOT_APPLICABLE` when there is nothing to test, or
+    `_gate_base.Status.HARNESS_FAULT` when the start tree could not be built.
     """
     if start is None:
         try:
             with _gate_start._start_tree(workspace, base, commits) as built:
                 return fail_to_pass(
-                    workspace, name, base, changes, brief, demo, note, commits, built, layout, work
+                    workspace, name, base, changes, brief, demo, note, commits, built.path, layout, work
                 )
         except _gate_start._GateError as exc:
-            return 1, str(exc)
+            return _gate_base.Status.HARNESS_FAULT, _gate_start.describe_harness_fault(str(exc))
     project = _gate_base.project_dir(workspace, name, layout)
     upstreams = _vendored.load(project, _gate_base._SKIP_DIRS, trusted_base=base)
     code, output = _judge_tests(

@@ -73,7 +73,7 @@ async def _grant_round(proc: ClaudeProcess, timeline: _timeline._Timeline, messa
         _preflight_resumes += 1
         timeline.row("🔁", "pre-review checks resumed; bounce budget reset")
         await proc.submit(
-            "Pre-review checks resumed. Fix the failing checks, push, and declare DONE again.",
+            "Pre-review checks resumed. Declare DONE again (fix any failing checks first).",
             label="Pre-review checks resumed",
         )
         return
@@ -720,6 +720,34 @@ async def _escalate_preflight(
         'decided>"` and wait for an answer. Tell the operator to resume with `/review-again`.\n\n'
         f"The last output:\n\n{problem}",
         label=f"Pre-review {source} escalated",
+    )
+
+
+async def _escalate_harness_fault(proc: ClaudeProcess, timeline: _timeline._Timeline, faults: str) -> None:
+    """Hold a DONE the gate could not judge because of the factory, not the project, for a human.
+
+    A bounce would have the session rewrite history that is fine, and would count against it. The hold is
+    the pre-review escalation's, so `/review-again` resumes it (see `_grant_round`) without a bounce used.
+    """
+    global _escalated, _preflight_escalated
+    _escalated = True
+    _preflight_escalated = True
+    await _post_verdict(
+        _session_config.WORKSPACE,
+        timeline,
+        await _head_sha(_session_config.WORKSPACE),
+        0,
+        "harness fault in the pre-review checks",
+    )
+    timeline.row("🚨", f"harness fault in the pre-review checks; holding review: {faults[:300]}")
+    timeline.activity("harness fault (the factory's) -- needs the operator; resume with /review-again")
+    await proc.submit(
+        "The pre-review checks hit a fault in the factory, not in your work: they could not compute what "
+        "your project changed. This is not your failure; do not change your history or your code for it. "
+        + _tell_human_first("the factory has a fault that blocks the pre-review checks")
+        + ' `ask-human "<the fault below>"` and wait. The operator has to fix the factory and resume with '
+        f"`/review-again`.\n\nThe fault:\n\n{faults}",
+        label="Pre-review harness fault",
     )
 
 
