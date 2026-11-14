@@ -157,15 +157,18 @@ ruleset lets through; the engine token (`engine-token`) comes after the board.
 7. **First deploy.** From the public `unionai-oss/flyte-agent-factory` `main`, with `--profile <workspace
    clone>/profile.toml`, so there is no separate move step for a new user; the deployer then follows `[direction]`.
    Moving an existing install onto `[direction]` later needs one deploy with that `--profile`, because the
-   deployer refuses to change its own direction, on purpose: when it applies, give the `--redeploy` command below
-   with their values filled in, run once.
+   deployer refuses to change its own direction, on purpose: when it applies and the person asks, run the
+   `--redeploy` command below once yourself where your shell holds their deploy credentials; otherwise say which tool
+   or access is missing and give them the command with their values filled in.
 
    **Deploying later engine changes.** The deployer deploys the default-branch head of `[deploy] repo` (default
    `[repo] factory`, the public engine) once that head's CI passed. The person's App is installed on their workspace,
    not on the public engine, so it reads the engine anonymously, polls (`[deploy] webhook = false`) and keeps its
    deploy lock in `[direction] repo`; with neither the App nor `[direction]` the profile is refused, so do not remove
    `[deploy] auto` or `[direction]`, and do not ask them to install the App on unionai-oss (they cannot). To deploy an
-   engine change at once, give this one command, with the same values as the first run; `--redeploy` runs the
+   engine change at once, run this one command yourself on the person's word, with the same values as the first run,
+   where your shell holds their deploy credentials; otherwise say which tool or access is missing and give it to
+   them. `--redeploy` runs the
    work-slot and factory deploys again from the public engine's `main`, with a one-off deployment key that it deletes
    at the end:
 
