@@ -4,7 +4,7 @@ A software factory that runs on Flyte. You describe a change to a chat agent; th
 coding-agent session on it (Claude Code or Codex, your choice per role), checks the result with independent
 reviewers, and delivers a reviewed pull request for you to merge.
 
-[![One-minute explainer of the agent factory (61 s, with narration). Click to play.](docs/media/agent-factory-explainer.png)](docs/media/agent-factory-explainer.mp4)
+https://github.com/user-attachments/assets/e5c6c924-f3c1-49fe-a261-f1baeb53b88c
 
 The one-minute explainer above was written, recorded, edited and narrated by the factory itself, as an ordinary
 project run.
