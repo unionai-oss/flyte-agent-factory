@@ -644,7 +644,10 @@ def test_the_projects_own_big_file_still_fails(nested):
     project, _ = nested
     (project / "mine.py").write_text(BIG)
     code, output = _size(project)
-    assert code == 1 and "mine.py" in output and ".upstream" not in output
+    findings, _, note = output.partition("\nNested git checkouts")
+    # The findings are the project's alone; the closing note names the checkout it did not judge.
+    assert code == 1 and "mine.py" in findings and ".upstream" not in findings
+    assert ".upstream (base " in note
 
 
 # -- declared evidence commands --

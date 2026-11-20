@@ -502,7 +502,8 @@ def _project_memory(
         "- **A copy of another repository kept in the project directory (no `.git`) is declared in "
         f"`{project_rel}/vendored.toml`**: one `[[tree]]` with `path`, `repo` (https) and `commit` (full "
         "sha) per copy. The gates then judge only the files you changed in it (module size, test removal, "
-        "language detection); no waiver is needed. See `docs/standards.md` in the engine.\n"
+        "language detection, shell lint, forbid rules, ruff, eslint, prettier); no waiver is needed. "
+        "See `docs/standards.md` in the engine.\n"
         '- **Say when you are done** with `flyte-note "DONE: <one line on what was delivered and '
         'where>"`. That does not end the work -- it starts a review. An independent reviewer, in '
         "its own container with its own copy of this workspace and no knowledge of your "

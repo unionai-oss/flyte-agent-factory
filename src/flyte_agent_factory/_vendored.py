@@ -1,9 +1,9 @@
 """Vendored upstream trees: the files of a project that are another repository's, not the project's.
 
 A project that builds a cross-repo patch carries byte-identical copies of other repositories in its
-directory. The gate rules (module size, test removal, language detection) must judge only what the project
-changed in them. `<project>/vendored.toml` names each copy's upstream; a nested git checkout needs no entry,
-its own history says what changed (`_target_run.nested_checkouts`).
+directory. The gate rules (module size, test removal, language detection, per-file linters) must judge only
+what the project changed in them. `<project>/vendored.toml` names each copy's upstream; a nested git
+checkout needs no entry, its own history says what changed (`_target_run.nested_checkouts`).
 
     [[tree]]
     path = "flyte-agent-factory"   # relative to the project directory
@@ -87,6 +87,8 @@ class Upstreams:
     problems: list[str] = dataclasses.field(default_factory=list)
     described: list[str] = dataclasses.field(default_factory=list)
     omitted_tests: list[str] = dataclasses.field(default_factory=list)
+    #: Each nested checkout's base tree (the paths of its blobs), listed on first use.
+    _base_blobs: dict[Path, set[str]] = dataclasses.field(default_factory=dict, init=False, repr=False)
 
     def _nested_of(self, relative: str) -> tuple[_target_run.Nested, str] | None:
         path = self.project / relative
@@ -94,6 +96,20 @@ class Upstreams:
             if path.is_relative_to(checkout.root):
                 return checkout, str(path.relative_to(checkout.root))
         return None
+
+    def _relativize(self, root: Path) -> str:
+        return str(root.relative_to(self.project))
+
+    def _is_base_blob(self, checkout: _target_run.Nested, inner: str) -> bool:
+        # A file git status does not name can still be the project's: a new file the checkout's .gitignore
+        # hides, or one inside a submodule (status names only the submodule). Only a blob of the base tree is
+        # upstream's; a submodule is a commit entry of that tree, so its files are not.
+        if checkout.root not in self._base_blobs:
+            try:
+                self._base_blobs[checkout.root] = set(_list_blobs([], checkout.root, checkout.base))
+            except _gate_start._GateError:
+                self._base_blobs[checkout.root] = set()  # base unreadable: every file is the project's
+        return inner in self._base_blobs[checkout.root]
 
     def unchanged(self, relative: str) -> bool:
         """Return whether the project-relative path is a file identical to upstream's."""
@@ -107,7 +123,7 @@ class Upstreams:
                 # The blob id git would give the file, as `git hash-object --no-filters` computes it.
                 return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() == sha
         found = self._nested_of(relative)
-        return found is not None and found[0].untouched(found[1])
+        return found is not None and found[0].untouched(found[1]) and self._is_base_blob(*found)
 
     def read_upstream(self, relative: str) -> bytes | None:
         """Return upstream's content of a project-relative path, None if no known tree has it."""
@@ -140,6 +156,19 @@ class Upstreams:
                 + "; ".join(self.described)
                 + "."
             )
+        judged = [c for c in self.nested if c.changed is not None]
+        if judged:
+            parts.append(
+                "Nested git checkouts judged against their base: "
+                + "; ".join(f"{self._relativize(c.root)} (base {c.base[:12]})" for c in judged)
+                + "."
+            )
+        parts.extend(
+            f"Nested git checkout {self._relativize(c.root)}: base unknown, so its files are judged as the "
+            "project's."
+            for c in self.nested
+            if c.changed is None
+        )
         if self.omitted_tests:
             more = f" and {len(self.omitted_tests) - 10} more" if len(self.omitted_tests) > 10 else ""
             parts.append(

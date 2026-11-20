@@ -7,6 +7,7 @@ import ast
 import contextlib
 import dataclasses
 import datetime
+import functools
 import io
 import json
 import re
@@ -36,6 +37,7 @@ from . import (
     _standards,
     _target_ci,
     _target_run,
+    _vendored,
     _waivers,
 )
 
@@ -323,8 +325,10 @@ def _head_and_worktree(workspace: Path, path: str) -> tuple[bytes | None, bytes 
 _UI_SUFFIXES = {".html", ".htm", ".tsx", ".jsx", ".vue", ".svelte"}
 
 
-def _has_ui(project: Path) -> bool:
-    return any(Path(p).suffix in _UI_SUFFIXES for p in _gate_base._project_files(project))
+def _has_ui(project: Path, load_upstreams: Callable[[], _vendored.Upstreams]) -> bool:
+    # An unchanged upstream page is upstream's UI, not the project's. Upstreams are loaded only for a UI file.
+    pages = [p for p in _gate_base._project_files(project) if Path(p).suffix in _UI_SUFFIXES]
+    return any(not load_upstreams().unchanged(p) for p in pages)
 
 
 def _judge_project(
@@ -626,7 +630,10 @@ def changed_lines(project: Path, base: str) -> dict[str, set[int]] | None:
 
 
 def _check_suppressions(
-    project: Path, files: dict[str, str], changed: dict[str, set[int]] | None = None
+    project: Path,
+    files: dict[str, str],
+    changed: dict[str, set[int]] | None = None,
+    load_upstreams: Callable[[], _vendored.Upstreams] | None = None,
 ) -> Result:
     # tokenize and ast avoid treating strings as directives or guessing handler structure from indentation.
     # No Ruff rule covers reason length, protected codes, and the loop-boundary exception together.
@@ -634,10 +641,16 @@ def _check_suppressions(
     # whose pinned boundary handlers and older suppression comments would fail every change to it.
     protected = _suppression_codes(files)
     problems = []
+    upstreams = None
     for relative in sorted(_gate_base._project_files(project)):
         path = project / relative
         if path.suffix not in {".py", ".pyi"} or (changed is not None and relative not in changed):
             continue
+        if changed is None and load_upstreams is not None:
+            # With no diff to go by, a file identical to upstream's is still upstream's, not the project's.
+            upstreams = upstreams or load_upstreams()
+            if upstreams.unchanged(relative):
+                continue
 
         def fail(line: int, message: str, end: int | None = None, filename: str = relative) -> None:
             # A violation spanning lines (a handler) is the project's if it touched any of them.
@@ -729,6 +742,8 @@ def _check_suppressions(
     lines = problems or ["suppression policy passed"]
     if changed is None:
         lines.append("checked every line: no base commit to diff against")
+    if upstreams is not None and (note := upstreams.describe()):
+        lines.append(note)
     return Result("factory:suppressions", status, "\n".join(lines))
 
 
@@ -791,6 +806,11 @@ def standards_results(
 
     start_key = ""
 
+    @functools.cache
+    def load_upstreams() -> _vendored.Upstreams:
+        # At most once per call, and only for a rule that needs it: a manifest tree may be fetched.
+        return _vendored.load(project, _gate_base._SKIP_DIRS, trusted_base=work.trusted_base if work else "")
+
     def with_mypy_cache(command: list[str], kind: str) -> list[str]:
         # Head and start have different sources; one cache for both would be rebuilt by each run.
         if Path(command[0]).name != "mypy":
@@ -845,39 +865,39 @@ def standards_results(
             if not shared and not shutil.which(command[0]):
                 record(rule.ident, _gate_base.Status.TOOL_UNAVAILABLE, image_defect(tool, [rule.ident]))
                 continue
-            command = _gate_rules.with_baseline_config(command, project, configs, shell_scripts)
-            eslint_baseline = (
-                Path(command[0]).name == "eslint"
-                and not any(project.glob("eslint.config.*"))
-                and not any(project.glob(".eslintrc*"))
+            known = load_upstreams() if _gate_rules.uses_upstreams(command) else None
+            command = _gate_rules.with_baseline_config(
+                command, project, configs, shell_scripts, upstreams=known
             )
-            if Path(command[0]).name == "tsc" and not (project / "tsconfig.json").exists():
-                config = json.loads((configs / "tsconfig.json").read_text())
-                config["files"] = [str(p) for p in project.rglob("*.ts") if "node_modules" not in p.parts]
-                config.pop("include", None)
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", dir=project) as baseline:
-                    json.dump(config, baseline)
-                    baseline.flush()
-                    command += ["--project", baseline.name]
-                    code, output = execute(rule, command, timeout)
-            elif eslint_baseline:
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", dir=project) as baseline:
-                    baseline.write((configs / "eslint.config.mjs").read_text())
-                    baseline.flush()
-                    command += ["--config", baseline.name]
-                    code, output = execute(rule, command, timeout)
-                if "Cannot find package" in output:
-                    code = 127
-                    output = "ESLint baseline dependency missing\n" + output
-            else:
-                code, output = execute(
-                    rule, command, timeout, (shared.code, shared.output) if shared else None
-                )
+            eslint_baseline = Path(command[0]).name == "eslint" and not _gate_rules._has_own_eslint_config(
+                project
+            )
+            # The temporary files a command names exist only inside this block; `command` is what ran.
+            with _gate_rules.prepare_command(command, project, configs, known) as (command, prepared):
+                if Path(command[0]).name == "tsc" and not (project / "tsconfig.json").exists():
+                    config = json.loads((configs / "tsconfig.json").read_text())
+                    config["files"] = [str(p) for p in project.rglob("*.ts") if "node_modules" not in p.parts]
+                    config.pop("include", None)
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", dir=project) as baseline:
+                        json.dump(config, baseline)
+                        baseline.flush()
+                        command += ["--project", baseline.name]
+                        code, output = execute(rule, command, timeout)
+                else:
+                    code, output = execute(
+                        rule, command, timeout, (shared.code, shared.output) if shared else None
+                    )
+                    if eslint_baseline and "Cannot find package" in output:
+                        code = 127
+                        output = "ESLint baseline dependency missing\n" + output
             if not shared and "No module named pytest" in output:  # a shared run quotes child-lane launchers
                 code = 127
                 output = image_defect("pytest", [rule.ident])
+            note = "\n".join(n for n in (prepared, known.describe() if known is not None else "") if n)
             record(
-                rule.ident, _gate_tests.judge_shared_run(shared, code), shlex.join(command) + "\n" + output
+                rule.ident,
+                _gate_tests.judge_shared_run(shared, code),
+                shlex.join(command) + "\n" + output + (f"\n{note}" if note else ""),
             )
 
     def labelled(ids: list[str], output: str) -> str:
@@ -894,7 +914,7 @@ def standards_results(
                 ident, _gate_base.Status.FAIL, f"rule ID defined more than once ({where}); IDs must be unique"
             )
         if any(rule.lint_codes for rule in must):
-            results.append(_check_suppressions(project, files, changed))
+            results.append(_check_suppressions(project, files, changed, load_upstreams))
         if ids := mapped.get(_standards.MODULE_SIZE):
             code, output = _module_size.check(project, start or size_reference, _gate_tests._is_test, work)
             record(_standards.MODULE_SIZE, _gate_base.Status.from_exit(code), labelled(ids, output))
@@ -908,7 +928,7 @@ def standards_results(
                 if rule.ident != ids[0]:
                     continue
                 commands = [i for i in ids if i in declared]
-                if commands and _has_ui(project):
+                if commands and _has_ui(project, load_upstreams):
                     first = len(results)
                     for ident in commands:
                         run_commands(
@@ -921,7 +941,7 @@ def standards_results(
                         for r in results[first:]
                     ]
                     continue
-                if _has_ui(project):
+                if _has_ui(project, load_upstreams):
                     status, output = _gate_base.Status.TOOL_UNAVAILABLE, UI_EVIDENCE_MISSING
                 else:
                     status, output = _gate_base.Status.NOT_APPLICABLE, "no UI in the project"
@@ -942,7 +962,7 @@ def standards_results(
             elif rule.kind == "tool":
                 run_commands(dataclasses.replace(rule, kind="command", arg=declared[rule.ident]), timeout)
             elif rule.kind == "forbid":
-                code, output = _gate_rules._forbidden(project, rule)
+                code, output = _gate_rules._forbidden(project, rule, load_upstreams())
                 record(rule.ident, _gate_base.Status.from_exit(code), output)
             elif rule.kind == "script":
                 command = _gate_rules._script_command(rule, standards_dir)

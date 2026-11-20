@@ -713,6 +713,8 @@ async def test_a_pinned_resume_on_the_other_engine_delivers_the_briefing_as_its_
     from tests.test_codex_author import project as project_fixture
 
     rig = project_fixture.__wrapped__(tmp_path, monkeypatch)  # type: ignore[attr-defined]  # pytest keeps the raw fixture here
+    # `project` sets `_pins.engine_input` from `engine=`: restored at teardown, so no later test inherits it.
+    monkeypatch.setattr(_pins, "engine_input", _pins.engine_input)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "fresh-token")  # both engines: an AuthorSession
     rig.seen["resumed"] = True
     owner = {"engine": "claude", "thread": "claude-session-1"}
