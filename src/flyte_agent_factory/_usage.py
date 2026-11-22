@@ -635,7 +635,7 @@ def _report_usage(round_: int, timeline: _timeline._Timeline) -> None:
 
 
 #: Roles whose verdict is a second opinion on the author's work.
-_QA_ROLES = frozenset({"correctness", "completeness", "craft"})
+_QA_ROLES = frozenset(_policy.JUDGE_CONCERNS)
 _hard_pins = False
 _ROUTES_KEEP = 200
 #: The engine the author session of this process runs on; `project` sets it once it has chosen.

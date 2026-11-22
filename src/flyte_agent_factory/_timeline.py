@@ -579,6 +579,7 @@ class _Timeline:
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         """Everything the dashboard shows, as plain data: the page renders it, tools read it as JSON."""
         now = time.time() if now is None else now
+        generated = int(now // 60 * 60)
         questions = self._questions()
         phase = dict(self._phase)
         waiting = [q for q in questions if not q["timed_out"]]
@@ -757,8 +758,11 @@ class _Timeline:
             # Where the factory finds this run again if it is aborted from inside (`_factory_recreate`):
             # the checkpoint it saves to, and the client id of its API key. Every report flush carries them.
             "checkpoint": _state.checkpoint_location(),
+            # The last good checkpoint and the last failure (#45): its age is what tells a reader how much a
+            # lost pod would cost. Aged as of `generated_at`, so the page is the same all minute.
+            "checkpoints": _state.health.report(generated),
             "app": _auth.own_client_id(),
-            "generated_at": int(now // 60 * 60),
+            "generated_at": generated,
             "project": self._labels.get("project", ""),
             "goal": _brief_goal(),
             "run": self._labels.get("run", ""),

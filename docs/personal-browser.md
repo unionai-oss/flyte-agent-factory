@@ -13,7 +13,7 @@ environment variable `BROWSER_<NAME>_TOKEN`; the supervisor reads it, and it is 
 environment. The earlier shape, `[browser] personal = true` with `profile_uri`, is exactly one identity named
 `personal`: the same app `claude-browser-personal`, the same secret `browser_personal_token` and the same
 archive. Migrating to named identities needs no wipe and no new sign-in. `personal_env` is accepted and
-ignored: it no longer picks a slot.
+ignored, with a warning: it no longer picks a slot, and it will be removed.
 
 ## Grants
 
@@ -120,8 +120,8 @@ An identity name matches `^[a-z][a-z0-9-]{0,19}$`, needs a `profile_uri` unless 
 (then it defaults, see "Location"), and two identities may not share one.
 The earlier shape still works and is exactly one identity named `personal`:
 `[browser] personal = true` with `profile_uri` (optional under the same condition) and `exit_node`. Do not combine it with
-`[browser.identities.personal]`. `personal_env` is deprecated: it is accepted and ignored, because it no longer
-grants anything.
+`[browser.identities.personal]`. `personal_env` is deprecated: it is accepted and ignored, with a warning, because it no longer
+grants anything, and it will be removed.
 
 Omit `profile_uri` and let it default to `<bucket>/browser/<identity>/profile.tar.gz` (or the volume's path)
 under the factory's own bucket. A `profile_uri` in Flyte's own data bucket is refused: anyone who can read a run's

@@ -429,11 +429,15 @@ async def test_a_stalled_checkpoint_on_a_deferred_limit_is_bounded_and_retried(t
     monkeypatch.setattr(_usage, "_author_engines", lambda: ("claude",))
     monkeypatch.setattr(_usage, "_child_meter", lambda e: _meter.Meter(e, "test", now, 100))
     monkeypatch.setattr(_author, "_HANDOFF_STEP_TIMEOUT_S", 0.2)
+    # The limit checkpoint has its own, longer bound than the handoff step's.
+    monkeypatch.setattr(_author, "_LIMIT_CHECKPOINT_TIMEOUT_S", 0.2)
     calls = []
 
-    async def stall(*args, **kwargs):
+    async def stall(*args, timeout, **kwargs):
+        # The bound is the checkpoint's own (`save_checkpoint(timeout=...)`), as in the real one.
         calls.append(1)
-        await asyncio.sleep(3600)
+        async with asyncio.timeout(timeout):
+            await asyncio.sleep(3600)
 
     monkeypatch.setattr(_state, "save_checkpoint", stall)
     session = AuthorSession(Process(), tmp_path / "pending.json")
@@ -919,8 +923,11 @@ async def test_checkpoint_git_listings_are_bounded(tmp_path, monkeypatch, caplog
     stuck = []
 
     async def spawn(program, *args, **kwargs):
+        assert args[:4] == ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+        if args[4] == "fsck":  # the staged repository's check, after both listings
+            return await real_spawn(program, *args, **kwargs)
         calls.append(args)
-        assert args[:5] == ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "ls-files")
+        assert args[4] == "ls-files"
         if failure == "timeout" and len(calls) == listing:
             proc = await real_spawn(sys.executable, "-c", "import signal; signal.pause()", **kwargs)
             stuck.append(proc)
@@ -988,8 +995,9 @@ async def test_handoff_failure_after_stop_ends_in_restart_not_a_hang(tmp_path, m
     session = AuthorSession(old, tmp_path / "author-pending.json")
     monkeypatch.setattr(_author, "_HANDOFF_STEP_TIMEOUT_S", 0.2, raising=False)
 
-    async def stall(*args, **kwargs):
-        await asyncio.sleep(3600)
+    async def stall(*args, timeout, **kwargs):
+        async with asyncio.timeout(timeout):
+            await asyncio.sleep(3600)
 
     async def boom(*args, **kwargs):
         raise OSError("disk full")

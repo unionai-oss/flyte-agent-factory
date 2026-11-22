@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from flyte_agent_factory import _factory_mcp, _names, _policy, _profile, _review, _usage
+from flyte_agent_factory import _factory_mcp, _names, _policy, _review
 from flyte_agent_factory._roles import ROLE_ALIASES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,20 +90,8 @@ def _factory_tasks() -> set[str]:
 
 
 def _policy_keys() -> set[str]:
-    """Every policy key the code reads, found where it reads them rather than from a copy of the list."""
-    keys = set(_profile._NUMERIC_POLICY) | set(_profile._ENGINE_KEYS) | {"COORDINATOR_ENGINE"}
-    for role in _policy.DEFAULTS:
-        keys |= {f"{role.upper()}_MODEL", f"{role.upper()}_EFFORT"}
-    for role in _policy.CODEX_DEFAULTS:
-        keys |= {f"{role.upper()}_CODEX_MODEL", f"{role.upper()}_CODEX_EFFORT"}
-    # `_usage._static_engine` reads `<PURPOSE>_ENGINE` for each purpose a call is routed for: the author
-    # (the coordinator), the delegate workers, the planner, the contract writer, the arbiter and the judges
-    # (routed by their concern, not as "judge").
-    purposes = set(_usage._QA_ROLES) | {"author", "delegate", "planner", "contract", "arbiter"}
-    keys |= {f"{purpose.upper()}_ENGINE" for purpose in purposes}
-    for source in PACKAGE.glob("*.py"):
-        keys |= set(re.findall(r'_policy\.read\(\s*"([A-Z0-9_]+)"', source.read_text()))
-    return keys
+    """Every policy key the code reads: the one set `_policy` keeps (tests/test_policy_keys.py checks it)."""
+    return set(_policy.POLICY_KEYS)
 
 
 def _env_names() -> set[str]:

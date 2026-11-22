@@ -150,6 +150,39 @@ def _suite_profile_survives_every_test():
     os.environ.pop("AGENT_FACTORY_PROFILE_TOML", None)
 
 
+# Roles and settings that tests invent on purpose, so they read a knob `_policy.POLICY_KEYS` does not list.
+TEST_ONLY_KNOBS: frozenset[str] = frozenset(
+    {
+        # tests/test_policy.py asks `resolve_codex("api-review")`: a role the profile never names still takes
+        # the `<ROLE>_CODEX_*` overrides and the judge defaults.
+        "API_REVIEW_CODEX_MODEL",
+        "API_REVIEW_CODEX_EFFORT",
+        # tests/test_codex_author.py routes the invented purpose `repair` through `_usage._route`.
+        "REPAIR_ENGINE",
+        # Tests call `_reviewer._call_reviewer` with no purpose (every caller in the source passes one), which
+        # reads the engine pin of the empty name.
+        "_ENGINE",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _tests_read_only_listed_policy_knobs(request):
+    """A knob the code reads must be in `_policy.POLICY_KEYS`, or a profile that sets it is refused at load.
+
+    The source scan in test_policy_keys.py sees names written out in the code; this sees the ones built at
+    runtime, by recording what each test actually reads.
+    """
+    from flyte_agent_factory import _policy
+
+    before = set(_policy.knobs_seen)
+    yield
+    unlisted = set(_policy.knobs_seen) - before - _policy.POLICY_KEYS - TEST_ONLY_KNOBS
+    assert not unlisted, (
+        f"{request.node.nodeid} read policy knobs missing from _policy.POLICY_KEYS: {sorted(unlisted)}"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_sealed_repo_outlives_its_test():
     """A sealed setup arms its repositories (`_seal_git.arm`) until `_seal_session.end()`, which a test may
@@ -245,6 +278,24 @@ def _reset_workspace_env(monkeypatch):
     monkeypatch.delenv("AGENT_FACTORY_WORKSPACE", raising=False)
     # `child.write_context` exports the run context the same way.
     monkeypatch.delenv("AGENT_FACTORY_RUN_CONTEXT", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_engine_input_pin(monkeypatch):
+    """`_author._engine_input_pin` (run by `project`) sets the pin as a module global that outlives the test:
+    a later test on the worker would see the coordinator pinned to that run's engine."""
+    from flyte_agent_factory import _pins
+
+    monkeypatch.setattr(_pins, "engine_input", "")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_checkpoint_health(monkeypatch):
+    """`_state.save_checkpoint` records into a module global that outlives the test: a later test's run report
+    would carry an earlier test's checkpoint, and its age."""
+    from flyte_agent_factory import _state
+
+    monkeypatch.setattr(_state, "health", _state.CheckpointHealth())
 
 
 @pytest.fixture

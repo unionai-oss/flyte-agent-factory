@@ -687,6 +687,34 @@ def test_a_queued_pin_to_an_engine_without_a_login_fails_instead_of_waiting(monk
     assert "pins codex, but this profile has no codex token" in kwargs["error"]
 
 
+def test_a_queued_request_with_a_policy_key_now_refused_fails_instead_of_stopping_the_planner(monkeypatch):
+    """#50: a request queued before its policy key was refused fails; the planner pass carries on."""
+    from flyte_agent_factory import _planner_runtime as module
+
+    monkeypatch.setattr(module, "_intents", lambda *_: [])
+    marked: list[tuple[Any, Any]] = []
+    monkeypatch.setattr(_queue, "mark", lambda *args, **kwargs: marked.append((args, kwargs)))
+    monkeypatch.setattr(_factory_base, "queue_root", lambda: "queue")
+    request = _queue.Request("m", 3, "new", "brief", "opus", "team/repo", "", {"REVEIW_MODEL": "opus"}, NOW)
+    item = _planner.ManualRequest("m", "team/repo", files=("a",))
+    facts = _planner.Facts(
+        manual_requests=(item,), capacity=(_planner.Capacity("claude", "login", slot="s"),)
+    )
+    none: Any = None
+    assert module.execute(none, none, "team/direction", "base", none, [], facts, {"m": request}) == []
+    ((args, kwargs),) = marked
+    assert args == ("queue", "m", 3, "failed")
+    assert "unknown key in [policy]: REVEIW_MODEL" in kwargs["error"]
+
+
+def test_an_imported_request_with_a_policy_key_now_refused_is_held_not_launched(runtime):
+    """#50: an imported request has no queue entry to fail, so its item waits rather than launch bare."""
+    launched, submitted = runtime(_caps(), {"REVEIW_MODEL": "opus"})
+    assert launched == [] and submitted == []
+    launched, submitted = runtime(_caps(), {"JUDGE_MODEL": "opus"})
+    assert launched and submitted
+
+
 def test_a_pin_the_router_moves_off_still_names_the_pin_in_the_launch():
     # The pod is handed the pin; the record and the board must name what it will run.
     """A pin the router moves off still names the pin in the launch."""

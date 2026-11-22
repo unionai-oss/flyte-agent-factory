@@ -39,6 +39,7 @@ from . import (
     _standards,
     _state_store,
 )
+from ._policy import ENGINE_KEYS, NUMERIC_POLICY, POLICY_KEYS, suggest_nearest_key
 from ._profile_policy import Gardening as Gardening
 from ._profile_policy import JudgementPolicy as JudgementPolicy
 from ._profile_state import State as State
@@ -57,8 +58,6 @@ DEFAULT_FILE = ".default"
 #: A role-policy key becomes `AGENT_FACTORY_<key>`; the profile's own variables must not be
 #: reachable through it.
 _POLICY_KEY = re.compile(r"[A-Z0-9_]+")
-#: Policy keys that name an engine: the coordinator's, and its old name.
-_ENGINE_KEYS = ("COORDINATOR_ENGINE", "AUTHOR_ENGINE")
 #: The marker a skeleton profile leaves for the values its owner must fill in.
 PLACEHOLDER = "TODO-"
 BACKENDS = ("union", "oss")
@@ -126,14 +125,6 @@ def normalize_engine(value: str) -> str:
 
 #: `[secrets]` keys `_fields` may leave out. `deploy_key` is required there, and `claude_token` right after.
 OPTIONAL_SECRETS = ("gateway_key", "api_key", "claude_token", "codex_token")
-#: Policy keys read as numbers, with the check their reader applies (the readers fall back to a default
-#: on a bad value; a profile fails instead). `PARK_RELEASE_MIN`: 0 keeps a parked session for ever.
-_NUMERIC_POLICY: Mapping[str, tuple[type[int] | type[float], float, str]] = MappingProxyType(
-    {
-        "PARK_RELEASE_MIN": (float, 0, "a finite number of minutes, 0 or more"),
-        "DELEGATE_MAX": (int, 1, "a whole number, 1 or more"),
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -491,14 +482,16 @@ def _policy(table: Mapping[str, Any], section: str, where: str) -> Mapping[str, 
                 f"{where}: [{section}] {key!r} must be A-Z, 0-9 and _, without an AGENT_FACTORY_ "
                 "or CLAUDE_ prefix and not starting with PROFILE"
             )
+        if key not in POLICY_KEYS:  # a typo would load and silently do nothing
+            raise ProfileError(f"{where}: unknown key in [{section}]: {key}{suggest_nearest_key(key)}")
         if not isinstance(value, str):
             raise ProfileError(f"{where}: [{section}] {key} must be a string")
-        if key in _ENGINE_KEYS and value and normalize_engine(value) not in ENGINES:
+        if key in ENGINE_KEYS and value and normalize_engine(value) not in ENGINES:
             raise ProfileError(f"{where}: [{section}] {key} = {value!r} must be one of {ENGINES}")
         if key == "ENGINE_FALLBACK" and value.strip().lower() not in ("", "allow", "wait"):
             raise ProfileError(f'{where}: [{section}] {key} = {value!r} must be "allow" or "wait"')
-        if key in _NUMERIC_POLICY:
-            kind, minimum, wanted = _NUMERIC_POLICY[key]
+        if key in NUMERIC_POLICY:
+            kind, minimum, wanted = NUMERIC_POLICY[key]
             try:
                 number = kind(value)
                 if not math.isfinite(number) or number < minimum:
@@ -516,7 +509,9 @@ def _policy(table: Mapping[str, Any], section: str, where: str) -> Mapping[str, 
                 f"{where}: [{section}] AUTHOR_ENGINE = {alias!r} and COORDINATOR_ENGINE = "
                 f"{out['COORDINATOR_ENGINE']!r} disagree; set only COORDINATOR_ENGINE"
             )
-        _warn_once(f"{where}: [{section}] AUTHOR_ENGINE is deprecated; use COORDINATOR_ENGINE")
+        _warn_once(
+            f"{where}: [{section}] AUTHOR_ENGINE is deprecated and will be removed; use COORDINATOR_ENGINE"
+        )
         out.setdefault("COORDINATOR_ENGINE", alias)
     if out.get("COORDINATOR_ENGINE"):
         out["COORDINATOR_ENGINE"] = normalize_engine(out["COORDINATOR_ENGINE"])
@@ -568,6 +563,11 @@ def _browser(data: Mapping[str, Any], where: str, state: State) -> Browser:
         (),
         ("exit_node", "tailscale_secret", "profile_uri", "personal_env", "tailscale_tag"),
     )
+    if "personal_env" in fields:
+        _warn_once(
+            f"{where}: [browser] personal_env is ignored and will be removed; "
+            "name the identity in [browser.identities.<name>] instead"
+        )
     tag = fields.get("tailscale_tag", "")
     if "tailscale_tag" in fields and not _TAILSCALE_TAG.fullmatch(tag):
         raise ProfileError(f"{where}: [browser] tailscale_tag must look like 'tag:name', not {tag!r}")

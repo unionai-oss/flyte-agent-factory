@@ -442,6 +442,9 @@ _AUTHOR_HANDOFF_MIN_RETRIES_LEFT = 2  # the handoff's own retry, plus one margin
 # Bound on each handoff step that talks to the outside (credential persistence, checkpoint): a
 # stall here must still end in the restart.
 _HANDOFF_STEP_TIMEOUT_S = 30
+#: Bound on the checkpoint taken when the author pauses on a limit. Not the handoff step's: a long project's
+#: copy and upload take more than 30s, and nothing waits on this one but the pause itself (#45).
+_LIMIT_CHECKPOINT_TIMEOUT_S = 300
 
 
 class AuthorHandoffRestart(RuntimeError):
@@ -624,15 +627,20 @@ def _author_handoff(
             note_pause(decision, pin)
         if decision.deferred or decision.engine == _usage._author_engine:
             if last_decision != getattr(session, "_checkpointed_limit", None):
+                started = time.time()
                 try:
-                    await asyncio.wait_for(
-                        _state.save_checkpoint(state, exclude_private=True), timeout=_HANDOFF_STEP_TIMEOUT_S
+                    await _state.save_checkpoint(
+                        state, exclude_private=True, kind="limit", timeout=_LIMIT_CHECKPOINT_TIMEOUT_S
                     )
                 except (*REMOTE_ERRORS, TimeoutError) as exc:
-                    # Not remembered as saved: the next pump tick tries again.
-                    timeline.row("⚠️", f"limit checkpoint failed: {type(exc).__name__}: {exc}")
+                    # Not remembered as saved: the next pump tick tries again. The step and the time it took
+                    # come from the checkpoint's own record; the status report carries the last good one.
+                    timeline.row(
+                        "⚠️", f"limit checkpoint failed: {_state.health.describe_failure(exc, started)}"
+                    )
                 else:
                     session._checkpointed_limit = last_decision
+                    timeline.row("💾", "limit checkpoint saved")
             return False
 
         assert decision.engine is not None  # deferred decisions returned above
@@ -717,12 +725,14 @@ def _author_handoff(
             finally:
                 # Best effort, and also on failure: the next pod resumes from this checkpoint. The
                 # factory never pushes; the briefing tells the new author to push first.
+                started = time.time()
                 try:
-                    await asyncio.wait_for(
-                        _state.save_checkpoint(state, exclude_private=True), timeout=_HANDOFF_STEP_TIMEOUT_S
+                    await _state.save_checkpoint(
+                        state, exclude_private=True, kind="handoff", timeout=_HANDOFF_STEP_TIMEOUT_S
                     )
                 except (*REMOTE_ERRORS, TimeoutError) as exc:
-                    timeline.row("💥", f"author handoff checkpoint failed: {type(exc).__name__}: {exc}")
+                    why = _state.health.describe_failure(exc, started)
+                    timeline.row("💥", f"author handoff checkpoint failed: {why}")
                 else:
                     timeline.row(
                         "💾",

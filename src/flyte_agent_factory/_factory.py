@@ -993,6 +993,7 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
         name=data.get("project") or result["name"],
         run_phase=_factory_base._phase(run),
         **_factory_status.phase_fields(phase),
+        **_factory_status.report_checkpoint_fields(data, time.time()),
         goal=data.get("goal", ""),
         verdict=data.get("verdict") or _dashboard.verdict(data),
         activity=data.get("activity") or _factory_status._html_activity(page),

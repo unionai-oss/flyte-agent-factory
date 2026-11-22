@@ -7,6 +7,9 @@ are mapped here rather than at each reader.
 
 from __future__ import annotations
 
+#: The session sub-agent roles, one per `_assets/agents/<role>.md`; `_policy` builds Codex keys from them.
+SESSION_ROLES = ("scope", "discover", "prototype", "shape", "build", "verify")
+
 #: alias -> the role it stands for. Removing the aliases is a gardening item after the rename window.
 ROLE_ALIASES = {"product": "scope", "designer": "shape", "dev": "build", "qa": "verify"}
 

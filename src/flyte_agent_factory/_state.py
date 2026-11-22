@@ -23,13 +23,19 @@ available, a volume is the better home for this.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import errno
 import logging
+import os
 import shutil
 import tempfile
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import _secret_env, _workspace_archive
 
@@ -123,24 +129,27 @@ def _ensure_layout(root: Path) -> None:
 
 
 _CHECKPOINT_GIT_TIMEOUT_S = 10.0
+# `fsck --connectivity-only` reads only commits and trees: 0.6 s on a repository of 48k objects.
+_CHECKPOINT_FSCK_TIMEOUT_S = 60.0
 
 
-async def _list_checkpoint_files(workspace: Path, *args: str) -> bytes | None:
+async def _git_in_checkpoint(cwd: Path, *args: str, timeout: float) -> tuple[int | None, bytes]:
+    """Run git for a checkpoint and return (exit status, stdout); None when it did not start or finish."""
     # Not the supervisor's `_git_out`: importing it would create a cycle, and its teardown can
     # wait for inherited pipes, which must not hold up a checkpoint.
     try:
         proc = await asyncio.create_subprocess_exec(
-            *_secret_env.git_argv("ls-files", *args, "-z"),
-            cwd=workspace,
+            *_secret_env.git_argv(*args),
+            cwd=cwd,
             env=_secret_env.child_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
     except OSError as exc:
-        logging.getLogger(__name__).warning("checkpoint file listing unavailable: %s", exc)
-        return None
+        logging.getLogger(__name__).warning("checkpoint git %s unavailable: %s", args[0], exc)
+        return None, b""
     try:
-        output, _ = await asyncio.wait_for(proc.communicate(), timeout=_CHECKPOINT_GIT_TIMEOUT_S)
+        output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -152,23 +161,208 @@ async def _list_checkpoint_files(workspace: Path, *args: str) -> bytes | None:
             await asyncio.wait_for(proc.wait(), timeout=1)
         if isinstance(exc, asyncio.CancelledError):
             raise
-        logging.getLogger(__name__).warning("checkpoint git listing timed out; copying the file tree")
-        return None
-    if proc.returncode:
+        logging.getLogger(__name__).warning("checkpoint git %s timed out", args[0])
+        return None, b""
+    return proc.returncode, output
+
+
+async def _list_checkpoint_files(workspace: Path, *args: str) -> bytes | None:
+    status, output = await _git_in_checkpoint(
+        workspace, "ls-files", *args, "-z", timeout=_CHECKPOINT_GIT_TIMEOUT_S
+    )
+    if status != 0:
         logging.getLogger(__name__).warning("checkpoint git listing failed; copying the file tree")
         return None
     return output
 
 
-async def save_checkpoint(state: ProjectState, *, exclude_private: bool = False) -> bool:
-    """Record the project so far, so a retry resumes instead of restarting."""
+async def _repository_is_intact(workspace: Path) -> bool:
+    """Return False only when git ran and found the repository broken; a git that cannot run says nothing."""
+    status, _ = await _git_in_checkpoint(
+        workspace, "fsck", "--connectivity-only", "--no-dangling", timeout=_CHECKPOINT_FSCK_TIMEOUT_S
+    )
+    return status is None or status == 0
+
+
+@dataclass
+class CheckpointHealth:
+    """How this pod's checkpoints went: the last good one, and the last one that failed and where.
+
+    The timeline only scrolls; the status report carries this so a reader can tell how old the newest
+    checkpoint is, and why the one after it was not written. None until one is taken in this pod.
+    """
+
+    last_ok_at: float | None = None
+    last_ok_kind: str = ""
+    #: {at, kind, step, elapsed_s, error} of the last failure, cleared by the next success.
+    failure: dict[str, Any] | None = None
+
+    def report(self, now: float | None = None) -> dict[str, Any]:
+        """Return the health as the plain dict the status report carries."""
+        now = time.time() if now is None else now
+        return {
+            "last_ok_at": self.last_ok_at,
+            "last_ok_age_s": None if self.last_ok_at is None else max(0, int(now - self.last_ok_at)),
+            "last_ok_kind": self.last_ok_kind,
+            "last_failure": dict(self.failure) if self.failure else None,
+        }
+
+    def describe_failure(self, exc: BaseException, since: float) -> str:
+        """Return `exc` for a timeline row, with the step and time of a checkpoint failed after `since`."""
+        text = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        f = self.failure
+        if f and f["at"] >= since:
+            text += f" while {f['step']} (after {f['elapsed_s']:.0f}s)"
+        return text
+
+
+health = CheckpointHealth()
+
+
+@dataclass
+class _Attempt:
+    """One checkpoint in flight; overlapping ones (limit and periodic) each keep their own step."""
+
+    kind: str
+    started: float  # monotonic
+    step: str = ""  # so one cut off by its bound says where
+    saved: bool = False  # uploaded: what fails after this (removing the staging copy) loses nothing
+
+
+class _CopyStopped(Exception):
+    """The checkpoint that wanted this copy was cancelled; stop writing into its staging directory."""
+
+
+class CheckpointInconsistent(OSError):
+    """The staged repository is broken although the project's own is not, even after copying it again."""
+
+
+def _vanished(row: tuple[str, str, str]) -> bool:
+    """Return whether a `shutil.Error` row's source was gone when it was read (ENOENT on that path)."""
+    source, _, why = row
+    return why.startswith(f"[Errno {errno.ENOENT}]") and repr(source) in why
+
+
+def _stage(
+    src: Path, dst: Path, ignore: Callable[[str, list[str]], list[str]], stop: threading.Event
+) -> list[str]:
+    """Copy the project into the staging directory, stopping at the next file once `stop` is set.
+
+    The tree is live: a file or directory deleted after it was listed (`git gc`, a subagent's scratch)
+    is left out rather than failing the checkpoint, and returned. It counts as deleted when reading it
+    failed with "no such file" on that very path, whatever is there by now: a `.git/objects/xx` that git
+    removes and recreates is still a directory the copy could not read. Any other copy error fails it.
+    """
+    vanished: list[str] = []
+
+    def copy(source: str, target: str, *, follow_symlinks: bool = True) -> object:
+        if stop.is_set():
+            raise _CopyStopped
+        try:
+            return shutil.copy2(source, target, follow_symlinks=follow_symlinks)
+        except FileNotFoundError as exc:
+            if exc.filename != source:
+                raise
+            vanished.append(source)
+            return target
+
+    def ignore_or_stop(directory: str, names: list[str]) -> list[str]:
+        if stop.is_set():
+            raise _CopyStopped
+        return ignore(directory, names)
+
+    try:
+        shutil.copytree(src, dst, ignore=ignore_or_stop, copy_function=copy, symlinks=True)
+    except shutil.Error as exc:
+        # Each row is (source, target, why).
+        rows = [row for row in exc.args[0] if not _vanished(row)]
+        if rows:
+            raise shutil.Error(rows) from None
+        vanished.extend(row[0] for row in exc.args[0])
+    if vanished:
+        in_git = sum(f"{os.sep}.git{os.sep}" in path for path in vanished)
+        logging.getLogger(__name__).warning(
+            "checkpoint: %d paths deleted during the copy were left out (%d under .git)",
+            len(vanished),
+            in_git,
+        )
+    return vanished
+
+
+def _restage(
+    src: Path, dst: Path, ignore: Callable[[str, list[str]], list[str]], stop: threading.Event
+) -> None:
+    shutil.rmtree(dst, ignore_errors=True)
+    _stage(src, dst, ignore, stop)
+
+
+def _remove_staging(directory: str) -> None:
+    # Runs on the copy's own single worker, so only after the copy has stopped: removing it while the
+    # copy still writes is what failed with "Directory not empty" (#45).
+    try:
+        shutil.rmtree(directory)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("checkpoint staging directory not removed: %s", exc)
+
+
+async def save_checkpoint(
+    state: ProjectState,
+    *,
+    exclude_private: bool = False,
+    kind: str = "periodic",
+    timeout: float | None = None,
+) -> bool:
+    """Record the project so far, so a retry resumes instead of restarting.
+
+    `kind` names it in `health`: "periodic" (the periodic and final ones), "limit" or "handoff".
+    `timeout` bounds listing, copying, checking and uploading; once the upload is done, removing the
+    staging copy is not bounded, so a checkpoint that was saved is never reported lost. A failure,
+    including running out of that bound (`TimeoutError`) or a cancel, is recorded in `health` with the
+    step it was in, then raised.
+    """
     ckpt = _checkpoint()
     if ckpt is None:
         return False
+    attempt = _Attempt(kind, time.monotonic())
+    bound = asyncio.timeout(timeout)
+    try:
+        async with bound:
+
+            def saved() -> None:
+                bound.reschedule(None)
+                health.last_ok_at, health.last_ok_kind, health.failure = time.time(), kind, None
+                attempt.saved, attempt.step = True, "removing the staging copy"
+
+            await _save(ckpt, state, exclude_private, attempt, saved)
+    except BaseException as exc:
+        if not attempt.saved:
+            if isinstance(exc, TimeoutError) and bound.expired():
+                why = f"timed out: its {timeout:g}s bound ran out"
+            elif isinstance(exc, asyncio.CancelledError):
+                why = "cancelled: its time bound ran out, or the pod is stopping"
+            else:
+                why = f"{type(exc).__name__}: {exc}"
+            health.failure = {
+                "at": time.time(),
+                "kind": kind,
+                "step": attempt.step,
+                "elapsed_s": round(time.monotonic() - attempt.started, 1),
+                "error": why[:300],
+            }
+        raise
+    return True
+
+
+async def _save(
+    ckpt: Checkpoint, state: ProjectState, exclude_private: bool, attempt: _Attempt, saved: Callable[[], None]
+) -> None:
     # `save` tars and uploads a directory itself.
     if not exclude_private and not (state.root / "author-conversation.json").is_file():
+        attempt.step = "uploading"
         await ckpt.save(state.root)
-        return True
+        saved()
+        return
+    attempt.step = "listing files"
     ignored = set()
     if (state.workspace / ".git").exists():
         output = await _list_checkpoint_files(state.workspace, "--others", "--ignored", "--exclude-standard")
@@ -190,23 +384,61 @@ async def save_checkpoint(state: ProjectState, *, exclude_private: bool = False)
             for name in output.decode().split("\0"):
                 if name:
                     ignored_dirs.difference_update((state.workspace / name).parents)
+    # Once, not per name: a `.venv` lists tens of thousands of ignored files.
+    skipped = ignored | ignored_dirs
 
     def exclude(directory: str, names: list[str]) -> list[str]:
         parent = Path(directory)
         return [
             name
             for name in names
-            if parent / name in ignored | ignored_dirs
+            if parent / name in skipped
             and ".claude-flyte" not in (parent / name).relative_to(state.root).parts
         ]
 
     # The SDK archives whole directories. Stage a filtered copy rather than moving live files out
     # from under the credential refresher, or archiving ignored training datasets.
-    with tempfile.TemporaryDirectory(prefix="author-checkpoint-") as directory:
-        snapshot = Path(directory) / "state"
-        await asyncio.to_thread(shutil.copytree, state.root, snapshot, ignore=exclude, symlinks=True)
+    attempt.step = "staging a copy"
+    directory = tempfile.mkdtemp(prefix="author-checkpoint-")
+    snapshot = Path(directory) / "state"
+    stop = threading.Event()
+    # Not the loop's shared executor: a cancel while the copy is still queued there drops the job, and
+    # nothing would ever run the removal. One worker keeps the removal behind the copy, in order.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="checkpoint-copy")
+    loop = asyncio.get_running_loop()
+    try:
+        # The thread outlives a cancelled await, so the copy is told to stop and the directory is removed
+        # after it (same worker, in order), whatever ends this block.
+        await loop.run_in_executor(pool, _stage, state.root, snapshot, exclude, stop)
+        staged = snapshot / state.workspace.relative_to(state.root)
+        if (staged / ".git" / "HEAD").is_file():
+            # A `git gc` during the copy can leave a staged repository missing objects it needs; a
+            # file it removed is left out above, so check the copy rather than trusting it.
+            attempt.step = "checking the staged repository"
+            if not await _repository_is_intact(staged):
+                logging.getLogger(__name__).warning(
+                    "checkpoint: staged repository broken; copying .git again"
+                )
+                await loop.run_in_executor(
+                    pool, _restage, state.workspace / ".git", staged / ".git", exclude, stop
+                )
+                if not await _repository_is_intact(staged):
+                    if await _repository_is_intact(state.workspace):
+                        raise CheckpointInconsistent(
+                            "the staged repository fails `git fsck --connectivity-only` after a recopy"
+                        )
+                    # The project's own repository is broken too: the checkpoint is a faithful copy of it.
+                    logging.getLogger(__name__).warning("checkpoint: the project's repository fails git fsck")
+        attempt.step = "uploading"
         await ckpt.save(snapshot)
-    return True
+        saved()
+    finally:
+        stop.set()
+        try:
+            # Shielded: a second cancel must not skip the removal; the worker finishes it regardless.
+            await asyncio.shield(loop.run_in_executor(pool, _remove_staging, directory))
+        finally:
+            pool.shutdown(wait=False)
 
 
 async def publish(state: ProjectState) -> Dir:

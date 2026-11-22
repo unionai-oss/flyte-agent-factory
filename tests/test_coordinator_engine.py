@@ -58,7 +58,8 @@ def test_author_engine_in_a_profile_is_an_alias_that_warns_naming_the_canonical_
     profile = _profile.parse(_with_policy('AUTHOR_ENGINE = "Codex"\n'))
     assert dict(profile.policy)["COORDINATOR_ENGINE"] == "codex"
     assert "AUTHOR_ENGINE" not in profile.policy
-    assert "AUTHOR_ENGINE is deprecated; use COORDINATOR_ENGINE" in capsys.readouterr().err
+    warning = capsys.readouterr().err
+    assert "AUTHOR_ENGINE is deprecated and will be removed; use COORDINATOR_ENGINE" in warning
 
 
 def test_a_profile_with_both_keys_set_to_different_engines_is_refused():

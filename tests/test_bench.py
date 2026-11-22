@@ -64,7 +64,7 @@ api_key = "api_key_x"
 gateway_key = "gateway_key_x"
 
 [policy]
-CRAFT_EFFORT = "high"
+JUDGE_EFFORT = "high"
 JUDGE_ENGINE = "codex"
 QA_DIFFERENT_ENGINE = "true"
 PLANNER_CODEX_EFFORT = "high"
@@ -210,7 +210,7 @@ def test_the_bench_profile_keeps_only_the_benchmark():
     # No App: candidate code would hold a key that reaches every repo the App is installed on.
     assert bench.github == _profile.Github() and not bench.github.configured
     # Claude-only: no engine routing, and no Codex token to route to.
-    assert dict(bench.policy) == {"CRAFT_EFFORT": "high"}
+    assert dict(bench.policy) == {"JUDGE_EFFORT": "high"}
     assert bench.secrets == _profile.Secrets(deploy_key="bench_repo_key", claude_token="production_token")
     # What a bench pod mounts beside the work token: the bench repo's key, and nothing else.
     assert bench.agent_secrets == "bench_repo_key=GIT_DEPLOY_KEY"
@@ -329,10 +329,10 @@ def test_the_case_name_is_deterministic_and_a_valid_project_name():
 
 
 def test_cases_are_planned_repeat_by_repeat():
-    cases = _bench.plan_cases("r1", SHA, ["bugfix-shortlinks"], 2, {"CRAFT_EFFORT": "low"}, "opus")
+    cases = _bench.plan_cases("r1", SHA, ["bugfix-shortlinks"], 2, {"JUDGE_EFFORT": "low"}, "opus")
     assert [(c["task"], c["repeat"]) for c in cases] == [("bugfix-shortlinks", 1), ("bugfix-shortlinks", 2)]
     assert cases[0]["case"] == _bench.case_name("r1", "bugfix-shortlinks", "candidate", 1)
-    assert cases[0]["suite_digest"] == _bench_suite.digest() and cases[0]["policy"] == {"CRAFT_EFFORT": "low"}
+    assert cases[0]["suite_digest"] == _bench_suite.digest() and cases[0]["policy"] == {"JUDGE_EFFORT": "low"}
     for bad, error in (
         (dict(task_ids=["nope"]), "no task"),
         (dict(repeats=0), "repeats must be 1 to 3"),

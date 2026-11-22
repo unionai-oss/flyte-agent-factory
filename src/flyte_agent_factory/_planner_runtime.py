@@ -339,25 +339,33 @@ def execute(
     # A pin to an engine the profile has no login for can never launch; fail it as `prepare_launch`
     # refuses it, rather than leave it waiting for good. (The planner's own `pin_unconfigured` is a
     # wait: the pinned engine exists, just not on a free slot.)
-    failed = set()
-    for manual in facts.manual_requests:
-        if (request := requests.get(manual.name)) is None:
-            continue
+    # A policy queued before a key was refused fails here too: an imported request has no queue entry left
+    # to mark, so its item is held back (and logged each pass) rather than launched without its policy.
+    failed, held = set(), set()
+    policies: dict[str, dict[str, str]] = {}
+    manual_names = {manual.name for manual in facts.manual_requests}
+    for name, queued in list(requests.items()):
         try:
-            _factory._check_author_pin(_factory_policy.normalize_policy(request.policy or {}))
+            policy = _factory_policy.normalize_policy(queued.policy or {})
+            if name in manual_names:
+                _factory._check_author_pin(policy)
         except ValueError as exc:
-            log.warning("planner: %s fails: %s", manual.name, exc)
-            _queue.mark(_factory_base.queue_root(), request.name, request.gen, "failed", error=str(exc))
-            failed.add(manual.name)
-            del requests[manual.name]
+            if name in manual_names:
+                log.warning("planner: %s fails: %s", name, exc)
+                _queue.mark(_factory_base.queue_root(), queued.name, queued.gen, "failed", error=str(exc))
+                failed.add(name)
+            else:
+                log.warning("planner: %s held: %s", name, exc)
+                held.add(name)
+            del requests[name]
+        else:
+            policies[name] = policy
     facts = replace(
         facts,
         manual_requests=tuple(m for m in facts.manual_requests if m.name not in failed),
         capacity=tuple(slot for slot in facts.capacity if slot.engine in AUTHOR_ENGINES),
         pins={
-            node: pin
-            for node, queued in requests.items()
-            if (pin := _factory_policy.normalize_policy(queued.policy or {}).get(PIN_KEY, "").strip().lower())
+            node: pin for node, policy in policies.items() if (pin := policy.get(PIN_KEY, "").strip().lower())
         },
         active_runs=(*facts.active_runs, *occupied),
         items=tuple(
@@ -365,6 +373,7 @@ def execute(
             if item.node_id in requests
             else item
             for item in facts.items
+            if item.node_id not in held
         ),
     )
     launched: list[str] = []

@@ -258,7 +258,7 @@ def test_resume_refuses_changed_inputs(origin, monkeypatch, changed):
     monkeypatch.setattr(_bench_flow, "_store", lambda app: _bench_store.Store(origin.as_uri()))
     monkeypatch.setattr(_bench_flow, "resolve_sha", lambda *args: SHA)
     cases = _bench.plan_cases("r1", SHA, ["bugfix-shortlinks"], 1, {}, "opus")
-    row = record(**{changed: {"CRAFT_EFFORT": "low"} if changed == "policy" else "other"})
+    row = record(**{changed: {"JUDGE_EFFORT": "low"} if changed == "policy" else "other"})
     with _bench_store.Store(origin.as_uri()) as store:
         store.append_case(row)
     monkeypatch.setattr(_bench_flow, "prepare", lambda *args: (cases, {}, True))

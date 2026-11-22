@@ -8,6 +8,7 @@ import math
 import os
 import signal
 import tarfile
+import time
 from pathlib import Path
 
 from flyte.io import Dir
@@ -62,13 +63,14 @@ async def _checkpoint_loop(
         except asyncio.TimeoutError:
             pass
 
+        started = time.time()
         try:
             if await _state.save_checkpoint(state):
                 timeline.row("💾", "checkpointed")
             else:
                 timeline.row("·", "no checkpoint configured for this action")
         except REMOTE_ERRORS as e:  # a failed commit must not end the project
-            timeline.row("⚠️", f"commit failed: {type(e).__name__}: {e}")
+            timeline.row("⚠️", f"commit failed: {_state.health.describe_failure(e, started)}")
         await timeline.flush()
 
 

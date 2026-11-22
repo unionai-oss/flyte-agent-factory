@@ -475,26 +475,33 @@ has refused the call. [engines.md](engines.md) lists what each engine supports.
 ### Policy keys
 
 Policy keys are set in the profile's `[policy]` table (or `[slots.policy]` per slot), in a launch's `policy`, or as
-`AGENT_FACTORY_<KEY>` in the environment. Unknown keys are accepted, so a typo does not fail; the names below are the
-ones the code reads.
+`AGENT_FACTORY_<KEY>` in the environment. The keys below are the only ones a profile or a launch accepts: any other
+key is refused when the profile loads or the launch is made, with the closest known key (`unknown key in [policy]:
+COORDINATR_ENGINE (did you mean COORDINATOR_ENGINE?)`). The set is `_policy.POLICY_KEYS`, and a test fails when it
+drifts from what the code reads.
 
 | Policy key | Default | Meaning |
 |---|---|---|
-| `COORDINATOR_ENGINE`, `AUTHOR_ENGINE` | none | `claude` or `codex`. `AUTHOR_ENGINE` is the alias; setting both to different engines is an error. Pinning `codex` needs `[secrets] codex_token` |
+| `COORDINATOR_ENGINE`, `AUTHOR_ENGINE` | none | `claude` or `codex`. `AUTHOR_ENGINE` is the deprecated alias, still accepted with a warning and to be removed: use `COORDINATOR_ENGINE`; setting both to different engines is an error. Pinning `codex` needs `[secrets] codex_token` |
 | `ENGINE_FALLBACK` | unset (wait) | `allow` lets a pinned coordinator or delegate move to the other engine while its own is at a usage limit; unset or `wait` makes the pin hard, so the run waits for the pinned engine's reset. Any other value in a profile is an error |
-| `DELEGATE_ENGINE`, `PLANNER_ENGINE`, `CONTRACT_ENGINE`, `ARBITER_ENGINE` | none | `claude` or `codex` for that role. A Codex pin runs on Claude when the profile has no `codex_token` |
+| `DELEGATE_ENGINE`, `PLANNER_ENGINE`, `CONTRACT_ENGINE`, `ARBITER_ENGINE`, `JUDGEMENT_ENGINE` | none | `claude` or `codex` for that role (`JUDGEMENT_` is the ask-human triage call). A Codex pin runs on Claude when the profile has no `codex_token` |
 | `CORRECTNESS_ENGINE`, `COMPLETENESS_ENGINE`, `CRAFT_ENGINE` | none | the same, per judge |
+| `CORRECTNESS_CHECK_ENGINE`, `COMPLETENESS_CHECK_ENGINE` | none | the same for the finding check that re-runs that judge's findings |
 | `QA_DIFFERENT_ENGINE` | `true` | the judges prefer an engine other than the coordinator's when the profile has both a `claude_token` and a `codex_token`; `false` keeps explicit or default routing |
 | `AUTHOR_MODEL`, `AUTHOR_EFFORT` | `sonnet`, none | the Claude model and effort of the coordinator |
 | `JUDGE_MODEL`, `JUDGE_EFFORT` | `opus`, `high` | the Claude model and effort of the judges; `JUDGE_EFFORT` also overrides the arbiter's `xhigh` |
 | `FINDING_CHECK_MODEL`, `FINDING_CHECK_EFFORT` | `sonnet`, `low` | the Claude model and effort of the finding check that re-runs a correctness or completeness judge's findings (see Judge outcomes) |
 | `PLANNER_MODEL`, `PLANNER_EFFORT` | `fable`, by round | the Claude model of the planner and contract writer (a failed call falls back to `opus`); effort is `medium` in round 1, `high` in rounds 2 and 3, `xhigh` after, unless set |
 | `AUTHOR_CODEX_MODEL`, `AUTHOR_CODEX_EFFORT`, `DELEGATE_CODEX_MODEL`, `DELEGATE_CODEX_EFFORT` | Codex's model, `medium` | the same for a Codex coordinator and Codex workers |
-| `JUDGE_CODEX_MODEL`, `JUDGE_CODEX_EFFORT`, `ARBITER_CODEX_MODEL`, `ARBITER_CODEX_EFFORT`, `CONTRACT_CODEX_MODEL`, `CONTRACT_CODEX_EFFORT`, `PLANNER_CODEX_MODEL`, `PLANNER_CODEX_EFFORT` | Codex's model, `high` | the same for the review-loop roles. Efforts are `minimal`, `low`, `medium`, `high` or `xhigh`; an invalid one warns and uses the default |
+| `CORRECTNESS_CODEX_MODEL`, `CORRECTNESS_CODEX_EFFORT`, `COMPLETENESS_CODEX_MODEL`, `COMPLETENESS_CODEX_EFFORT`, `CRAFT_CODEX_MODEL`, `CRAFT_CODEX_EFFORT`, `ARBITER_CODEX_MODEL`, `ARBITER_CODEX_EFFORT`, `CONTRACT_CODEX_MODEL`, `CONTRACT_CODEX_EFFORT`, `PLANNER_CODEX_MODEL`, `PLANNER_CODEX_EFFORT` | Codex's model, `high` | the same for the review-loop roles; a judge reads its concern's keys (the old judge-wide Codex keys were never read and are now refused, naming these). Efforts are `minimal`, `low`, `medium`, `high` or `xhigh`; an invalid one warns and uses the default |
+| `CORRECTNESS_CHECK_CODEX_MODEL`, `CORRECTNESS_CHECK_CODEX_EFFORT`, `COMPLETENESS_CHECK_CODEX_MODEL`, `COMPLETENESS_CHECK_CODEX_EFFORT` | Codex's model, `high` | the same for the finding check of each of those judges |
+| `JUDGEMENT_CODEX_MODEL`, `JUDGEMENT_CODEX_EFFORT` | Codex's model, `high` | the same for the ask-human triage call, which is routed and tuned on its own |
+| `SCOPE_CODEX_MODEL`, `SCOPE_CODEX_EFFORT`, `DISCOVER_CODEX_MODEL`, `DISCOVER_CODEX_EFFORT`, `PROTOTYPE_CODEX_MODEL`, `PROTOTYPE_CODEX_EFFORT`, `SHAPE_CODEX_MODEL`, `SHAPE_CODEX_EFFORT`, `BUILD_CODEX_MODEL`, `BUILD_CODEX_EFFORT`, `VERIFY_CODEX_MODEL`, `VERIFY_CODEX_EFFORT`, `SUBAGENT_CODEX_MODEL`, `SUBAGENT_CODEX_EFFORT`, `PRODUCT_CODEX_MODEL`, `PRODUCT_CODEX_EFFORT`, `DESIGNER_CODEX_MODEL`, `DESIGNER_CODEX_EFFORT`, `DEV_CODEX_MODEL`, `DEV_CODEX_EFFORT`, `QA_CODEX_MODEL`, `QA_CODEX_EFFORT` | Codex's model, `high` | the same for a session sub-agent running on Codex, by its role: `scope`, `discover`, `prototype`, `shape`, `build`, `verify`, or `subagent` for a call made without one. The old role names `product`, `designer`, `dev` and `qa` are accepted as well |
 | `CRAFT_BLOCKING` | `false` | `true` makes craft findings block |
 | `DELEGATE_MAX` | `3` | workers running at once (a whole number, 1 or more) |
 | `PARK_RELEASE_MIN` | `60` | minutes a parked session (unanswered nudges) keeps its slot; `0` keeps it for ever |
 | `COMPACT_BETWEEN_ROUNDS` | off | `1`, `true` or `yes` compacts a Claude coordinator between review rounds |
+| `CONTEXT_GUARD`, `CONTEXT_GUARD_BYTES` | on, `24576` | `0`, `false`, `no` or `off` turns the coordinator's [context guard](context-guard.md) off; the file size in bytes above which an unbounded read is denied |
 | `ADMITTED_ENGINE`, `ADMISSION_NOTE` | none | written by planner admission when it launches a project: the engine it chose (never a pin) and its note. Not set by hand |
 
 Effort for Claude is one of `low`, `medium`, `high`, `xhigh`, `max`; when a call moves to Codex, `max` becomes `xhigh`.
@@ -511,6 +518,7 @@ factory's and are not listed.
 | `AGENT_FACTORY_PROFILE_TOML` | the profile's text, set on deployed pods, which cannot read `profiles/` |
 | `AGENT_FACTORY_DEPLOY_REPORT`, `AGENT_FACTORY_ENGINE_SHA` | the file a deploy child writes its report to; the engine commit a pod runs; `ops/deploy_status.py` reads it back from the task spec |
 | `AGENT_FACTORY_LIVE_TESTS` | `1` runs the live, billed model test; off by default |
+| `AGENT_FACTORY_CLAUDE_TUI` | `1` runs the author on the interactive TUI on a pty instead of the stream-json session ([headless-author-session.md](headless-author-session.md)); set in the deploying shell, which forwards it |
 | `AGENT_FACTORY_BROWSER`, `AGENT_FACTORY_BROWSER_ISOLATED`, `AGENT_FACTORY_BROWSER_EXIT_NODE`, `AGENT_FACTORY_BROWSER_TAILSCALE_SECRET` | the browser: on or off per deploy, isolated per project, and the optional exit-node egress ([browser-exit-node.md](browser-exit-node.md)) |
 | `AGENT_FACTORY_BROWSER_IDENTITIES`, `AGENT_FACTORY_BROWSER_GATE` | a project's personal browser grant (identity names) and the address of the supervisor's gate that serves it; set per run, never in a profile ([personal-browser.md](personal-browser.md)) |
 | `AGENT_FACTORY_CLAUDE_TOKEN_SECRET`, `AGENT_FACTORY_CODEX_TOKEN_SECRET` | the secrets holding the Claude and Codex tokens, from `[secrets]` |
@@ -524,10 +532,9 @@ factory's and are not listed.
 | `AGENT_FACTORY_ADMISSION_NOTE`, `AGENT_FACTORY_ADMITTED_ENGINE` | the policy keys of the same name, as variables |
 | `AGENT_FACTORY_COMPACT_BETWEEN_ROUNDS`, `AGENT_FACTORY_CRAFT_BLOCKING`, `AGENT_FACTORY_CRAFT_ENGINE`, `AGENT_FACTORY_CORRECTNESS_ENGINE` | the policy keys of the same name, as variables |
 | `AGENT_FACTORY_AUTHOR_EFFORT`, `AGENT_FACTORY_AUTHOR_MODEL`, `AGENT_FACTORY_DELEGATE_ENGINE`, `AGENT_FACTORY_DELEGATE_MAX` | the policy keys of the same name, as variables |
-| `AGENT_FACTORY_AUTHOR_ENGINE` | the deprecated alias of `AGENT_FACTORY_COORDINATOR_ENGINE` (the policy key `AUTHOR_ENGINE`); setting both to different engines is an error |
+| `AGENT_FACTORY_AUTHOR_ENGINE` | the deprecated alias of `AGENT_FACTORY_COORDINATOR_ENGINE` (the policy key `AUTHOR_ENGINE`), to be removed; setting both to different engines is an error |
 | `AGENT_FACTORY_JUDGE_EFFORT`, `AGENT_FACTORY_JUDGE_ENGINE`, `AGENT_FACTORY_JUDGE_MODEL`, `AGENT_FACTORY_PARK_RELEASE_MIN`, `AGENT_FACTORY_QA_DIFFERENT_ENGINE` | the policy keys of the same name, as variables. `JUDGE_ENGINE` pins all three judges; a per-judge key (`CORRECTNESS_ENGINE`, `COMPLETENESS_ENGINE`, `CRAFT_ENGINE`) wins over it |
 | `AGENT_FACTORY_PLANNER_CODEX_EFFORT`, `AGENT_FACTORY_PLANNER_CODEX_MODEL`, `AGENT_FACTORY_PLANNER_EFFORT`, `AGENT_FACTORY_PLANNER_ENGINE` | the policy keys of the same name, as variables |
-| `AGENT_FACTORY_CODEX_SECRET`, `AGENT_FACTORY_CREDENTIALS_SECRET`, `AGENT_FACTORY_AGENT_REPO` | names in `_names.py` that nothing reads |
 
 ### Standards
 
@@ -581,7 +588,17 @@ of the same checks, not an exemption from them. Without an escalation to grant a
 **The coordinator is long-lived.** One session per project holds the brief, the direction and the context for the
 months a feature can take. It keeps decisions and judges patches; implementation goes to delegate workers, which see
 only a snapshot and can be many and cheap. It is checkpointed on a timer, so a restart resumes it (a Codex coordinator
-resumes from its saved thread).
+resumes from its saved thread). It is also checkpointed when it pauses on a usage limit (bounded at 5 minutes, retried
+on the next tick of the pause until one is written) and before an engine handoff. A checkpoint stages a filtered copy
+of the project. Its time bound covers listing, staging, checking and uploading; once the upload is done the checkpoint
+counts as saved, and removing the staging copy is not bounded. One cut off by its bound stops the copy before the
+staging directory is removed. A file or directory that could not be read because it was deleted mid-copy is left out
+rather than failing it; the staged repository is then checked with `git fsck --connectivity-only`, and its `.git` is
+copied once more if the check fails (a `git gc` during the copy). A copy still broken while the project's own
+repository is intact fails the checkpoint. The run report's `checkpoints` block, and `factory.status`, carry the time,
+age and kind of the last good checkpoint and the last failure with the step it was in (listing files, staging a copy,
+checking the staged repository, uploading) and how long it ran; the timeline row of a failure says the same. The report's age is as of its
+`generated_at` minute; `factory.status` recomputes it from now.
 
 **A session cannot read its own issue.** The factory's GitHub App key and tokens are kept out of the session's
 environment; the session holds a deploy key or a one-repository installation token for its own repository and nothing

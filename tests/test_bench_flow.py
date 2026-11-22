@@ -113,7 +113,7 @@ def world(monkeypatch):
 
 def planned(**over):
     return {
-        **_bench.plan_cases("r1", SHA, [], 1, {"CRAFT_EFFORT": "low"}, "opus")[0],
+        **_bench.plan_cases("r1", SHA, [], 1, {"JUDGE_EFFORT": "low"}, "opus")[0],
         "env": "bench-0123456-1",
         **over,
     }
@@ -143,7 +143,7 @@ def test_a_case_that_passes_review_is_accepted_and_stopped(world):
     assert created["inputs"]["branch"] == f"bench/{case['case']}"
     assert created["inputs"]["name"] == case["case"] and "{name}" not in created["inputs"]["brief"]
     assert f"cp -r bench/shortlinks {case['case']}" in created["inputs"]["brief"]
-    assert created["context"]["env_vars"] == {"AGENT_FACTORY_CRAFT_EFFORT": "low"}
+    assert created["context"]["env_vars"] == {"AGENT_FACTORY_JUDGE_EFFORT": "low"}
     assert created["context"]["labels"] == {
         "factory-bench": "r1",
         "bench-arm": "candidate",
@@ -1440,7 +1440,7 @@ def test_same_sha_with_different_policies_is_an_experiment(benchmark_world):
     store, _, launched = benchmark_world
     asyncio.run(
         _bench_flow.benchmark.func(
-            SHA, baseline_sha=SHA, candidate_policy='{"CRAFT_EFFORT": "low"}', max_usd=1000
+            SHA, baseline_sha=SHA, candidate_policy='{"JUDGE_EFFORT": "low"}', max_usd=1000
         )
     )
     assert not store.aa

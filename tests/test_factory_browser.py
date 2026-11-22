@@ -104,8 +104,8 @@ def test_policy_cannot_set_the_grant(key, flyte_world):
 
 
 def test_policy_keeps_its_other_keys_next_to_a_grant(flyte_world):
-    _factory.launch_project("brief", "both", policy={"FOO": "1"}, browser="github")
-    assert env_of(flyte_world) == {"AGENT_FACTORY_FOO": "1", ENV: "github"}
+    _factory.launch_project("brief", "both", policy={"JUDGE_MODEL": "x"}, browser="github")
+    assert env_of(flyte_world) == {"AGENT_FACTORY_JUDGE_MODEL": "x", ENV: "github"}
 
 
 def finish(world, result):

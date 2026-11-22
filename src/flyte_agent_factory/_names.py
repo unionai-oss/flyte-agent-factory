@@ -1,7 +1,7 @@
 """Environment variable names the factory owns.
 
 Every factory variable is `AGENT_FACTORY_*`. A role-policy key `<KEY>` (the profile's `[policy]` table, or a
-launch's policy) is the variable `AGENT_FACTORY_<KEY>`; those are open-ended, so they are not listed here.
+launch's policy) is the variable `AGENT_FACTORY_<KEY>`; those are listed in `_policy.POLICY_KEYS`, not here.
 What is listed are the fixed variables, the ones that are not policy. Variables that belong to Claude Code
 itself (`CLAUDE_CODE_*`, `CLAUDE_CONFIG_DIR`) are not the factory's and are not listed.
 """
@@ -16,9 +16,9 @@ log = logging.getLogger(__name__)
 
 PREFIX = "AGENT_FACTORY_"
 
-#: What the deploying shell selects and the deploy and test tooling read. Unlike the variables in
-#: `POD_FIXED`, these are forwarded to a pod with the policy keys (except the profile selection, see
-#: `agent._shell_policy_env`).
+#: What the deploying shell selects and the deploy and test tooling read, and `AGENT_FACTORY_CLAUDE_TUI` (the
+#: author's TUI fallback, which a session reads). Unlike the variables in `POD_FIXED`, these are forwarded
+#: to a pod with the policy keys (except the profile selection, see `agent._shell_policy_env`).
 TOOLING_FIXED = frozenset(
     {
         "AGENT_FACTORY_PROFILE",
@@ -26,6 +26,7 @@ TOOLING_FIXED = frozenset(
         "AGENT_FACTORY_PROFILES_DIR",
         "AGENT_FACTORY_DEPLOY_REPORT",
         "AGENT_FACTORY_LIVE_TESTS",
+        "AGENT_FACTORY_CLAUDE_TUI",
     }
 )
 
@@ -39,9 +40,7 @@ POD_FIXED = frozenset(
     {
         "AGENT_FACTORY_BROWSER",
         "AGENT_FACTORY_CLAUDE_TOKEN_SECRET",
-        "AGENT_FACTORY_CODEX_SECRET",
         "AGENT_FACTORY_CODEX_TOKEN_SECRET",
-        "AGENT_FACTORY_CREDENTIALS_SECRET",
         "AGENT_FACTORY_ENV_NAME",
         "AGENT_FACTORY_REPO_KEYS",
         "AGENT_FACTORY_SECRETS",
@@ -50,7 +49,6 @@ POD_FIXED = frozenset(
         "AGENT_FACTORY_BROWSER_ISOLATED",
         "AGENT_FACTORY_BROWSER_EXIT_NODE",
         "AGENT_FACTORY_BROWSER_TAILSCALE_SECRET",
-        "AGENT_FACTORY_AGENT_REPO",
         "AGENT_FACTORY_BASE",
         "AGENT_FACTORY_BACKEND_KIND",
         "AGENT_FACTORY_BRIDGE_DIR",

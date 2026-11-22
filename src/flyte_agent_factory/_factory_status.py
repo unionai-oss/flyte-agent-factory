@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections.abc import Mapping
 from typing import Any
 
-from flyte_agent_factory import _dashboard, _github_mode, _profile_oss, _profile_union
+from flyte_agent_factory import _dashboard, _github_mode, _profile_oss, _profile_union, _state
 from flyte_agent_factory._profile import IDENTITIES_ENV, Profile
 
 _HTML_ROW = re.compile(r"<tr><td><code>([^<]*)</code></td><td>([^<]*)</td><td>(.*?)</td></tr>", re.DOTALL)
@@ -78,6 +79,24 @@ def status_fields(profile: Profile, env: Mapping[str, str]) -> dict[str, Any]:
 def phase_fields(phase: dict[str, Any]) -> dict[str, Any]:
     """Return the `phase` label and, while the author waits on a usage limit, the structured `paused`."""
     return {"phase": _dashboard.phase_label(phase), "paused": phase.get("paused")}
+
+
+def report_checkpoint_fields(data: dict[str, Any], now: float) -> dict[str, Any]:
+    """Return the run's last good checkpoint, its age now, and the last failure (`_state.CheckpointHealth`).
+
+    The age is from now, not from the report's own time: a pod that stopped publishing keeps aging.
+    """
+    raw = data.get("checkpoints")
+    if not isinstance(raw, dict):  # older reports, or a garbled one: status must not fail on it
+        return {"checkpoints": None}
+    at = raw.get("last_ok_at")
+    # JSON reads NaN and Infinity as floats, and an age cannot be computed from either.
+    at = at if isinstance(at, (int, float)) and math.isfinite(at) else None
+    failure = raw.get("last_failure") if isinstance(raw.get("last_failure"), dict) else None
+    health = _state.CheckpointHealth(
+        last_ok_at=at, last_ok_kind=raw.get("last_ok_kind") or "", failure=failure
+    )
+    return {"checkpoints": health.report(now)}
 
 
 #: What `factory.status` carries of each decision the factory made in the owner's place.
