@@ -223,7 +223,9 @@ def _target_ci_facts(brief: str) -> str:
 
 def _contract_prompt(brief: str, acceptance: str) -> str:
     """Turn the brief (and the author's criteria) into a frozen list of checkable assertions."""
-    must_standards: str = _standards.review_text(_session_config._applicable_standards(), must_only=True)
+    files = _session_config._applicable_standards()
+    must_standards: str = _standards.review_text(files, must_only=True)
+    human = _standards.describe_human_facing_files(files)
     return (
         "You are writing the **validation contract** for a software project, before it is reviewed. "
         "Every review round will grade the work against this list, so it must be complete, specific "
@@ -249,7 +251,9 @@ def _contract_prompt(brief: str, acceptance: str) -> str:
         + must_standards
         + "Include applicable MUST rule IDs as assertions, within the 60-line contract limit. "
         "Respect brief > project DESIGN.md overrides with a reason > standards. "
-        "Rules from brand.md apply only to visual/customer-facing deliverables.\n\n"
+        + (human + " " if human else "")
+        + "\n\n"
+        + _session_config._describe_product_users()
         + "## Write the contract\n\n"
         "One numbered line per assertion, in the form `C1. <assertion> -- check: <how a reviewer "
         "verifies it>`. Each must be checkable with a yes or no by running something or reading "

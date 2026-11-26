@@ -22,6 +22,7 @@ from flyte_agent_factory import (
     _git,
     _meter,
     _names,
+    _product,
     _profile,
     _secret_env,
     _standards,
@@ -514,6 +515,9 @@ def _applicable_standards() -> dict[str, str]:
         fetch=False,
         trusted_base=_vendored_base(),
     )
+    taken = {r.ident for r in _standards.rules({n: t for n, t in files.items() if n != "brand.md"})}
+    for problem in _product.find_problems(_project_dir(), taken):
+        print(f"product.toml: {problem}", file=sys.stderr)
     if not files:
         print(
             f"{_standards.NO_STANDARDS}: the effective standards selection is empty, "
@@ -521,6 +525,28 @@ def _applicable_standards() -> dict[str, str]:
             file=sys.stderr,
         )
     return files
+
+
+def _describe_human_facing_files() -> str:
+    """Return the sentence limiting the human-facing standards files to human-facing work."""
+    try:
+        config = _PROFILE.standards if _PROFILE else _standards.Standards()
+        selected = _standards.select(
+            _captured_standards(),
+            config,
+            _project_dir(),
+            demo=_demo_kind,
+            fetch=False,
+            trusted_base=_vendored_base(),
+        )
+    except (OSError, ValueError):
+        return ""  # a prompt is not worth a crash; `_standards_diagnostics` reports the same fault
+    return _standards.describe_human_facing_files(selected)
+
+
+def _describe_product_users() -> str:
+    """Return the project's users, from its `product.toml`, for the session, contract and review prompts."""
+    return _product.format_audience_block(_project_dir())
 
 
 def warm_vendored_cache() -> None:

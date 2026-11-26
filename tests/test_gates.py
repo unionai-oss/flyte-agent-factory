@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, cast
 
@@ -1317,8 +1318,13 @@ def test_standards_cli_prints_what_the_factory_gate_records(python_repo, monkeyp
     assert _gates.main(["standards", str(python_repo), "--standards", str(template.TEMPLATE)]) == 1
     printed = capsys.readouterr().out
 
-    config = _standards.Standards(dir=str(template.TEMPLATE))
-    files = _standards.select(_standards.capture(config, python_repo), config, python_repo)
+    # The CLI applies every base file; the template's profile includes all three, so the gate does too.
+    include = tuple(
+        tomllib.loads((template.TEMPLATE.parent / "profile.example.toml").read_text())["standards"]["include"]
+    )
+    config = _standards.Standards(dir=str(template.TEMPLATE), include=include)
+    # Materialized as a session start does: the gate runs script rules from the workspace copy.
+    files = _standards.materialize(python_repo, python_repo, config, _standards.capture(config, python_repo))
     _gates.run(python_repo, "app", "", "", "DONE", files, _timeline._Timeline(), "root")
     judged = {"attribution", "scope", "factory:fail-to-pass", "uncommitted"}
     # A list, not `_statuses`: the formatter rule is two commands, so two records under one rule.
@@ -1334,7 +1340,16 @@ def test_standards_cli_prints_what_the_factory_gate_records(python_repo, monkeyp
         f"{r['rule']}: {r['status']}\n" + "".join(f"    {line}\n" for line in r["output"].splitlines())
         for r in recorded
     )
-    assert printed == expected
+    # A script rule runs from the materialized copy: the CLI's is in a scratch directory, the gate's here.
+    copy = re.compile(r"\S*/\.claude-flyte/standards/")
+    assert copy.search(expected)  # a script rule really did run from a materialized copy
+    gate_copies, cli_copies = set(copy.findall(expected)), set(copy.findall(printed))
+    assert len(gate_copies) == 1 and Path(next(iter(gate_copies))).resolve().is_relative_to(
+        python_repo.resolve()
+    )
+    assert len(cli_copies) == 1 and "factory-standards-" in next(iter(cli_copies))
+    assert gate_copies != cli_copies
+    assert copy.sub("<standards>/", printed) == copy.sub("<standards>/", expected)
 
 
 def test_workflow_actions_are_pinned_to_a_commit():

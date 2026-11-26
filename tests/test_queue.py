@@ -184,6 +184,61 @@ def test_a_corrupt_lease_is_absent(queue_state, junk):
     assert _queue.take_lease(queue_state, "a", now=1000) is None
 
 
+def test_lease_uses_current_time_after_a_rejected_push(queue_state, state_store, tmp_path, monkeypatch):
+    rival = make_store(tmp_path, remote=Path(state_store.remote), name="rival")
+    real_push = type(state_store)._push
+    clock = [1000.0]
+    pushed: list[str] = []
+
+    def push(self, commit):
+        if self is state_store and not pushed:
+            pushed.append(commit)
+            rival.write({"unrelated": b"v"}, "rival")
+            clock[0] = 1400.0
+        return real_push(self, commit)
+
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(type(state_store), "_push", push)
+    assert _queue.take_lease(queue_state, "a") is None
+    lease = json.loads(_queue._fs(lease_path(queue_state)).cat_file(lease_path(queue_state)))
+    assert lease["expires"] == 1400.0 + _queue.LEASE_TTL
+
+
+def test_lease_renews_if_final_push_outlasts_lease(queue_state, state_store, monkeypatch):
+    real_push = type(state_store)._push
+    clock = [1000.0]
+    pushed: list[str] = []
+
+    def push(self, commit):
+        result = real_push(self, commit)
+        if self is state_store and not pushed:
+            pushed.append(commit)
+            clock[0] = 1400.0
+        return result
+
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(type(state_store), "_push", push)
+    assert _queue.take_lease(queue_state, "a") is None
+    lease = json.loads(_queue._fs(lease_path(queue_state)).cat_file(lease_path(queue_state)))
+    assert lease["expires"] == 1400.0 + _queue.LEASE_TTL
+
+
+def test_lease_fails_if_both_pushes_outlast_lease(queue_state, state_store, monkeypatch):
+    real_push = type(state_store)._push
+    clock = [1000.0]
+
+    def push(self, commit):
+        result = real_push(self, commit)
+        if self is state_store:
+            clock[0] += 400.0
+        return result
+
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(type(state_store), "_push", push)
+    with pytest.raises(_state_store.StateError, match="lease expired"):
+        _queue.take_lease(queue_state, "a")
+
+
 def test_a_taker_that_loses_the_race_for_the_lease_finds_the_winner(
     queue_state, state_store, tmp_path, monkeypatch
 ):

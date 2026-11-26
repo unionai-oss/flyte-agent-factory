@@ -178,14 +178,17 @@ def run_hidden_check(
         return {"exit_code": None, "summary": refusal}
     project = project.resolve()
     with tempfile.TemporaryDirectory(prefix="bench-check-") as tmp:
-        hidden, home = Path(tmp) / "hidden", Path(tmp) / "home"
+        hidden, home, temp = (Path(tmp) / name for name in ("hidden", "home", "tmp"))
         hidden.mkdir()
         home.mkdir()
+        temp.mkdir()
         for name, text in task.check_files.items():
             (hidden / name).write_text(text)
         env = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": str(home),
+            # Nested pytest runs otherwise compete with the host suite cleaning shared temp directories.
+            "TMPDIR": str(temp),
             "LANG": "C.UTF-8",
             "PYTHONDONTWRITEBYTECODE": "1",
             "BENCH_PROJECT": str(project),

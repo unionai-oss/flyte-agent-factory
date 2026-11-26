@@ -961,8 +961,8 @@ def standards_results(
                 if isinstance(command, str):
                     record(rule.ident, _gate_base.Status.FAIL, command)
                 else:
-                    code, output = _gate_base._run(command, project, timeout=timeout)
-                    record(rule.ident, _gate_base.Status.from_exit(code), shlex.join(command) + "\n" + output)
+                    status, output = _gate_rules.run_script(command, project, timeout)
+                    record(rule.ident, status, shlex.join(command) + "\n" + output)
     if ids := mapped.get(_standards.LANGUAGE_SUMMARY):
         language = {r.ident for r in must if r.language_pack and r.kind not in {"judgement", "check"}}
         language_results = [r for r in results if r.rule in language]

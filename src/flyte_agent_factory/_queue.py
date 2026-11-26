@@ -356,17 +356,24 @@ def take_lease(queue: str, holder: str, now: float | None = None) -> str | None:
     What it does not cover is a holder that outlives `LEASE_TTL` mid-dispatch, which the cancel re-reads and
     the label dedupe still catch.
     """
-    now = time.time() if now is None else now
     key = _state_store.key_of(f"{queue}/{_LEASE}")
+    expires = 0.0
 
     def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], str | None]:
+        nonlocal expires
+        effective_now = time.time() if now is None else now
         lease = _parse_lease(snap.read(key))
-        if lease and lease["holder"] != holder and lease["expires"] > now:
+        if lease and lease["holder"] != holder and lease["expires"] > effective_now:
             return {}, lease["holder"]
-        body = json.dumps({"holder": holder, "expires": now + LEASE_TTL}).encode()
+        expires = effective_now + LEASE_TTL
+        body = json.dumps({"holder": holder, "expires": expires}).encode()
         return {key: body}, None
 
-    return _state_store.current().transact(decide, f"lease {holder}")
+    for _ in range(2):
+        other = _state_store.current().transact(decide, f"lease {holder}")
+        if other is not None or now is not None or time.time() < expires:
+            return other
+    raise _state_store.StateError("dispatch lease expired before acquisition completed")
 
 
 def release_lease(queue: str, holder: str) -> None:

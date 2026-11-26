@@ -1,0 +1,4 @@
+# The browser evidence for this project's UI files (the UX render check's fixture pages): render them in
+# Chromium, print each screenshot written and the console errors found. See tests/ux_render_evidence.py.
+[evidence]
+"ENG-012" = "uv run python tests/ux_render_evidence.py"

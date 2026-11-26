@@ -57,8 +57,15 @@ def test_shipped_content():
             assert re.fullmatch(r"Timeout: [1-9][0-9]*", line), (rule.ident, line)
             assert int(line[9:]) <= _gate_base._MAX_TOOL_TIMEOUT, rule.ident
             assert rule.kind in {"command", "lint", "script"}, rule.ident
+    scripts = {r.arg.split()[0] for r in RULES if r.kind == "script"}
+    for script in scripts:
+        assert script in FILES, script
     for name in FILES:
         if name == "README.md" or "/configs/" in name or name == "brand.md":
+            continue
+        if not name.endswith(".md"):
+            # A script's support file (a shared module, a node helper) sits beside a script a rule runs.
+            assert any(Path(name).parent == Path(s).parent for s in scripts), name
             continue
         assert any(r.file == name for r in RULES), name
 
@@ -108,7 +115,8 @@ def test_default_brand_and_budget():
     text = {"rules.md": "## X-01 SHOULD\noptional\nCheck: inspect\n\n## X-02 MUST\nrequired\nCheck: run\n"}
     bounded = _standards.review_text(text, budget=55)
     assert "X-02 MUST" in bounded
-    assert "X-01" not in bounded
+    assert "X-01 SHOULD" not in bounded and "optional" not in bounded
+    assert "Not shown, for space" in bounded and "X-01 (rules.md)" in bounded
     assert "brief >" in _standards.GUIDANCE
     assert "DESIGN.md" in _standards.GUIDANCE
     assert "SHOULD" in _standards.GUIDANCE
@@ -122,6 +130,37 @@ def test_profile_roundtrip(tmp_path):
     assert deployed.standards == profile.standards
     assert _standards.decode(deployed.standards_payload)["engineering.md"] == FILES["engineering.md"]
     assert deployed.deployment_text() == profile.deployment_text()
+
+
+def test_full_ux_standard_fits_deployment_profile(tmp_path):
+    standards = tmp_path / "standards"
+    shutil.copytree(TEMPLATE, standards, ignore=shutil.ignore_patterns("__pycache__"))
+    source = Path(__file__).resolve().parents[1] / "profiles/example.toml"
+    text = source.read_text().replace('# dir = "../private-standards"', f'dir = "{standards}"')
+    text = text.replace(
+        'include = ["engineering", "security"]', 'include = ["engineering", "security", "ux"]'
+    )
+    profile = _profile.parse(text, str(tmp_path / "profile.toml"))
+    deployment = profile.deployment_text()
+    assert len((f"{_profile.TOML_ENV}=" + deployment).encode()) + 1 <= 131072
+    child = subprocess.run(
+        [sys.executable, "-c", "import os, sys; print(os.environ[sys.argv[1]], end='')", _profile.TOML_ENV],
+        env=_profile.child_env(profile, {}),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert child.stdout == deployment
+    deployed = _profile.parse(deployment, _profile.TOML_ENV)
+    files = _standards.decode(deployed.standards_payload)
+    assert files["ux.md"] == (standards / "ux.md").read_text()
+    assert {name for name in files if name.startswith("checks/")} == {
+        str(path.relative_to(standards)) for path in (standards / "checks").rglob("*") if path.is_file()
+    }
+    for name in files:
+        if name.startswith("checks/"):
+            assert files[name] == (standards / name).read_text()
 
 
 def test_bundle_rejects_traversal():

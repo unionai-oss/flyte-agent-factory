@@ -60,10 +60,11 @@ _LOST_RACE = (
 _IDENTITY = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"}
 #: Writers of different files still collide on the tip, so many writers need many rounds. The sleep before
 #: attempt n is uniform in [0, min(_BACKOFF_CAP, _BACKOFF * 2**(n-2))] ("full jitter"): with the default
-#: `_RETRIES` that is at most about 40 s of sleeping, so a call cannot hang for minutes.
-_RETRIES = 25
+#: `_RETRIES` that is at most about 220 s of sleeping. A wider cap spreads writers out when git commands
+#: take longer under load; the finite retry limit still lets callers report sustained contention.
+_RETRIES = 50
 _BACKOFF = 0.05  # seconds
-_BACKOFF_CAP = 2.0  # seconds
+_BACKOFF_CAP = 5.0  # seconds
 #: git's words for a cache whose objects or refs are damaged (`_locked` then clears it).
 _CORRUPT = (
     "corrupt",
@@ -310,12 +311,22 @@ class StateStore:
                         return result, False
                     fresh = True  # decided on a tip up to `ttl` old: make sure before saying "nothing to do"
                     continue
-                if self._push(commit):
+                pushed = False
+                try:
+                    pushed = self._push(commit)
+                finally:
+                    if not pushed:
+                        self._fetched = float("-inf")
+                if pushed:
                     self.pushes += 1
+                    fetched = self._fetched
+                    self._fetched = float("-inf")
                     self._git("update-ref", self._ref, commit)
+                    self._fetched = fetched
                     return result, True
                 self.lost_races += 1
-                self._fetch()  # lost the race: the next attempt decides on the winner's tip
+                if attempt == self.retries:
+                    self._fetch()  # Preserve the winner's tip if the retry budget is exhausted.
         raise StateError(f"{self.branch}: push rejected {self.retries} times; giving up")
 
     def _commit(self, tip: str, changes: Mapping[str, bytes | None], message: str) -> str | None:
@@ -420,16 +431,18 @@ class StateStore:
         return proc.returncode == 0 and (self.cache_dir / "objects").is_dir()
 
     def _fetch(self) -> None:
+        self._fetched = float("-inf")
         _git.install_deploy_key(self.remote)
         spec = f"+refs/heads/{self.branch}:{self._ref}"
         proc = self._run("fetch", "--no-tags", "--quiet", "origin", spec)
-        self._fetched = time.monotonic()
         if proc.returncode == 0:
+            self._fetched = time.monotonic()
             return
         err = proc.stderr.decode(errors="replace")
         if _NO_REMOTE_REF not in err:
             raise StateError(self._failure("fetch", err))
-        self._run("update-ref", "-d", self._ref)  # the branch is gone (or was never made): an empty store
+        self._git("update-ref", "-d", self._ref)  # the branch is gone (or was never made): an empty store
+        self._fetched = time.monotonic()
 
     def _tip(self) -> str:
         proc = self._run("rev-parse", "--verify", "--quiet", f"{self._ref}^{{commit}}")

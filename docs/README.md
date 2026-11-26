@@ -27,6 +27,7 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [READBACK.md](READBACK.md) | How #15 (small nodes) was re-applied on #12's sharded test lanes: the shard budget arithmetic and the tests adjusted where the two meet |
 | [../profiles/README.md](../profiles/README.md) | Every profile table and key |
 | [standards.md](standards.md) | Writing your own standards: the rule format, how each rule is enforced, mapping your rule IDs to the factory's built-in checks |
+| [ux-standard.md](ux-standard.md) | Writing your own UX standard: naming your users in product.toml, deterministic checks first, product-type addenda |
 | [chat-operator.md](chat-operator.md) | The default interface: why a chat agent sits between you and the factory, what each side can do, and setting it up |
 | [factory-mcp-setup.md](factory-mcp-setup.md) | The factory MCP's authentication, scoping the API key, and building the chat skill |
 | [mcp-stock-move.md](mcp-stock-move.md) | The move to flyte 2.13.5's stock MCP server: each wrapper removed, set or kept, with evidence, and what changes on redeploy |

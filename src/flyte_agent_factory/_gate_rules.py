@@ -47,6 +47,20 @@ def _script_command(rule: _standards.Rule, standards_dir: Path) -> list[str] | s
     return [*interpreter, str(path), *words[1:]]
 
 
+#: What a script prints first to say the rule does not apply to this project (exit 0 only).
+NOT_APPLICABLE_PREFIX = "NOT APPLICABLE:"
+
+
+def run_script(command: list[str], project: Path, timeout: int) -> tuple[_gate_base.Status, str]:
+    """Run a `script` rule: its exit status, or NOT_APPLICABLE if it exits 0 and says so first."""
+    code, output = _gate_base._run(command, project, timeout=timeout)
+    status = _gate_base.Status.from_exit(code)
+    first = next((line for line in output.splitlines() if line.strip()), "")
+    if status is _gate_base.Status.PASS and first.startswith(NOT_APPLICABLE_PREFIX):
+        status = _gate_base.Status.NOT_APPLICABLE
+    return status, output
+
+
 def _glob_matches(relative: str, pattern: str) -> bool:
     """Whether `relative` matches `pattern`: `**/` may match no directory, a pattern without `/` the name."""
     if "/" not in pattern:

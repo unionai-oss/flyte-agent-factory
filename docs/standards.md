@@ -43,7 +43,8 @@ standards/
   README.md            # optional: anything for people; not parsed
   engineering.md       # base files: their names are yours; [standards] include selects which apply
   security.md
-  brand.md             # optional: rules for visual or customer-facing work only
+  brand.md             # optional: rules for human-facing work only (implicitly `applies: human-facing`)
+  ux.md                # optional: any base file may say `applies: human-facing`, as below
   demo.md              # optional: rules for demos (see "Demos")
   languages/
     python.md          # language packs: selected by their `detect:` line, or by [standards] languages
@@ -57,6 +58,19 @@ standards/
 ```markdown
 detect: pyproject.toml, setup.py, **/*.py
 ```
+
+A base file whose rules are only for what people see or read says so, before its first rule heading:
+
+```markdown
+applies: human-facing
+```
+
+The key is case-insensitive, like `detect:`, and the line is not part of any rule. The rules of such a file, and
+those of `brand.md` (which needs no line), are *human-facing*: `Rule.human_facing`. The factory's prompts then
+say, naming the selected files, that their rules apply only to human-facing deliverables (UI, reports, CLI
+output read by people, docs sites, demos, slides), and that they are judged with evidence: screenshots at the
+stated viewports and a walkthrough of the main task. The session instructions, the contract writer and the
+craft reviewer get that sentence; when no selected file is human-facing, nothing is said.
 
 With `[standards] languages = "auto"` (the default) a pack applies when any project file matches; a list of
 pack names applies exactly those.
@@ -94,7 +108,8 @@ Enforced: check factory:fail-to-pass
 The rule's text goes to the factory's LLM reviewers (the craft judge, and the contract writer for `MUST`
 rules). A reviewer that finds the work breaks it names the rule ID and cites the file and line of the work it
 applies to. `SHOULD` findings and craft findings are advisory unless the profile's policy makes craft blocking.
-Rules in `brand.md` are judged only for visual or customer-facing deliverables.
+Rules of a human-facing file (`brand.md`, or one with `applies: human-facing`) are judged only for
+human-facing deliverables.
 
 ### `Enforced: check <name>`: a check built into the factory
 
@@ -188,6 +203,11 @@ Enforced: script checks/no_secrets_in_fixtures.py --strict
 directory: a `.py` file with the factory's Python, a `.sh` file with bash, anything else directly. Exit 0
 passes; its output is the report.
 
+A script may say the rule does not apply to this project: if it exits 0 and the first non-empty line of its
+output starts with `NOT APPLICABLE:`, the rule is recorded as *not applicable* with that output, and does not
+block. Only `script` rules can do this. The same line with a nonzero exit is a failure, and with exit 0 but not
+on the first non-empty line it is an ordinary pass.
+
 ### `Enforced: tool` with nothing after it
 
 Kept for rules that need a project-specific command nobody has configured: reported as tool unavailable. The
@@ -280,6 +300,66 @@ Pattern demos replace QA-3, QA-9 and SEC-2.
 rules for a `Demo kind: pattern` project. A rule with the line `Applies: showcase` also applies to a
 `Demo kind: showcase` project, whose other rules are not applied.
 
+## Naming your users and brand: product.toml
+
+A project may keep a `product.toml` at its root (beside its `README.md`, not in the standards directory). It
+tells the factory who the product is for and which brand applies to this project. Without the file nothing
+below happens.
+
+```toml
+[audience]
+users = "Children learning to read, and the parent who sets the game up"   # who, in a sentence (required)
+age_band = "6-8"          # required: shown in prompts; "6-8", "13+", "65+", "adult" are read for their ages
+# under_13 = true         # true | false: required when age_band is any other text, and must agree with a range
+expertise = "novice"      # required: novice | intermediate | expert
+reading_grade = 2         # required: highest US school grade of text users must read, integer 0..18
+main_task = "Create a world and walk into its first room"   # required: the one task a first-time user must finish
+
+[brand]
+file = "BRAND.md"   # path relative to the project root; "none" = no brand rules; omitted = the workspace brand
+
+[surfaces]          # used by the workspace's UX check scripts, not by the engine
+pages = ["prototype/index.html"]          # project files or http(s) URLs to render
+serve = "npx --yes serve -l 4173 dist"    # optional, started before rendering
+ready = "http://localhost:4173/"          # polled until it answers, when serve is set
+viewports = ["320x640", "390x844", "1280x800"]
+text = ["src/strings/*.json"]             # extra files whose user-facing text is reading-level checked
+cli = "mytool"                            # the command a person runs, for a command-line tool
+cli_invalid = ["--no-such-option"]        # arguments the tool must reject; required when cli is set
+cli_main = ["--version"]                  # one successful run; required when cli is set; [] = bare command
+```
+
+**`[audience]`.** When all five fields are valid (and `under_13`, where `age_band` needs it, agrees with the age band), a short "This product's users" section is added to the
+session instructions, the contract writer's prompt and the prompt of every reviewer. It states the fields and
+that it overrides any audience named in `brand.md`, including whether children under 13 are among the users. When the file is present but not usable (invalid TOML, a
+missing field, an `expertise` outside the three values, a `reading_grade` that is not an integer from 0 to 18),
+the section says which fields are wrong instead, and the problems are also printed to standard error. An
+unknown key in `[audience]` or `[brand]` is reported and ignored; it does not discard the valid fields.
+
+**`[brand]`.** `file` names a file inside the project; its text becomes the project's `brand.md` for this
+project only (the workspace's file is not touched). `"none"` removes `brand.md` from the selection. Omitted, the
+workspace's brand applies as before, and the session's `BRAND.md` fallback is unchanged. A path that is absolute,
+climbs out with `..`, leaves the project through a link, or is not a file is reported and ignored: the workspace
+brand is kept. Only `Enforced: judgement` rules are taken from a project's brand file; a rule with any other
+kind is dropped and reported, because a project must not grant itself a mechanical check or a script. So is a
+rule whose ID another selected standard already uses, which would otherwise hide that rule. A file
+without rules (colours, type, tone) is fine and is passed on as guidance text.
+
+**`[surfaces]`** is not read by the engine. The workspace's UX check scripts (`Enforced: script`) read it from
+the project's directory, which is their working directory; a script with no `[surfaces]` to check can print
+`NOT APPLICABLE:` as above. Each script validates every declared `text` entry (it must match a regular file
+inside the project) before it reports a result. The CLI script runs each declared `cli` command, without a
+shell, with `--help`, with the `cli_invalid` arguments and with the `cli_main` arguments: help must identify
+itself as usage (the word "usage" or an option list), the error must name a rejected argument or point to
+`--help`, and the main run must exit 0. The output of all three is piped, and any escape code or carriage
+return without a newline in it fails; the colour switches in the environment (`NO_COLOR`, `FORCE_COLOR`,
+`CLICOLOR`, `CLICOLOR_FORCE`) are removed and `TERM` is `xterm-256color`, so only the pipe can keep it plain.
+How to write a UX standard of your own, and what
+the template's checks measure, is in [ux-standard.md](ux-standard.md).
+
+The behaviour lives in `_product.py` (`parse`, `load`, `resolve_brand`, `find_problems`, `format_audience_block`); the
+brand is applied in `_standards.select`, so it holds for `materialize`, the gate and the reviewers alike.
+
 ## Checking a tree against your standards
 
 ```bash
@@ -301,3 +381,11 @@ The template's set maps its rules as follows (its IDs are its own; any others wo
 | `lint ruff ...` | the exception-handling rule |
 | `command ...` | the formatter, linter, type-checker and test rules in `languages/` |
 | `judgement` | everything else, including all of `security.md`, `brand.md` and `demo.md` |
+
+The behaviours added for human-facing work, in one place:
+
+| Behaviour | Where |
+|---|---|
+| A `script` that prints `NOT APPLICABLE:` first and exits 0 is not applicable | `Enforced: script` |
+| A base file with `applies: human-facing` is limited to human-facing work, like `brand.md` | "Files" |
+| `product.toml` names the audience, and may replace or remove the project's brand | "Naming your users and brand" |

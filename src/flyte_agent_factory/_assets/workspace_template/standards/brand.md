@@ -10,7 +10,7 @@ choice, not from the brand source. Default to Union branding; use the Flyte vari
 ## Tokens
 
 **Voice [VOICE]:** plain, factual, short sentences. No hype words. Numbers carry their caveat.
-**Audience [AUDIENCE]:** ML and AI platform practitioners and their engineering leaders.
+**Audience [AUDIENCE]:** ML and AI platform practitioners and their engineering leaders (Union work). A project that declares `[audience]` in its product.toml is judged for those users instead.
 **Naming [NAMES]:** "Union" (the company and platform), "Flyte" (the open-source project), "the agent factory".
 
 **Palette [PRIMARY] [SURFACE] [TEXT]** (Union, from the sheet's grey and yellow ranges):

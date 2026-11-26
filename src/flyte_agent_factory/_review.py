@@ -142,6 +142,20 @@ _JUDGES: tuple[tuple[str, str], ...] = (
 )
 
 
+def _render_craft_standards() -> str:
+    """Return the craft reviewer's standards section: the judgement rules of the selected files."""
+    files = _session_config._applicable_standards()
+    human = _standards.describe_human_facing_files(files)
+    return (
+        "## Applicable standards\n\n"
+        "Cite rule IDs for judgement rules, with the file and line of the work the finding applies "
+        "to. Craft is advisory by default; SHOULD findings are "
+        "non-blocking. Precedence: brief > project DESIGN.md (with a stated reason) > standards. "
+        + (human + "\n\n" if human else "\n\n")
+        + _standards.review_text(files, judgement_only=True)
+    )
+
+
 def _qa_prompt(
     judge: str,
     instruction: str,
@@ -172,15 +186,11 @@ def _qa_prompt(
         "## Your concern\n\n"
         f"{instruction}\n\n"
         + (
-            "## Applicable standards\n\n"
-            "Cite rule IDs for judgement rules, with the file and line of the work the finding applies "
-            "to. Craft is advisory by default; SHOULD findings are "
-            "non-blocking. Precedence: brief > project DESIGN.md (with a stated reason) > standards. "
-            "Judge the rules from brand.md only for visual or customer-facing surfaces.\n\n"
-            + _standards.review_text(_session_config._applicable_standards(), judgement_only=True)
+            _render_craft_standards()
             if judge == "craft"
             else "Standards exist in .claude-flyte/standards/; craft grades them. Do not grade style.\n\n"
         )
+        + _session_config._describe_product_users()
         + _findings.render_finding_instructions(judge)
         + "## What was asked for\n\n"
         "This is the authority. It was given to the author as a task input and neither of you "

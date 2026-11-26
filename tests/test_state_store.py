@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import cast
 
@@ -169,6 +170,111 @@ def test_retries_exhausted_raises(tmp_path):
     with pytest.raises(ss.StateError, match="rejected 2 times"):
         a.transact(decide, "a")
     assert len(n) == 2
+
+
+def test_default_retries_survive_sustained_contention(tmp_path, monkeypatch):
+    remote = make_remote(tmp_path)
+    writer = ss.StateStore(str(remote), BRANCH, tmp_path / "writer.git", ttl=0.0)
+    rival = make_store(tmp_path, remote=remote, name="rival")
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    calls = []
+
+    def decide(snap):
+        calls.append(snap.tip)
+        if len(calls) <= 25:
+            rival.write({f"rival/{len(calls)}": b"v"}, "rival wins")
+        return {"writer": str(len(snap.list())).encode()}, len(snap.list())
+
+    assert writer.transact(decide, "writer") == 25
+    assert writer.lost_races == 25
+    assert writer.read("writer", fresh=True) == b"25"
+    assert len(writer.list()) == 26
+
+
+def test_rejected_push_invalidates_cached_reads_before_retry(tmp_path, monkeypatch):
+    remote = make_remote(tmp_path)
+    writer = make_store(tmp_path, remote=remote, name="writer", ttl=3600)
+    rival_wins_first_push(monkeypatch, writer, tmp_path, {"rival": b"v"})
+    seen: list[bytes | None] = []
+    original_sleep = time.sleep
+
+    def read_between_attempts(delay):
+        if writer.lost_races and not seen:
+            seen.append(None)
+            seen[0] = writer.read("rival")
+        else:
+            original_sleep(delay)
+
+    monkeypatch.setattr(time, "sleep", read_between_attempts)
+    writer.write({"writer": b"v"}, "writer")
+    assert seen == [b"v"]
+
+
+def test_failed_push_invalidates_cached_reads(tmp_path, monkeypatch):
+    remote = make_remote(tmp_path)
+    writer = make_store(tmp_path, remote=remote, name="writer", ttl=3600)
+    rival = make_store(tmp_path, remote=remote, name="rival")
+    writer.write({"seed": b"v"}, "seed")
+    real_run = writer._run
+
+    def reject_after_remote_update(*args, **kwargs):
+        if args[0] == "push":
+            rival.write({"rival": b"v"}, "rival")
+            return subprocess.CompletedProcess(args, 1, b"", b"permission denied")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(writer, "_run", reject_after_remote_update)
+    with pytest.raises(ss.StateError, match="push failed"):
+        writer.write({"writer": b"v"}, "writer")
+    assert writer.read("rival") == b"v"
+
+
+def test_failed_local_update_after_push_invalidates_cached_reads(tmp_path, monkeypatch):
+    writer = make_store(tmp_path, ttl=3600)
+    writer.write({"seed": b"v"}, "seed")
+    real_run = writer._run
+    failed: list[bool] = []
+
+    def fail_local_update(*args, **kwargs):
+        if args[0] == "update-ref" and not failed:
+            failed.append(True)
+            return subprocess.CompletedProcess(args, 1, b"", b"cannot update ref")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(writer, "_run", fail_local_update)
+    with pytest.raises(ss.StateError, match="update-ref"):
+        writer.write({"committed": b"v"}, "write")
+    assert writer.read("committed") == b"v"
+
+
+def test_failed_fetch_does_not_make_stale_cache_fresh(tmp_path):
+    remote = make_remote(tmp_path)
+    writer = make_store(tmp_path, remote=remote, ttl=3600)
+    writer.write({"key": b"value"}, "seed")
+    remote.rename(tmp_path / "offline.git")
+    with pytest.raises(ss.StateError, match="fetch failed"):
+        writer.read("key", fresh=True)
+    with pytest.raises(ss.StateError, match="fetch failed"):
+        writer.read("key")
+
+
+def test_failed_deleted_ref_cleanup_does_not_make_cache_fresh(tmp_path, monkeypatch):
+    remote = make_remote(tmp_path)
+    writer = make_store(tmp_path, remote=remote, ttl=3600)
+    writer.write({"key": b"value"}, "seed")
+    bare(remote, "update-ref", "-d", f"refs/heads/{BRANCH}")
+    real_run = writer._run
+
+    def fail_cleanup(*args, **kwargs):
+        if args[:2] == ("update-ref", "-d"):
+            return subprocess.CompletedProcess(args, 1, b"", b"cannot delete ref")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(writer, "_run", fail_cleanup)
+    with pytest.raises(ss.StateError, match="update-ref"):
+        writer.read("key", fresh=True)
+    with pytest.raises(ss.StateError, match="update-ref"):
+        writer.read("key")
 
 
 def test_rejecting_hook_is_a_state_error_not_a_retry(tmp_path):

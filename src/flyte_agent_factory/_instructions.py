@@ -459,8 +459,11 @@ def _project_memory(
         if _target_ci.parse_target(_session_config._project_brief)
         else ""
     )
+    human_facing = _session_config._describe_human_facing_files()
     return (
         _standards.GUIDANCE
+        + (f"{human_facing}\n\n" if human_facing else "")
+        + _session_config._describe_product_users()
         + (_issues.GUIDANCE + "\n\n" if _issues.is_framed(_session_config._project_brief) else "")
         + (_coordinator_note() if delegation_available else "")
         + (_context_hygiene_note(delegation_available) if guard else "")

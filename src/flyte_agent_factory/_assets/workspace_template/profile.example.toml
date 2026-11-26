@@ -41,7 +41,7 @@ deploy_key = "my_deploy_key"       # deploy key of this workspace repository, wi
 # Standards come from this workspace's standards/ directory (read-only to the factory).
 [standards]
 dir = "standards"
-include = ["engineering", "security"]
+include = ["engineering", "security", "ux"]
 languages = "auto"
 
 # Optional: a Projects v2 board as the backlog.

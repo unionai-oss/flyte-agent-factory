@@ -666,6 +666,25 @@ def test_the_check_runs_without_this_pods_environment(tmp_path, monkeypatch):
     assert _bench_check.run_hidden_check(task, project, key_vars=())["exit_code"] == 0
 
 
+def test_check_subprocesses_use_a_private_temporary_directory(tmp_path):
+    code = (
+        "import os, subprocess, sys, tempfile; "
+        "print(tempfile.gettempdir()); "
+        "subprocess.run([sys.executable, '-c', "
+        "'import tempfile; print(tempfile.gettempdir())'], check=True, timeout=10)"
+    )
+    task = dataclasses.replace(
+        _bench_suite.get("bugfix-shortlinks"), check_commands=(("python", "-c", code),)
+    )
+    result = _bench_check.run_hidden_check(task, tmp_path, key_vars=())
+    assert result["exit_code"] == 0
+    paths = result["summary"].splitlines()[-2:]
+    assert paths[0] == paths[1]
+    private_tmp = Path(paths[0])
+    assert private_tmp.name == "tmp" and private_tmp.parent.name.startswith("bench-check-")
+    assert not private_tmp.exists()
+
+
 def test_a_hung_check_is_killed(tmp_path):
     task = dataclasses.replace(
         _bench_suite.get("bugfix-shortlinks"),

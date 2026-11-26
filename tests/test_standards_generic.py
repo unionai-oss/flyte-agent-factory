@@ -195,6 +195,8 @@ def test_the_engine_names_none_of_the_owners_rule_ids():
         "standards/",
         ".claude-flyte/",
         "briefs/",
+        # The project's own evidence declaration: the file's format keys each command by a rule ID.
+        "factory-evidence.toml",
     )
     found = []
     for name in filter(None, tracked):
@@ -277,6 +279,27 @@ def test_script_rules_run_from_the_standards_directory(tmp_path, scripts, arg, s
     result = gate(tmp_path, rule_text("A.1", f"script {arg}"), scripts=scripts)["A.1"]
     assert result.status is status
     assert needle in result.output
+
+
+@pytest.mark.parametrize(
+    ("script", "status"),
+    [
+        ("print('NOT APPLICABLE: no pages declared')\n", Status.NOT_APPLICABLE),
+        ("print()\nprint('NOT APPLICABLE: after a blank line')\n", Status.NOT_APPLICABLE),
+        ("print('NOT APPLICABLE: but broken')\nraise SystemExit(1)\n", Status.FAIL),
+        ("print('a')\nprint('b')\nprint('NOT APPLICABLE: too late')\n", Status.PASS),
+        ("print('not applicable: wrong case')\n", Status.PASS),
+    ],
+)
+def test_a_script_may_declare_itself_not_applicable(tmp_path, script, status):
+    result = gate(tmp_path, rule_text("A.1", "script na.py"), scripts={"na.py": script})["A.1"]
+    assert result.status is status
+    assert not result.status.blocks or status is Status.FAIL
+
+
+def test_not_applicable_is_for_scripts_only(tmp_path):
+    text = rule_text("A.1", "command echo 'NOT APPLICABLE: no'")
+    assert gate(tmp_path, text)["A.1"].status is Status.PASS
 
 
 def test_a_script_runs_in_the_project_directory(tmp_path):

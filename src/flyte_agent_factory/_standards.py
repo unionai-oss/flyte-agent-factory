@@ -14,7 +14,9 @@ from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
 
 ROOT = Path(__file__).resolve().parents[2]
-MAX_PAYLOAD = 48_000
+#: The encoded bundle travels inside one environment variable (`AGENT_FACTORY_PROFILE_TOML`), and Linux caps a
+#: single environment string at 128 KiB (MAX_ARG_STRLEN): 96 KB leaves over 30 KB for the rest of the profile.
+MAX_PAYLOAD = 96_000
 #: A workspace's own standards directory when `[standards] dir` is unset (`_profile._with_tree`).
 DEFAULT_DIR = "standards"
 MAX_FILES = 512_000
@@ -50,8 +52,8 @@ GUIDANCE = (
     "DESIGN.md may override a standard with a stated reason. Failing checks, tool-enforced MUST rules, "
     "evidenced correctness/completeness findings and scope violations block review. Craft, unevidenced "
     "findings and SHOULD "
-    "findings are non-blocking. Read the selected files before implementing. Brand standards apply "
-    "only to visual or customer-facing deliverables. If `brand.md` is present here, follow it; "
+    "findings are non-blocking. Read the selected files before implementing. "
+    "If `brand.md` is present here, follow it; "
     "do not redecide the configured brand for demos, reports or other customer-facing work.\n\n"
 )
 
@@ -71,6 +73,8 @@ class Rule:
     arg: str = ""
     #: Why the `Enforced:` line cannot be used; empty when it can.
     error: str = ""
+    #: Whether the rule is for what people see or read: its file says `applies: human-facing`, or is brand.md.
+    human_facing: bool = False
 
     @property
     def must(self) -> bool:
@@ -181,15 +185,37 @@ def forbid_parts(rule: Rule) -> tuple[str, list[str]]:
     return _split_forbid(rule.arg)
 
 
+def _is_human_facing(name: str, text: str) -> bool:
+    """Whether a standards file's rules are for human-facing work: brand.md, or an `applies:` line says so."""
+    if name == "brand.md":
+        return True
+    preamble = re.split(r"^## ", text, maxsplit=1, flags=re.MULTILINE)[0]
+    return bool(re.search(r"^applies:[ \t]*human-facing[ \t]*$", preamble, re.MULTILINE | re.IGNORECASE))
+
+
+def describe_human_facing_files(files: dict[str, str]) -> str:
+    """Return the sentence limiting human-facing files' rules to human-facing work; empty if none."""
+    names = list(dict.fromkeys(r.file for r in rules(files) if r.human_facing))
+    if not names:
+        return ""
+    listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
+    return (
+        f"Rules from {listed} apply only to human-facing deliverables (UI, reports, CLI output read by "
+        "people, docs sites, demos, slides); for those, judge them with evidence: screenshots at the "
+        "stated viewports and a walkthrough of the main task."
+    )
+
+
 def rules(files: dict[str, str]) -> list[Rule]:
     """Every rule of the `.md` files in `files`, in file order. README files are for people, not parsed."""
     found = []
     for name, text in files.items():
         if not name.endswith(".md") or PurePosixPath(name).name == "README.md" or "/configs/" in name:
             continue
+        human = _is_human_facing(name, text)
         for ident, level, body in RULE.findall(text):
             kind, arg, error = _parse_enforced(body)
-            found.append(Rule(ident, level, body, name, kind, arg, error))
+            found.append(Rule(ident, level, body, name, kind, arg, error, human))
     return found
 
 
@@ -337,13 +363,13 @@ def encode(files: dict[str, str]) -> str:
         raise ValueError("[standards] files exceed 512 KB; reduce the selected standards")
     payload = base64.b64encode(zlib.compress(raw)).decode()
     if len(payload) > MAX_PAYLOAD:
-        raise ValueError("[standards] compressed payload exceeds 48 KB; reduce the selected standards")
+        raise ValueError("[standards] compressed payload exceeds 96 KB; reduce the selected standards")
     return payload
 
 
 def decode(payload: str) -> dict[str, str]:
     if len(payload) > MAX_PAYLOAD:
-        raise ValueError("[standards] payload exceeds 48 KB")
+        raise ValueError("[standards] payload exceeds 96 KB")
     decompressor = zlib.decompressobj()
     raw = decompressor.decompress(base64.b64decode(payload, validate=True), MAX_FILES + 1)
     if len(raw) > MAX_FILES or not decompressor.eof:
@@ -451,6 +477,16 @@ def select(
             )
     if "brand.md" in files:
         selected["brand.md"] = files["brand.md"]
+    # Imported here: `_product` reads rules with this module's parser.
+    from . import _product
+
+    product = _product.load(project)
+    taken = {r.ident for r in rules({n: t for n, t in selected.items() if n != "brand.md"})}
+    brand = _product.resolve_brand(project, product, taken) if product else _product.Brand()
+    if brand.action == "none":
+        selected.pop("brand.md", None)
+    elif brand.action == "replace":
+        selected["brand.md"] = brand.text
     return selected
 
 
@@ -480,18 +516,31 @@ def materialize(
     return selected
 
 
+#: A `Sources:` paragraph: register keys for whoever revises the rule, not for a reviewer applying it.
+_SOURCES = re.compile(r"^Sources:.*(?:\n(?!\n).*)*\n?", re.MULTILINE)
+
+
 def review_text(
-    files: dict[str, str], budget: int = 24_000, *, must_only: bool = False, judgement_only: bool = False
+    files: dict[str, str], budget: int = 40_000, *, must_only: bool = False, judgement_only: bool = False
 ) -> str:
+    """Return the rules a reviewer applies, MUST first, within `budget`; name any left out."""
     chosen = [
-        (rule.level, f"{rule.file}: {rule.ident} {rule.level}\n{rule.body.strip()}\n")
+        (rule, f"{rule.file}: {rule.ident} {rule.level}\n{_SOURCES.sub('', rule.body).strip()}\n")
         for rule in rules(files)
         if (not must_only or rule.must)
         and (not judgement_only or rule.kind == "judgement" or "\nJudged:" in rule.body)
     ]
-    chosen.sort(key=lambda rule: rule[0] != "MUST")
-    result = ""
-    for _, text in chosen:
+    chosen.sort(key=lambda chosen: chosen[0].level != "MUST")
+    result, omitted = "", []
+    for rule, text in chosen:
         if len(result) + len(text) + 1 <= budget:
             result += text + "\n"
+        else:
+            omitted.append(f"{rule.ident} ({rule.file})")
+    if omitted:
+        result += (
+            "Not shown, for space (read them in .claude-flyte/standards/ and apply them all the same): "
+            + ", ".join(omitted)
+            + ".\n\n"
+        )
     return result
