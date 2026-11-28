@@ -214,7 +214,7 @@ def test_expired_login_survives_the_status_bar_losing_its_spaces(tmp_path):
 
 def test_a_healthy_session_is_not_flagged_as_logged_out(tmp_path):
     proc = ClaudeProcess(["true"], cwd=tmp_path, env={})
-    proc._consume("Claude Code v2.1.287\nSonnet 5.5\nI read BRIEF.md. Starting with the in-range baseline.\n")
+    proc._consume("Claude Code v2.1.326\nSonnet 5.5\nI read BRIEF.md. Starting with the in-range baseline.\n")
     assert not proc.login_expired
 
 

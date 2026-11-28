@@ -41,9 +41,9 @@ from flyte._image import _CREATE_FLYTE_USER_CMD
 
 from flyte_agent_factory import _scanners
 
-# Claude Code's `stable` channel at the time of writing; don't go below v2.1.283, the floor
+# Claude Code's npm `stable` channel on 2026-11-27; don't go below v2.1.283, the floor
 # for several behaviors we rely on.
-CLAUDE_VERSION = "2.1.287"
+CLAUDE_VERSION = "2.1.326"
 
 # `@playwright/mcp` pins an alpha build of `playwright` itself, so we never
 # install `playwright` separately -- the install script drives the copy bundled

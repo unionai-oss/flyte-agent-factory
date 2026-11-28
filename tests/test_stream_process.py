@@ -671,3 +671,115 @@ async def test_submit_to_an_exited_session_returns_false() -> None:
     assert await proc.submit("x") is False
     assert list(proc.sent_texts) == []
     assert proc._outstanding == 0
+
+
+async def test_result_reports_hook_denials_without_double_counting(monkeypatch: pytest.MonkeyPatch) -> None:
+    notices: list[tuple[str, str]] = []
+    proc, _ = _detached(monkeypatch, on_notice=lambda emoji, text: notices.append((emoji, text)))
+    await proc.handle(
+        {"type": "system", "subtype": "permission_denied", "tool_name": "Bash", "tool_use_id": "seen"}
+    )
+    await proc.handle(
+        {
+            "type": "result",
+            "subtype": "success",
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_use_id": "seen", "tool_input": {"command": "rm x"}},
+                {"tool_name": "Read", "tool_use_id": "hook", "tool_input": {"file_path": "private"}},
+            ],
+        }
+    )
+    assert [tool for _, tool in proc.permission_denials] == ["Bash", "Read"]
+    assert notices == [
+        ("🚫", "Bash blocked by a deny rule or hook"),
+        ("🚫", "Read blocked by a deny rule or hook"),
+    ]
+    assert not any("private" in line or "rm x" in line for line in proc.tail)
+
+
+async def test_policy_denial_in_result_is_not_counted_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc, _ = _detached(monkeypatch)
+    await proc.handle(
+        {
+            "type": "control_request",
+            "request_id": "r",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "tool_use_id": "call-1",
+                "input": {"command": "rm -rf /tmp/example"},
+            },
+        }
+    )
+    await proc.handle(
+        {
+            "type": "result",
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_use_id": "call-1"},
+            ],
+        }
+    )
+    assert [tool for _, tool in proc.permission_denials] == ["Bash"]
+
+
+async def test_policy_and_system_events_for_same_denial_count_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc, _ = _detached(monkeypatch)
+    await proc.handle(
+        {
+            "type": "control_request",
+            "request_id": "r",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "tool_use_id": "same",
+                "input": {"command": "rm -rf /tmp/example"},
+            },
+        }
+    )
+    await proc.handle(
+        {"type": "system", "subtype": "permission_denied", "tool_name": "Bash", "tool_use_id": "same"}
+    )
+    await proc.handle(
+        {"type": "result", "permission_denials": [{"tool_name": "Bash", "tool_use_id": "same"}]}
+    )
+    assert [tool for _, tool in proc.permission_denials] == ["Bash"]
+
+
+async def test_result_denial_name_cannot_inject_log_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    notices: list[tuple[str, str]] = []
+    proc, _ = _detached(monkeypatch, on_notice=lambda emoji, text: notices.append((emoji, text)))
+    await proc.handle(
+        {"type": "result", "permission_denials": [{"tool_name": "Read\nforged", "tool_use_id": "x"}]}
+    )
+    assert [tool for _, tool in proc.permission_denials] == ["Readforged"]
+    assert all("\n" not in text for _, text in notices)
+    assert all("\n" not in line for line in proc.tail)
+
+
+@pytest.mark.parametrize("callback", ["on_line", "on_notice"])
+async def test_result_denial_reporting_failure_does_not_lose_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, callback: str
+) -> None:
+    def fail(*args: Any) -> None:
+        if callback == "on_notice" or args[0].startswith("[permission]"):
+            raise OSError("report unavailable")
+
+    if callback == "on_line":
+        proc, _ = _detached(monkeypatch, ledger=tmp_path / "ledger", on_line=fail)
+    else:
+        proc, _ = _detached(monkeypatch, ledger=tmp_path / "ledger", on_notice=fail)
+    proc._outstanding = 1
+    await proc.handle(
+        {
+            "type": "result",
+            "subtype": "success",
+            "num_turns": 2,
+            "usage": {"output_tokens": 7},
+            "permission_denials": [{"tool_name": "Read", "tool_use_id": "x"}],
+        }
+    )
+    assert proc.results == 1 and proc.turns == 2 and not proc.busy
+    assert proc.usage["output_tokens"] == 7
+    assert [tool for _, tool in proc.permission_denials] == ["Read"]
+    assert len((tmp_path / "ledger").read_text().splitlines()) == 1
+    assert not proc._denied_tool_ids

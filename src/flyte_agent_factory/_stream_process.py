@@ -139,6 +139,7 @@ class StreamClaudeProcess:
         self.last_submission: tuple[str, float, int] | None = None
         self.sent_texts: deque[str] = deque(maxlen=500)
         self.permission_denials: deque[tuple[float, str]] = deque(maxlen=100)
+        self._denied_tool_ids: set[str] = set()
         #: Structured totals for this process: turns, tokens, and the conversation's cost estimate.
         self.turns = 0
         self.results = 0
@@ -367,6 +368,11 @@ class StreamClaudeProcess:
                 self._log_line(f"[api retry] {event.get('error')} attempt {attempt}")
         elif sub == "permission_denied":
             # A deny rule or hook refused a call without asking: policy working, recorded for the report.
+            tool_id = event.get("tool_use_id")
+            if isinstance(tool_id, str) and tool_id in self._denied_tool_ids:
+                return
+            if isinstance(tool_id, str) and tool_id:
+                self._denied_tool_ids.add(tool_id)
             self._record_denial(str(event.get("tool_name")), str(event.get("message") or ""), asked=False)
         elif sub == "hook_response" and event.get("exit_code") not in (0, None):
             self._log_line(f"[hook] {event.get('hook_name')} exited {event.get('exit_code')}")
@@ -440,6 +446,22 @@ class StreamClaudeProcess:
             self._log_line(f"[auth] {error}: the setup-token no longer works")
 
     def _handle_result(self, event: dict[str, Any]) -> None:
+        denials = event.get("permission_denials")
+        if isinstance(denials, list):
+            for denial in denials:
+                if not isinstance(denial, dict):
+                    continue
+                tool_id = denial.get("tool_use_id")
+                if isinstance(tool_id, str) and tool_id in self._denied_tool_ids:
+                    continue
+                if isinstance(tool_id, str) and tool_id:
+                    self._denied_tool_ids.add(tool_id)
+                try:
+                    self._record_denial(str(denial.get("tool_name") or ""), "", asked=False)
+                except _EVENT_ERRORS as exc:
+                    # A failed report must not discard the turn or its usage ledger entry.
+                    self.tail.append(f"[stream] could not report a denial: {exc!r}")
+        self._denied_tool_ids.clear()
         self.results += 1
         self._outstanding = max(0, self._outstanding - 1)
         queued = event.get("queued_turn_count")
@@ -510,7 +532,11 @@ class StreamClaudeProcess:
             tool = str(request.get("tool_name") or "")
             decision = self._policy.decide(tool, request.get("input") or {})
             if decision.behavior == "deny":
-                self._record_denial(tool, decision.message, asked=True)
+                tool_id = request.get("tool_use_id")
+                if not isinstance(tool_id, str) or tool_id not in self._denied_tool_ids:
+                    if isinstance(tool_id, str) and tool_id:
+                        self._denied_tool_ids.add(tool_id)
+                    self._record_denial(tool, decision.message, asked=True)
             body: dict[str, Any] = {
                 "subtype": "success",
                 "request_id": request_id,
@@ -526,6 +552,8 @@ class StreamClaudeProcess:
         await self._send({"type": "control_response", "response": body})
 
     def _record_denial(self, tool: str, message: str, *, asked: bool) -> None:
+        tool = "".join(char for char in tool if char.isprintable())[:120] or "unknown"
+        message = "".join(char for char in message if char.isprintable())
         self.permission_denials.append((time.monotonic(), tool))
         how = "denied by the factory's permission policy" if asked else "blocked by a deny rule or hook"
         self._log_line(f"[permission] {tool} {how}: {message[:200]}")

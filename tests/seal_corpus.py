@@ -397,7 +397,7 @@ class Record:
                 "isSidechain": sidechain,
                 "userType": "external",
                 "cwd": "/repo",
-                "version": "2.1.287",
+                "version": "2.1.326",
             }
             envelope |= {"sessionId": session_id, "entrypoint": "sdk-cli", "gitBranch": "HEAD"}
             if agent_id:

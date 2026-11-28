@@ -137,3 +137,13 @@ def test_podman_probe_is_guarded_and_runs_on_the_slot_image():
     assert 'if __name__ == "__main__":' in source
     assert "agent_image" in source
     assert "podman build" in source and "podman run" in source
+
+
+def test_claude_cli_uses_reviewed_stable_release():
+    assert _images.CLAUDE_VERSION == "2.1.326"
+
+
+def test_claude_cli_pin_is_not_below_the_floor():
+    """v2.1.283 is the oldest release the engine supports (see the pin's comment)."""
+    pinned = tuple(int(part) for part in _images.CLAUDE_VERSION.split("."))
+    assert pinned >= (2, 1, 283)
