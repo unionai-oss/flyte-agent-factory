@@ -297,29 +297,35 @@ supervisors and `factory-reconcile`. Both its explicit environment name and Unio
 name are removed before children start. This shares the App key's same-uid limitation: environment
 removal does not isolate secrets from processes running as the supervisor's user.
 
-The board's Status (Backlog, Ready, In flight, In review, Upstream, Done), Size, Kind (GitHub reserves `Type`),
+The board's Status (Backlog, Ready, In flight, In review, Stopped, Upstream, Done), Size, Kind (GitHub reserves `Type`),
 Flyte, Branch and Engine fields are created by `factory-reconcile` whenever one is missing, including
 one deleted by hand later. Project input `issue="owner/repo#123"`, or the issue a factory launch links
 (its queue request's `issue`, with or without issue intake), associates a run with an existing board
 item. Nothing is queued: an item's values are a projection of its issue's newest project
 run, found by the run's `factory-issue` label. A live run is In flight, or In review once it has a
 pull request; a run that passed review is Done, or In review while it has a pull request (the merge, or
-the issue closing, makes it Done); Flyte, Branch and Engine come from the run and its report. The supervisor's
+the issue closing, makes it Done); Flyte, Branch and Engine come from the run and its report. Passed means
+the last QA verdict was PASS with no newer review round, a restored legacy pass with no newer round, or a
+release; a session that exited cleanly (phase `done`, as after `/stop`) without one is Stopped, not Done,
+while the run is live or after Flyte reports it succeeded. The planner does not admit a Stopped card, so the
+owner moves it to Ready to relaunch it; the resumed run then takes it to In flight like any new run. The supervisor's
 release move follows the same rule. A Done from a run never takes a card out of Upstream. A failed or aborted run moves nothing. The run projection never sets Backlog or Ready; the
 [truth pass](#board-status) moves a card there only on the evidence listed below.
 
-The supervisor writes its moves (start, PR opened, release) as they happen. A write that fails is kept
+The supervisor writes its moves (start, PR opened, release, a clean stop without a pass) as they happen. A write that fails is kept
 in memory, with one ⚠️ row per failing streak (🚨 for a refused token or an item missing from the
 board), and retried every minute for the life of the run; board failures never stop project work.
 `factory-reconcile` looks at every board item, whatever its Status, whose issue has a project run that is
 live or ended in the last two hours, and writes only the values that differ. Past those two hours the run
 projection leaves the item alone; the truth pass below still examines it. For a run the item already
 shows (its Flyte field is that run's URL) it only moves Status forward (Backlog, Ready, In flight, In
-review, Upstream, Done), so a report that lags the supervisor, or a Done the owner set by hand on a live run,
-is never overwritten. Only the supervisor's direct write when it starts a review round puts a Done
+review, Stopped, Upstream, Done), so a report that lags the supervisor, or a Done the owner set by hand on a live run,
+is never overwritten, and it leaves a Status a person set after the run's newest event (or on a run whose
+report has no dated event) where they put it. Only the supervisor's direct write when it starts a review round puts a Done
 item back In review. If that write fails and the supervisor cannot retry it, reconciliation does not
 heal the reopen: preserving an owner's Done takes priority. An item that shows another run, or none,
-takes the new run's Status. A run that never started, or whose report is missing, is read as an empty
+takes the new run's Status, unless a person set its Status after that run's newest event (then only its
+other fields move). A run that never started, or whose report is missing, is read as an empty
 status. One tick lists the slots' runs once (one call per slot task, not one per item). A tick that cannot
 read or write the board fails, with
 a 🚨 row in its log when the board is not visible or the PAT is refused: the run list in the console
@@ -338,12 +344,16 @@ First rule that applies wins:
 2. A closed issue is Done (and never leaves Done), whoever set the card's Status.
 3. An upstream pull request merged and none open: Done (a closed one resubmitted and merged counts).
 4. The whole issue referenced by a commit on main: left alone, and flagged for review.
+4a. A Stopped card whose newest run stopped without a pass: left alone. A quiet spell, or a pull request no
+   newer than the run's last event, is not new evidence; a newer pull request (any, when the report has no
+   dated event), an upstream pull request changing state, or the issue closing, is.
 5. An open local pull request that references the issue (closing keyword or plain `#N`, or linked to
    it), or a live review round: In review, even for a card that was Done or Upstream.
-6. A live run: In flight, for a card that is behind it.
+6. A live run: In flight, for a card that is behind it or Stopped (a resumed run).
 7. An open upstream pull request: Upstream.
 8. Upstream pull requests closed, none merged: Ready, with a note on the issue, posted once per pull request.
-9. A Done card on an open issue whose newest run stopped without a pass: Ready.
+9. A Done card on an open issue whose newest run stopped without a pass: Stopped after a clean stop, Ready
+   after a failed or aborted run.
 10. In flight or In review with no live run, open pull request, queued launch or activity (a branch commit,
     the newest run's end, the Status's own last change) for two days: Ready.
 11. A card in Backlog whose launch request is waiting in the queue: Ready.
@@ -352,12 +362,18 @@ Backlog and Ready otherwise stay the owner's, but the pass reads upstream links 
 Status of an open issue: an open upstream pull request moves a card there to Upstream and a merged one to
 Done, while one closed unmerged leaves it where it is.
 
-A Status that a person (not a Bot) set in the last 24 hours is held (except on a closed issue, whose card
-always goes to Done): the pass logs
+A Status that a person set is held until there is evidence newer than the move for the proposed
+correction: the run's newest event, a pull request opened or reopened, or an upstream pull request changing
+state. Elapsed time is not evidence, so there is no expiry and rule 10 does not undo a person's later move
+either. A closed issue's card still goes to Done, and a merged upstream pull request still makes it Done.
+While held, the pass logs
 `Board truth <ref>: held <from> (set by hand <age> ago); would move to <to>: <reason>` and moves
-nothing; the audit still flags the card where one of its usual checks applies.
-The board PAT may be a person's own, in which case the factory's own writes look like hand moves; the guard
-is deliberately conservative, so a card the factory just moved is left alone for a day. Each correction
+nothing; the audit still flags the card where one of its usual checks applies. A card with no recorded
+setter or time is not held, nor is one a Bot set, with one exception in the run projection: a Bot-set In
+review is not moved back to Stopped until the run has an event newer than that write, since it can
+reflect pull-request evidence the stopped run does not know about.
+The board PAT may be a person's own, in which case the factory's own writes look like hand moves; such a
+write is then held the same way, until the run's next event. Each correction
 is one WARNING line `Board truth <ref>: <from> -> <to>: <reason>`, and is counted in the tick's result.
 One card's failure does not stop the others; the first error is raised at the end.
 

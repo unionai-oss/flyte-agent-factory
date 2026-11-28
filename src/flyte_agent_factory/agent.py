@@ -501,7 +501,7 @@ async def project(
         timeline.row("🏁", f"already ended ({ended}); publishing the workspace without a session")
         published = await _state.publish(state)
         await _checkpoint._hand_over_slot(timeline, run_name, completion_key=app_key)
-        timeline.phase("released" if ended_released else "done")
+        _supervise_support._restore_pass_and_end_retry(timeline, ended_released)
         await _supervise_support._flush_milestones(timeline)
         await timeline.flush(force=True)
         return f"{project_name}: {ended}", published
@@ -1011,7 +1011,7 @@ async def project(
         raise RuntimeError(f"{outcome}, but the workspace could not be published")
     await _checkpoint._hand_over_slot(timeline, run_name, completion_key=app_key)
     # A release keeps its own phase: "done" would read as finished-and-closed to the dashboard.
-    timeline.phase("released" if _supervise_support._released else "done")
+    await _supervise_support._end_session_and_mark_stopped_card(timeline)
     await _supervise_support._flush_milestones(timeline)
     await timeline.flush(force=True)
     return f"{project_name}: {outcome}", workspace_out

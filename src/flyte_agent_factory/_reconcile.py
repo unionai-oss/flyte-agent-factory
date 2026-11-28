@@ -217,8 +217,8 @@ class RunIndex:
                 log.warning("Run %s links an issue the board cannot name", run.name)  # type: ignore[union-attr]  # A nonempty issue above requires a run.
         return issues
 
-    def latest(self, ref: str) -> tuple[bool, str, _issues.Snapshot | None] | None:
-        """Return `(live, url, snapshot)` of issue `ref`'s newest project run, or None.
+    def latest(self, ref: str) -> tuple[bool, str, _issues.Snapshot | None, str] | None:
+        """Return `(live, url, snapshot, phase)` of issue `ref`'s newest project run, or None.
 
         The run counts if it is live or ended within `BOARD_WINDOW`; with None the reconciler leaves
         the item alone.
@@ -235,10 +235,10 @@ class RunIndex:
         run = candidates[0]
         if not (live or _ended_within(run, BOARD_WINDOW, self.now)):
             return None
-        return bool(live), _board.run_url(PROFILE, run.name), _board_snapshot(run)
+        return bool(live), _board.run_url(PROFILE, run.name), _board_snapshot(run), _factory_base._phase(run)
 
-    def newest(self, ref: str) -> tuple[bool, datetime | None, _issues.Snapshot | None] | None:
-        """Return `(live, ended_at, snapshot)` of issue `ref`'s newest indexed run, however long ago it ended.
+    def newest(self, ref: str) -> tuple[bool, str, datetime | None, _issues.Snapshot | None] | None:
+        """Return `(live, phase, ended_at, snapshot)` of issue `ref`'s newest indexed run, however old.
 
         `latest` is for projecting a run onto its card and goes quiet after `BOARD_WINDOW`; the truth pass
         needs the run a stale card last showed. The index holds runs updated in the last day, plus the
@@ -252,10 +252,10 @@ class RunIndex:
         run = candidates[0]
         if run.name not in self._snapshots:
             self._snapshots[run.name] = _board_snapshot(run)
-        return bool(live), _ended_at(run), self._snapshots[run.name]
+        return bool(live), _factory_base._phase(run), _ended_at(run), self._snapshots[run.name]
 
 
-def latest_run(ref: str, now: float | None = None) -> tuple[bool, str, _issues.Snapshot | None] | None:
+def latest_run(ref: str, now: float | None = None) -> tuple[bool, str, _issues.Snapshot | None, str] | None:
     """`RunIndex.latest` of a fresh listing: for one issue. A tick indexes once for all its items."""
     return RunIndex(project_runs(), now).latest(ref)
 

@@ -658,6 +658,33 @@ async def _move_board(
         timeline.row("⚠️", f"could not update the board: {type(exc).__name__}")
 
 
+def _restore_pass_and_end_retry(timeline: _timeline._Timeline, released: bool) -> None:
+    """Set the phase of a retry that finds its run already ended, keeping a saved pass a pass.
+
+    This attempt's report replaces the one that saw the pass, and a bare `done` is a clean stop, not a
+    pass (`_board.run_passed`), so the saved pass goes back onto the timeline first. Nothing is posted: the
+    earlier attempt did that.
+    """
+    restored = _session_config._load_pass_record()
+    if restored and restored["passed"]:
+        timeline.review_passed = True
+        timeline.verdicts = restored["verdicts"]
+        timeline.pr_url = timeline.pr_url or restored["pr_url"]
+    timeline.phase("released" if released else "done")
+
+
+async def _end_session_and_mark_stopped_card(timeline: _timeline._Timeline) -> None:
+    """Set the phase of a session that ended normally, and move its card to Stopped if it never passed.
+
+    A clean end before a pass (`/stop`, say) is unfinished: Stopped says so, and the planner does not
+    relaunch it. A release keeps its own phase: "done" would read as finished-and-closed to the dashboard.
+    `_board_worker` is never torn down, so it is still set here.
+    """
+    timeline.phase("released" if _released else "done")
+    if not _released and not _board.run_passed(timeline.snapshot()):
+        await _move_board("Stopped", timeline, Engine=_engines_used())
+
+
 def _has_passed(timeline: _timeline._Timeline) -> bool:
     """Whether this run's own review passed once: its Done card is the run's to reopen."""
     return any(row.get("verdict") == "PASS" for row in timeline.verdicts)

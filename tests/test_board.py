@@ -1073,3 +1073,39 @@ def test_advance_status_never_leaves_done_and_only_moves_forward():
     assert _board.advance_status(ready, "i", "In flight") and ready.writes == ["In flight"]
     fresh = Fake("")
     assert _board.advance_status(fresh, "i", "Backlog") and fresh.writes == ["Backlog"]
+
+
+def test_bootstrap_adds_stopped_between_in_review_and_upstream_keeping_ids():
+    # A board from before Stopped existed (issue #48): the option is added in lifecycle order.
+    before = ("Backlog", "Ready", "In flight", "In review", "Upstream", "Done")
+    existing = [{"id": f"id-{name}", "name": name, "color": "GRAY", "description": ""} for name in before]
+    merged = _board._with_options(existing, _board.SELECTS["Status"])
+    assert [o["name"] for o in merged] == list(_board.SELECTS["Status"])
+    assert [o["name"] for o in merged].index("Stopped") == 4
+    assert all(o["id"] == f"id-{o['name']}" for o in merged if o["name"] != "Stopped")
+
+
+def _truncated_board_snapshot(phase: dict[str, Any], passed_round: int) -> dict[str, Any]:
+    """The smallest form `_dashboard` keeps of a report with no `review`: phase, PR, metrics' pass round."""
+    return {
+        "schema": 1,
+        "truncated": True,
+        "phase": phase,
+        "deliverables": {"pr": ""},
+        "metrics": {"passed_round": passed_round},
+    }
+
+
+def test_a_truncated_pass_does_not_count_once_a_newer_review_round_started():
+    data = _truncated_board_snapshot({"kind": "review", "round": 2}, passed_round=1)
+    assert _board.run_passed(data) is False
+    assert _board.desired(True, "", data)["Status"] == "In review"
+
+
+@pytest.mark.parametrize(
+    "phase", [{"kind": "done", "since": 2000.0}, {"kind": "review", "round": 1}, {"kind": "building"}]
+)
+def test_a_truncated_pass_with_no_newer_round_still_counts(phase):
+    data = _truncated_board_snapshot(phase, passed_round=1)
+    assert _board.run_passed(data) is True
+    assert _board.desired(False, "", data)["Status"] == "Done"

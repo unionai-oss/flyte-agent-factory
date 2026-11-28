@@ -92,8 +92,8 @@ async def test_cancellation_is_not_an_error():
     assert not stop.is_set()
 
 
-@pytest.mark.asyncio
-async def test_clean_exit_still_has_a_final_row_after_pump_failure(tmp_path, monkeypatch):
+async def _run_project(tmp_path, monkeypatch, pump):
+    """Run `agent.project` to a clean exit on fakes; `pump(timeline)` runs the session, then it exits."""
     from types import SimpleNamespace
 
     workspace = tmp_path / "workspace"
@@ -107,9 +107,9 @@ async def test_clean_exit_still_has_a_final_row_after_pump_failure(tmp_path, mon
     async def forever(*args, **kwargs):
         await asyncio.Event().wait()
 
-    async def broken_pump(*args, **kwargs):
+    async def session(*args, **kwargs):
         try:
-            raise ValueError("pump failed before the session exited")
+            await pump(timeline)
         finally:
             exited.set()
 
@@ -158,15 +158,51 @@ async def test_clean_exit_still_has_a_final_row_after_pump_failure(tmp_path, mon
     monkeypatch.setattr(_session_setup, "_prepare_workspace", noop)
     monkeypatch.setattr(agent, "write_context", lambda *args: workspace / "context")
     monkeypatch.setattr(_author, "_start_session", start)
-    monkeypatch.setattr(_supervise, "_pump", broken_pump)
+    monkeypatch.setattr(_supervise, "_pump", session)
     for name in ("_inbox_loop", "_watch_app_messages"):
         monkeypatch.setattr(_inbox, name, forever)
     monkeypatch.setattr(_checkpoint, "_checkpoint_loop", forever)
     monkeypatch.setattr(Bridge, "run", forever)
 
     result, output = cast(tuple[str, Any], await agent.project.func("brief", browser=False))
+    return timeline, result, output
+
+
+@pytest.mark.asyncio
+async def test_clean_exit_still_has_a_final_row_after_pump_failure(tmp_path, monkeypatch):
+    async def broken_pump(timeline):
+        raise ValueError("pump failed before the session exited")
+
+    timeline, result, output = await _run_project(tmp_path, monkeypatch, broken_pump)
 
     assert "session ended cleanly" in result
     assert output == "published-workspace"
     assert "the pump loop stopped" in timeline.render()
     assert [text for _, icon, text in timeline._rows if icon == "🏁"] == ["session ended cleanly"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdicts, moved",
+    [
+        ([], ["Stopped"]),  # /stop before review
+        ([{"round": 1, "verdict": "FAIL"}], ["Stopped"]),  # /stop after a failed round
+        ([{"round": 1, "verdict": "PASS"}], []),  # passed: the end is not a stop
+    ],
+)
+async def test_a_clean_end_without_a_pass_moves_the_card_to_stopped(tmp_path, monkeypatch, verdicts, moved):
+    """#48: a session that exits cleanly before review passed is unfinished, not Done."""
+    calls: list[str] = []
+
+    async def move(status, timeline, **kwargs):
+        calls.append(status)
+
+    async def reviewed(timeline):
+        timeline.verdicts = list(verdicts)
+
+    monkeypatch.setattr(_supervise_support, "_move_board", move)
+    timeline, result, _ = await _run_project(tmp_path, monkeypatch, reviewed)
+
+    assert "session ended cleanly" in result
+    assert [status for status in calls if status == "Stopped"] == moved
+    assert timeline.snapshot()["phase"]["kind"] == "done"

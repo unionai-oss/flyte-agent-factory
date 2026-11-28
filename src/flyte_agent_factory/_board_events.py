@@ -11,22 +11,28 @@ cannot decide. A card whose Status a correction has just moved is not flagged fo
 2. The issue is closed: Done (never moved out of Done).
 3. An upstream PR merged and none open: Done (a closed PR resubmitted and merged counts).
 4. The issue's whole reference is on main: left alone; `drift` flags it.
+4a. Stopped while the newest run stopped without a pass: left alone. A quiet spell, or a PR no newer than
+   the run's last event, is not new evidence; a newer PR, upstream PR state changes and the issue closing are.
 5. An open local PR references the issue, or a review round is live: In review.
-6. A live run: In flight, only for a card that is behind it.
+6. A live run: In flight, only for a card that is behind it or Stopped.
 7. An upstream PR is open: Upstream.
 8. Upstream PRs closed, none merged: Ready (a card in Backlog or Ready stays), and a note on the issue.
-9. Done on an open issue whose newest run stopped without a pass: Ready.
+9. Done on an open issue whose newest run stopped without a pass: Stopped for a clean stop, else Ready.
 10. In flight or In review with no evidence of life for `STALE`: Ready.
 11. Queued in Backlog: Ready.
 
-Otherwise None. Backlog and Ready stay the owner's: only rules 1, 2, 3, 7, 11 and the stale/stopped/
-closed-upstream rules move a card to or from them. Evidence of life is the newest of a branch commit, the
-newest run's end and the Status's own last change, so a card the supervisor has just set is never stale.
+Otherwise None. Backlog and Ready stay the owner's: only rules 1, 2, 3, 7, 9 (a failed or aborted run), 11
+and the stale and closed-upstream rules move a card to or from them; a cleanly stopped card goes to
+Stopped, which the planner does not admit, so a stopped project is not relaunched until the owner moves
+it to Ready. Evidence of life is the newest of a branch commit, the newest run's end and the Status's own
+last change, so a card the supervisor has just set is never stale.
 
-A card whose Status a person set within `HAND_SET` is held, and the correction is logged instead. GitHub
-reports who set a value, but the board PAT may be a person's own, so the factory's writes look like
-hand moves too: held for a day after any move, never wrongly overwritten. That is deliberate. The one
-exception is a closed issue: moving its card to Done is never wrong, so the guard does not apply.
+A Status a person set is held until there is evidence newer than the move for the proposed correction (the
+run's newest event, a pull request opened or reopened, an upstream PR changing state), however long ago the
+move was: elapsed time is not evidence, so the stale rule does not undo a person's later move either. GitHub
+reports who set a value, and a `Bot` setter is never held. The board PAT may be a person's own, so the
+factory's own writes can look hand-set and are then held the same way until the run's next event; a card with
+no recorded setter or time is not held. Closed issues and merged upstream pull requests still move to Done.
 """
 
 from __future__ import annotations
@@ -51,8 +57,6 @@ log = logging.getLogger(__name__)
 STATUS_CONTEXT = "factory/board-drift"
 #: In flight / In review with no sign of life for this long is Ready.
 STALE = timedelta(days=2)
-#: A Status a person set this recently is left where they put it.
-HAND_SET = timedelta(hours=24)
 #: Statuses owned by the owner: the factory only leaves them for a PR card or a queued launch.
 _OWNERS = ("Backlog", "Ready")
 # Owner, repository and number follow `_board._ISSUE`, which parses what this finds: text that is not
@@ -271,7 +275,11 @@ class Facts:
     live: bool = False  # the newest run is live
     review_live: bool = False  # ... and in a review round (or has its pull request)
     stopped: bool = False  # the newest run ended without a pass
+    clean_stop: bool = False  # ... and it ended cleanly (a /stop), not by failing or being aborted
+    run_event: datetime | None = None  # newest event reflected by the run report
     open_pr: bool = False  # a local open PR references the issue
+    pr_event: datetime | None = None
+    upstream_event: datetime | None = None
     merged: bool = False  # the whole issue is referenced by a commit on main
     active_at: datetime | None = None  # newest sign of life
     #: Upstream pull requests the issue names: `(owner/repo#N, OPEN | MERGED | CLOSED)`.
@@ -317,11 +325,19 @@ def derive(facts: Facts, current: str, now: datetime) -> tuple[str | None, str]:
         return (None, "") if current == "Done" else ("Done", "upstream pull request merged")
     if facts.merged:
         return None, ""
+    if (
+        current == "Stopped"
+        and facts.stopped
+        and not states.intersection({"OPEN", "CLOSED"})
+        and (facts.pr_event is None or (facts.run_event is not None and facts.pr_event <= facts.run_event))
+    ):
+        return None, ""
     if facts.open_pr or facts.review_live:
         reason = "open pull request" if facts.open_pr else "review round live"
         return (None, "") if current == "In review" else ("In review", reason)
     if facts.live:
-        behind = rank(current) < rank("In flight")
+        # Stopped ranks after In review, but a live run is new evidence: a resume moves the card on.
+        behind = rank(current) < rank("In flight") or current == "Stopped"
         return ("In flight", "run is live") if behind else (None, "")
     if "OPEN" in states:
         return (None, "") if current == "Upstream" else ("Upstream", "upstream pull request open")
@@ -330,7 +346,7 @@ def derive(facts: Facts, current: str, now: datetime) -> tuple[str | None, str]:
             return None, ""
         return "Ready", "upstream pull request closed unmerged"
     if current == "Done" and facts.stopped:
-        return "Ready", "run stopped without delivering"
+        return ("Stopped" if facts.clean_stop else "Ready"), "run stopped without delivering"
     if current in ("In flight", "In review") and not facts.queued:
         if facts.active_at is None or now - facts.active_at >= STALE:
             return "Ready", f"no live run, pull request or activity for {STALE.days} days"
@@ -354,13 +370,17 @@ def _time(text: str) -> datetime:
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def _held(item: _board.BoardRow, now: datetime) -> timedelta | None:
-    """How long ago a person set this card's Status, if within `HAND_SET`."""
+def _held(item: _board.BoardRow, now: datetime, event: datetime | None) -> timedelta | None:
+    """How long ago a person set this card's Status, while that move still holds.
+
+    The move holds until `event`, the newest evidence behind the correction, is newer than it; None means no
+    such evidence is known, so nothing implies a newer status than the person's.
+    """
     at, by = item.get("status_at", ""), item.get("status_by", "")
     if not at or not by or by == "Bot":
         return None
-    age = now - _time(at)
-    return age if age < HAND_SET else None
+    changed = _time(at)
+    return now - changed if event is None or event <= changed else None
 
 
 def _age(age: timedelta) -> str:
@@ -378,15 +398,18 @@ class _World:
     app: GithubApp
     client: _board.BoardClient
     own: set[str]
-    newest: Callable[[str], tuple[bool, datetime | None, Any] | None]
+    newest: Callable[[str], tuple[bool, str, datetime | None, Any] | None]
     queued: Collection[str]
     now: datetime
     issues: dict[int, str] = dataclasses.field(default_factory=dict)  # REST state of each listed issue
     merged: dict[int, str] = dataclasses.field(default_factory=dict)  # issues wholly on main -> commit
     pulled: set[int] = dataclasses.field(default_factory=set)  # issues an open local PR references
+    pull_events: dict[int, datetime] = dataclasses.field(default_factory=dict)
     activity: dict[int, datetime] = dataclasses.field(default_factory=dict)  # newest branch commit naming it
     branches: dict[str, datetime] = dataclasses.field(default_factory=dict)  # newest commit per branch
-    upstream: dict[str, str] = dataclasses.field(default_factory=dict)  # link -> state, read once per pass
+    upstream: dict[str, tuple[str, str]] = dataclasses.field(
+        default_factory=dict
+    )  # link -> state, read once per pass
 
 
 def _facts(world: _World, item: _board.BoardRow, ref: str) -> Facts:
@@ -402,34 +425,64 @@ def _facts(world: _World, item: _board.BoardRow, ref: str) -> Facts:
     ]
     if item.get("status_at"):
         seen.append(_time(item["status_at"]))
-    live = review_live = stopped = False
+    live = review_live = stopped = clean_stop = False
+    run_event = None
     found = world.newest(ref) if opened else None
     if found:
-        live, ended, snapshot = found
+        live, phase, ended, snapshot = found
         status = _board.desired(live, "", snapshot).get("Status", "")
         review_live = live and status == "In review"
         # No report (None) says nothing about whether the run delivered.
         # A pass whose pull request merged without closing the issue still delivered: ask the report.
         stopped = not live and snapshot is not None and not _board.run_passed(snapshot)
+        clean_stop = stopped and phase == "SUCCEEDED" and status == "Stopped"
+        event = _board.find_run_event_time(snapshot)
+        if event is not None:
+            run_event = datetime.fromtimestamp(event, timezone.utc)
         if ended:
             seen.append(ended)
     upstream: tuple[tuple[str, str], ...] = ()
+    upstream_times: list[tuple[str, datetime]] = []
     if opened:
         repo, _ = ref.rsplit("#", 1)
         texts = [item.get("body", "")]
         texts += [c.get("body") or "" for c in world.app.issue_comments_since(repo, number)]
         for link in dict.fromkeys(found for text in texts for found in upstream_links(text, world.own)):
             if link not in world.upstream:
-                world.upstream[link] = world.client.pull_request_state(link)
-            if world.upstream[link]:
-                upstream += ((link, world.upstream[link]),)
+                world.upstream[link] = world.client.fetch_pull_request_evidence(link)
+            state, at = world.upstream[link]
+            if state:
+                upstream += ((link, state),)
+                if at and state in {"OPEN", "CLOSED"}:
+                    upstream_times.append((state, _time(at)))
     return Facts(
         issue_open=opened,
         queued=ref.lower() in world.queued,
         live=live,
         review_live=review_live,
         stopped=stopped,
+        clean_stop=clean_stop,
+        run_event=run_event,
         open_pr=number in world.pulled or bool(item.get("linked_prs")),
+        pr_event=max(
+            [
+                at
+                for at in [
+                    world.pull_events.get(number),
+                    *(_time(pr["createdAt"]) for pr in item.get("linked_prs", []) if pr.get("createdAt")),
+                ]
+                if at
+            ],
+            default=None,
+        ),
+        upstream_event=max(
+            (
+                at
+                for state, at in upstream_times
+                if state == ("OPEN" if "OPEN" in {s for _, s in upstream} else "CLOSED")
+            ),
+            default=None,
+        ),
         merged=number in world.merged,
         active_at=max(seen, default=None),
         upstream=upstream,
@@ -450,8 +503,15 @@ def _correct(world: _World, item: _board.BoardRow, ref: str, facts: Facts) -> st
         if want is None:
             return ""
         before = current["status"]
-        # A closed issue's Done is never wrong, and the PAT makes the factory's own writes look hand-set.
-        held = _held(current, world.now) if current["open"] else None
+        # A closed issue or merged upstream PR wins even if the PAT makes our writes look hand-set.
+        merged_upstream = "MERGED" in facts.upstream_states and "OPEN" not in facts.upstream_states
+        event = facts.run_event
+        if reason == "open pull request":
+            live_event = facts.run_event if facts.live else None
+            event = max((at for at in (live_event, facts.pr_event) if at), default=None)
+        elif reason in {"upstream pull request open", "upstream pull request closed unmerged"}:
+            event = facts.upstream_event
+        held = _held(current, world.now, event) if current["open"] and not merged_upstream else None
         if held is not None:
             log.warning(
                 "Board truth %s: held %s (set by hand %s ago); would move to %s: %s",
@@ -516,13 +576,13 @@ def drift(
     app: GithubApp,
     latest: Callable[[str], Any],
     *,
-    newest: Callable[[str], tuple[bool, datetime | None, Any] | None] | None = None,
+    newest: Callable[[str], tuple[bool, str, datetime | None, Any] | None] | None = None,
     queued: Collection[str] = (),
     now: datetime | None = None,
 ) -> list[str]:
     """Correct each card's Status from the facts, heal proven completion and log every mismatch.
 
-    `newest(ref)` is `(live, ended_at, snapshot)` of the issue's newest project run however long ago it
+    `newest(ref)` is `(live, phase, ended_at, snapshot)` of the issue's newest project run however long ago it
     ended, or None; `queued` the lower-case `owner/repo#N` of issues with a pending launch request. Without
     `newest` there is no corrections pass and drift only heals and flags. `latest` is the run the card
     shows now, for the in-flight audit.
@@ -571,9 +631,19 @@ def drift(
                 if whole:
                     world.merged.setdefault(number, commit["sha"])
         for pull in app.repo_pulls(repo):
-            world.pulled.update(
-                references(f"{pull.get('title') or ''}\n{pull.get('body') or ''}", repo, plain=True)
-            )
+            refs = references(f"{pull.get('title') or ''}\n{pull.get('body') or ''}", repo, plain=True)
+            world.pulled.update(refs)
+            if refs and pull.get("created_at"):
+                times = [_time(pull["created_at"])]
+                if pull.get("number"):
+                    times.extend(
+                        _time(event["created_at"])
+                        for event in app.issue_events(repo, pull["number"])
+                        if event.get("event") == "reopened" and event.get("created_at")
+                    )
+                at = max(times)
+                for number in refs:
+                    world.pull_events[number] = max(world.pull_events.get(number, at), at)
         names = _branches_to_read(items)
         if len({item.get("texts", {}).get("Branch") for item in items} - {None, ""}) > MAX_BRANCH_READS:
             log.warning("Board drift branch reads truncated at %s branches", MAX_BRANCH_READS)

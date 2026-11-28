@@ -1778,3 +1778,64 @@ def test_overview_survives_a_state_store_that_raises_an_unexpected_error_class(m
 
     monkeypatch.setattr(operate._state_store, "current", lambda: Store())
     assert operate.recent_state_changes() is None
+
+
+@pytest.mark.parametrize("newer_review, expected", [(False, "In review"), (True, "Stopped")])
+def test_truncated_report_preserves_open_pull_request_for_board(newer_review, expected):
+    from flyte_agent_factory import _board
+
+    data = timeline_for().snapshot()
+    data["phase"]["kind"] = "done"
+    data["review"]["verdicts"] = [{"round": 1, "verdict": "PASS", "at": 1000.0}]
+    data["metrics"]["passed_round"] = 1
+    if newer_review:
+        data["review"]["round"] = 2
+    data["deliverables"]["pr"] = "https://github.com/example/repo/pull/1"
+    data["metrics"]["usage"] = {"author": {"detail": "x" * _dashboard.MAX_REPORT_BYTES}}
+    page = _dashboard.render(data, header_html="", meter_rows="", activity="", rows=[], routine=[], now=1234)
+    report = _dashboard.from_report(page)
+    assert report is not None
+    assert report["truncated"]
+    assert _board.desired(False, "https://example.com/run", report)["Status"] == expected
+
+
+@pytest.mark.parametrize("passed, expected", [(True, "In review"), (False, "Stopped")])
+def test_oversized_core_preserves_board_evidence(passed, expected):
+    from flyte_agent_factory import _board
+
+    data = timeline_for().snapshot()
+    data["phase"]["kind"] = "done"
+    data["deliverables"]["pr"] = "https://github.com/example/repo/pull/1"
+    if passed:
+        data["review"]["verdicts"] = [{"round": 1, "verdict": "PASS", "at": 1000.0}]
+        data["metrics"]["passed_round"] = 1
+    data["metrics"]["phase_history"] = [["x" * _dashboard.MAX_REPORT_BYTES, 1000.0]]
+    page = _dashboard.render(data, header_html="", meter_rows="", activity="", rows=[], routine=[], now=1234)
+    assert len(page.encode()) <= _dashboard.MAX_REPORT_BYTES
+    report = _dashboard.from_report(page)
+    assert report is not None
+    assert report["truncated"]
+    assert _board.desired(False, "https://example.com/run", report)["Status"] == expected
+
+
+@pytest.mark.parametrize("phase_round, passed, expected", [(2, False, "In review"), (1, True, "Done")])
+def test_an_older_truncated_report_without_review_compares_its_pass_round_with_the_live_round(
+    phase_round, passed, expected
+):
+    # The board-evidence form an older engine persisted when a report had no `review`: only the metrics'
+    # pass round says it passed, so a newer live round must still win.
+    from flyte_agent_factory import _board
+
+    board = {
+        "schema": _dashboard.SCHEMA,
+        "truncated": True,
+        "phase": {"kind": "review", "round": phase_round, "since": 2000.0},
+        "deliverables": {"pr": ""},
+        "metrics": {"passed_round": 1},
+    }
+    report = _dashboard.from_report("<p>Report truncated …</p>" + _dashboard.status_script(board))
+    assert report is not None
+    assert report["truncated"]
+    assert "review" not in report
+    assert _board.run_passed(report) is passed
+    assert _board.desired(True, "https://example.com/run", report)["Status"] == expected

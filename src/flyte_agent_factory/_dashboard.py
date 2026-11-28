@@ -800,6 +800,21 @@ def render(
                 "truncated": True,
                 "checkpoint": data.get("checkpoint", ""),
                 "app": data.get("app", ""),
+                "deliverables": {"pr": (data.get("deliverables") or {}).get("pr", "")},
+                **(
+                    {
+                        "review": {
+                            **{
+                                k: v
+                                for k, v in (data.get("review") or {}).items()
+                                if k in {"round", "started_at", "passed", "passed_round"}
+                            },
+                            "verdicts": (data.get("review") or {}).get("verdicts", [])[-1:],
+                        }
+                    }
+                    if data.get("review") is not None
+                    else {}
+                ),
                 # Small, and what `factory.credential_link` needs: dropping it would stop a grant being given.
                 "credentials": data.get("credentials") or {},
                 **({"metrics": metrics} if metrics is not None else {}),
@@ -811,7 +826,35 @@ def render(
                 summary["metrics"] = {k: v for k, v in metrics.items() if k not in {"labels", "usage"}}
                 tail = status_script(summary)
             if len((prefix + tail).encode()) > MAX_REPORT_BYTES:
-                tail = status_script({"schema": SCHEMA, "truncated": True})
+                # The board needs the last verdict, newer review evidence, phase and PR even
+                # when the benchmark's core history is too large to keep.
+                phase = data.get("phase") or {}
+                review = data.get("review")
+                board: Snapshot = {
+                    "schema": SCHEMA,
+                    "truncated": True,
+                    "phase": {k: phase[k] for k in ("kind", "round", "since") if k in phase},
+                    "deliverables": {"pr": (data.get("deliverables") or {}).get("pr", "")},
+                }
+                if review is not None:
+                    verdicts = review.get("verdicts") or []
+                    board["review"] = {
+                        **{
+                            k: review[k]
+                            for k in ("round", "started_at", "passed", "passed_round")
+                            if k in review
+                        },
+                        "verdicts": [
+                            {k: verdicts[-1][k] for k in ("round", "verdict", "at") if k in verdicts[-1]}
+                        ]
+                        if verdicts
+                        else [],
+                    }
+                elif metrics is not None:
+                    board["metrics"] = {k: metrics[k] for k in ("passed_round",) if k in metrics}
+                tail = status_script(board)
+                if len((prefix + tail).encode()) > MAX_REPORT_BYTES:
+                    tail = status_script({"schema": SCHEMA, "truncated": True})
             return prefix + tail
         # Halve rather than pop one at a time: a page far over the cap should not take 300 passes.
         keep, keep_routine = keep[(len(keep) + 1) // 2 :], keep_routine[(len(keep_routine) + 1) // 2 :]

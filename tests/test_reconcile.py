@@ -77,6 +77,16 @@ class Board:
         self.status = 0  # answer every request with this HTTP status, when set
         self.expiry = ""
         self.issue_state = lambda ref: "OPEN"
+        # When set, a Status write records this time and a `User` setter, as a board PAT's write does.
+        self.write_at = ""
+
+    def _status_value(self, item: dict[str, Any]) -> dict[str, Any]:
+        """`fieldValueByName` of an item's Status, with who set it when the item records that."""
+        value: dict[str, Any] = {"name": item["status"]}
+        if item.get("status_at"):
+            value["updatedAt"] = item["status_at"]
+            value["creator"] = {"__typename": item.get("status_by", "User"), "login": "x"}
+        return value
 
     def _ref(self, item_id: str) -> str:
         return next(ref for ref in self.items if f"item-{ref}" == item_id)
@@ -101,7 +111,7 @@ class Board:
             if item is not None:
                 node = {
                     "id": variables["id"],
-                    "fieldValueByName": {"name": item["status"]},
+                    "fieldValueByName": self._status_value(item),
                     "content": {"state": self.issue_state(ref)},
                     **{field: {"text": text} for field, text in item["texts"].items()},
                 }
@@ -112,7 +122,7 @@ class Board:
                 repo, number = ref.split("#")
                 node = {
                     "id": f"item-{ref}",
-                    "fieldValueByName": {"name": item["status"]} if item["status"] else None,
+                    "fieldValueByName": self._status_value(item) if item["status"] else None,
                     "content": {
                         "id": f"issue-{ref}",
                         "number": int(number),
@@ -146,6 +156,11 @@ class Board:
             self.writes.append((ref, field, text))
             if field == "Status":
                 self.items[ref]["status"] = text
+                if self.write_at:  # a stamped write, as GitHub reports one made with a person's PAT
+                    self.items[ref].update(status_at=self.write_at, status_by="User")
+                else:
+                    self.items[ref].pop("status_at", None)
+                    self.items[ref].pop("status_by", None)
             else:
                 self.items[ref]["texts"][field] = text
             data = {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": value["itemId"]}}}
@@ -705,13 +720,14 @@ def test_a_failing_app_fails_the_milestone_heal(world):
 
 
 def test_latest_run_is_live_or_ended_inside_the_window(world):
-    from flyte_agent_factory import _factory, _reconcile
+    from flyte_agent_factory import _factory, _factory_base, _reconcile
 
     run = world.runs[_factory.launch_project("brief", "widget", issue="you/repo#12")["run"]]
     run.report = _dashboard.status_script(snapshot(branch="factory/widget"))
     latest = _reconcile.latest_run("you/repo#12")
     assert latest is not None
-    live, url, data = latest
+    live, url, data, phase = latest
+    assert phase in _factory_base.LIVE
     assert (
         live
         and url == _board.run_url(_reconcile.PROFILE, run.name)
@@ -1485,12 +1501,22 @@ async def test_board_shown_run_is_fetched_when_listing_misses_it(world, monkeypa
 def test_legacy_pass_snapshot_is_done(live):
     # A pass with a pull request is In review until it merges (the merge or the issue closing makes it Done).
     data = snapshot(phase="done", pr="")
-    assert _board.desired(live, URL, data)["Status"] == "Done"
+    # Phase `done` alone is a clean exit, which `/stop` also produces: Stopped, not a pass (issue #48).
+    assert _board.desired(live, URL, data)["Status"] == "Stopped"
     data["phase"]["kind"] = "building"
     data["review"]["passed"] = True
     assert _board.desired(live, URL, data)["Status"] == "Done"
     data["deliverables"]["pr"] = PR
     assert _board.desired(live, URL, data)["Status"] == "In review"
+
+
+def test_legacy_pass_without_passed_round_passed_in_its_own_round():
+    data = snapshot(phase="done")
+    data["review"].update(passed=True, round=1)
+    data["review"].pop("passed_round", None)
+    assert _board.run_passed(data)
+    data["phase"].update(kind="review", round=2)  # a newer round started after the legacy pass
+    assert not _board.run_passed(data)
 
 
 def test_direct_lookup_without_sdk_run_labels_uses_board_issue(world):
@@ -1643,8 +1669,14 @@ def test_newest_run_ignores_the_board_window_and_queued_issues_need_state(world)
     assert index.latest(ISSUE) is None  # past BOARD_WINDOW: not the tick's to project
     newest = index.newest(ISSUE)
     assert newest is not None
-    live, at, data = newest
-    assert not live and at is not None and data is not None and data["phase"]["kind"] == "failed"
+    live, phase, at, data = newest
+    assert (
+        not live
+        and phase == "SUCCEEDED"
+        and at is not None
+        and data is not None
+        and data["phase"]["kind"] == "failed"
+    )
     assert index.newest("x/y#99") is None
     assert _reconcile.queued_issues(dataclasses.replace(board_profile(), state=_profile.State())) == set()
 
@@ -1803,3 +1835,187 @@ async def test_a_skipped_repo_does_not_hide_a_tick_where_every_step_failed(world
     monkeypatch.setattr(_github, "GithubApp", lambda *a, **kw: Broken())
     with pytest.raises(_github.GithubError, match="HTTP 500"):
         await _reconcile.reconcile()
+
+
+# --- a project stopped before it passed review is not Done (issue #48) ------------------------- #
+
+PASS = {"round": 1, "verdict": "PASS", "at": 1000.0}
+FAIL = {"round": 1, "verdict": "FAIL", "at": 1000.0}
+
+
+def stopped_snapshot(phase="done", since=2000.0, **parts):
+    """A snapshot of a run whose session ended: phase `phase` since `since` (epoch seconds)."""
+    data = snapshot(phase=phase, **parts)
+    data["phase"]["since"] = since
+    return data
+
+
+@pytest.mark.parametrize(
+    "data, passed, status",
+    [
+        (stopped_snapshot(), False, "Stopped"),  # /stop before review
+        (stopped_snapshot(verdicts=[FAIL]), False, "Stopped"),  # /stop after a FAIL
+        (stopped_snapshot(verdicts=[PASS]), True, "Done"),  # /stop after a PASS, no pull request
+        (
+            stopped_snapshot(verdicts=[PASS], pr=PR),
+            True,
+            "In review",
+        ),  # ... with one: its merge makes it Done
+        (stopped_snapshot(phase="released"), True, "Done"),
+        (stopped_snapshot(phase="released", pr=PR), True, "In review"),
+    ],
+)
+@pytest.mark.parametrize("live", [True, False])
+def test_clean_exit_is_a_pass_only_after_review_passed(data, passed, status, live):
+    assert _board.run_passed(data) is passed
+    assert _board.desired(live, URL, data)["Status"] == status
+
+
+def test_a_review_round_after_a_pass_then_a_stop_is_stopped():
+    data = stopped_snapshot(verdicts=[PASS])
+    data["review"]["round"] = 2
+    assert not _board.run_passed(data)
+    assert _board.desired(False, URL, data)["Status"] == "Stopped"
+
+
+@pytest.mark.parametrize(
+    "phase, expected", [("FAILED", "In flight"), ("ABORTED", "In flight"), ("SUCCEEDED", "Stopped")]
+)
+def test_reconciler_uses_flyte_terminal_phase_for_done_snapshot(
+    world, monkeypatch, no_storage, phase, expected
+):
+    from flyte_agent_factory import _factory_base, _reconcile
+
+    run = world.add(
+        "terminal", _factory_base.SLOTS[0], labels={_reconcile.LABEL_ISSUE: _issues.issue_label(ISSUE)}
+    )
+    run.phase = phase
+    ended(run, 0)
+    run.report = _dashboard.status_script(stopped_snapshot())
+    url = _board.run_url(_reconcile.PROFILE, run.name)
+    board = Board({ISSUE: {"status": "In flight", "texts": {"Flyte": url}}}).install(monkeypatch)
+    _board.Reconciler(board_profile(), "token", _reconcile.RunIndex([run]).latest).tick()
+    assert board.items[ISSUE]["status"] == expected
+    if phase != "SUCCEEDED":
+        assert board.writes == []
+
+
+def test_a_failed_run_still_implies_nothing():
+    assert _board.desired(False, URL, stopped_snapshot(phase="failed")) == {}
+
+
+@pytest.mark.parametrize("passed_round, status", [(2, "Done"), (None, "Stopped")])
+def test_truncated_report_keeps_its_pass_from_the_metrics(passed_round, status):
+    # `_dashboard.status_html`'s summary when the page overflows: no review, the metrics kept.
+    data = {"schema": _dashboard.SCHEMA, "phase": {"kind": "done"}, "truncated": True}
+    data["metrics"] = {"passed_round": passed_round}
+    assert _board.run_passed(data) is (passed_round is not None)
+    assert _board.desired(False, URL, data)["Status"] == status
+
+
+def test_run_event_at_is_the_newest_moment_the_run_reports():
+    data = stopped_snapshot(since=2000.0, verdicts=[{**FAIL, "at": 2500.0}])
+    data["review"]["started_at"] = 2200.0
+    assert _board.find_run_event_time(data) == 2500.0
+    assert _board.find_run_event_time(snapshot()) is None
+    assert _board.find_run_event_time(None) is None
+
+
+def iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@pytest.mark.parametrize(
+    "status_at, status_by, after",
+    [
+        (iso(3000), "User", "Ready"),  # a person moved it after the run's last event: it stays
+        (iso(1500), "User", "Done"),  # the run passed after the move: the pass is new
+        (iso(3000), "Bot", "Done"),  # a board workflow is not a person
+        ("", "", "Done"),  # nothing says who set it: as before
+    ],
+)
+def test_reconciler_keeps_a_hand_move_newer_than_the_run(
+    monkeypatch, no_storage, status_at, status_by, after
+):
+    item = {"status": "Ready", "texts": {"Flyte": URL}, "status_at": status_at, "status_by": status_by}
+    board = Board({ISSUE: item}).install(monkeypatch)
+    _board.Reconciler(
+        board_profile(), "token", runs({ISSUE: (False, URL, stopped_snapshot(verdicts=[PASS]))})
+    ).tick()
+    assert board.items[ISSUE]["status"] == after
+
+
+@pytest.mark.parametrize("status_by, after", [("User", "Ready"), ("", "Done")])
+def test_reconciler_keeps_a_hand_move_when_the_report_has_no_dated_event(
+    monkeypatch, no_storage, status_by, after
+):
+    # An undated report implies nothing newer than the move, as in the drift pass; an unattributed one moves.
+    item = {"status": "Ready", "texts": {"Flyte": URL}, "status_at": iso(3000), "status_by": status_by}
+    board = Board({ISSUE: item}).install(monkeypatch)
+    undated = stopped_snapshot(verdicts=[{"round": 1, "verdict": "PASS"}])
+    del undated["phase"]["since"]
+    assert _board.find_run_event_time(undated) is None
+    assert _board.desired(False, URL, undated)["Status"] == "Done"
+    _board.Reconciler(board_profile(), "token", runs({ISSUE: (False, URL, undated)})).tick()
+    assert board.items[ISSUE]["status"] == after
+
+
+def test_reconciler_moves_a_stopped_run_to_stopped_and_then_leaves_a_hand_move(monkeypatch, no_storage):
+    board = Board({ISSUE: {"status": "In flight", "texts": {"Flyte": URL}}}).install(monkeypatch)
+    latest = runs({ISSUE: (False, URL, stopped_snapshot(since=2000.0))})
+    _board.Reconciler(board_profile(), "token", latest).tick()
+    assert board.items[ISSUE]["status"] == "Stopped"
+    board.items[ISSUE].update(status="Ready", status_at=iso(3000), status_by="User")
+    board.writes.clear()
+    _board.Reconciler(board_profile(), "token", latest).tick()
+    assert board.items[ISSUE]["status"] == "Ready"
+    assert [w for w in board.writes if w[1] == "Status"] == []
+
+
+@pytest.mark.parametrize("before", ["Stopped", "Done"])
+def test_a_resume_moves_the_card_with_the_new_run(monkeypatch, no_storage, before):
+    item = {"status": before, "texts": {"Flyte": URL}, "status_at": iso(3000), "status_by": "User"}
+    board = Board({ISSUE: item}).install(monkeypatch)
+    resumed = "https://console.example/runs/r2"
+    board.write_at = iso(4000)
+    started = snapshot()
+    started["phase"]["since"] = 3500.0
+    _board.Reconciler(board_profile(), "token", runs({ISSUE: (True, resumed, started)})).tick()
+    assert board.items[ISSUE]["status"] == "In flight"
+    assert board.items[ISSUE]["texts"]["Flyte"] == resumed
+    reviewing = snapshot(pr=PR)
+    reviewing["phase"] = {"kind": "review", "since": 5000.0, "round": 1}
+    _board.Reconciler(board_profile(), "token", runs({ISSUE: (True, resumed, reviewing)})).tick()
+    assert board.items[ISSUE]["status"] == "In review"
+
+
+def test_supervisor_starts_a_resume_over_a_stopped_card(monkeypatch, no_storage):
+    board = Board({ISSUE: {"status": "Stopped", "texts": {"Flyte": URL}}}).install(monkeypatch)
+    worker = _board.supervisor(board_profile(), "token", ISSUE, lambda *row: None)
+    assert worker is not None
+    worker.move("In flight", Flyte="https://console.example/runs/r2")
+    assert board.items[ISSUE]["status"] == "In flight"
+    worker.move("In review")
+    assert board.items[ISSUE]["status"] == "In review"
+
+
+def test_supervisor_stopped_move_keeps_a_closed_issues_done(monkeypatch, no_storage):
+    board = Board({ISSUE: {"status": "Done", "texts": {"Flyte": URL}}}).install(monkeypatch)
+    board.issue_state = lambda ref: "CLOSED"
+    worker = _board.supervisor(board_profile(), "token", ISSUE, lambda *row: None)
+    assert worker is not None
+    worker.move("Stopped")
+    assert board.items[ISSUE]["status"] == "Done"
+
+
+def test_saved_pass_does_not_override_a_newer_review_round():
+    data = stopped_snapshot()
+    data["review"].update(passed=True, passed_round=1, round=2, started_at=2000.0)
+    assert not _board.run_passed(data)
+    assert _board.desired(False, URL, data)["Status"] == "Stopped"
+
+
+@pytest.mark.parametrize("state, expected", [("OPEN", "Upstream"), ("CLOSED", "Ready")])
+def test_stopped_card_tracks_upstream_pull_request(state, expected):
+    facts = _board_events.Facts(stopped=True, upstream=(("other/repo#1", state),))
+    assert _board_events.derive(facts, "Stopped", datetime(2025, 1, 1, tzinfo=timezone.utc))[0] == expected

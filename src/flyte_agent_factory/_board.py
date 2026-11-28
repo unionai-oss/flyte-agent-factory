@@ -14,7 +14,7 @@ import os
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import httpx
@@ -56,7 +56,7 @@ class BoardRow(TypedDict, total=False):
 
 TOKEN_ENV = "GITHUB_BOARD_PAT"
 SELECTS = {
-    "Status": ("Backlog", "Ready", "In flight", "In review", "Upstream", "Done"),
+    "Status": ("Backlog", "Ready", "In flight", "In review", "Stopped", "Upstream", "Done"),
     "Size": ("S", "M", "L"),
     # Not "Type": GitHub reserves that name for issue types and refuses to create it.
     "Kind": ("feature", "bug", "refactor", "docs", "research"),
@@ -359,26 +359,32 @@ class BoardClient:
         return (data.get("fieldValueByName") or {}).get("name", ""), content.get("state", "OPEN") == "OPEN"
 
     def pull_request_state(self, issue: str) -> str:
-        """Return the state (OPEN, MERGED, CLOSED) of pull request `owner/repo#N`.
+        """Return the state of pull request `owner/repo#N`, or "" if not visible."""
+        return self.fetch_pull_request_evidence(issue)[0]
 
-        "" if it is not visible, or if `issue` is not of that form.
+    def fetch_pull_request_evidence(self, issue: str) -> tuple[str, str]:
+        """Return the state and its timestamp of pull request `owner/repo#N`.
+
+        Both are "" if it is not visible, or if `issue` is not of that form.
 
         Any repository's public pull requests are readable with the board token.
         """
         match = _ISSUE.fullmatch(issue)
         if not match or not match[1]:
-            return ""
+            return "", ""
         owner, name, number = match.groups()
         body = self._post(
             "query UpstreamPull($owner:String!,$name:String!,$number:Int!) {"
-            "repository(owner:$owner,name:$name) {pullRequest(number:$number) {state merged}}}",
+            "repository(owner:$owner,name:$name) {pullRequest(number:$number) {"
+            "state merged createdAt closedAt}}}",
             {"owner": owner, "name": name, "number": int(number)},
         )
         errors = body.get("errors") or []
         if any(error.get("type") != "NOT_FOUND" for error in errors):
             raise _graphql_error(errors)
         pull = ((body.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
-        return "MERGED" if pull.get("merged") else str(pull.get("state", ""))
+        state = "MERGED" if pull.get("merged") else str(pull.get("state", ""))
+        return state, str((pull.get("closedAt") if state == "CLOSED" else pull.get("createdAt")) or "")
 
     def set_status(self, item: str, name: str) -> None:
         try:
@@ -419,7 +425,7 @@ class BoardClient:
                 + "content {__typename "
                 "... on Issue {id number title body state repository {nameWithOwner} "
                 "labels(first:100) {nodes {name}} closedByPullRequestsReferences(first:100) {nodes {"
-                "id number url state repository {nameWithOwner}}}}"
+                "id number url state createdAt repository {nameWithOwner}}}}"
                 "... on PullRequest {id number title body state repository {nameWithOwner} "
                 "labels(first:100) {nodes {name}}}"
                 "... on DraftIssue {id title body}"
@@ -520,11 +526,19 @@ def engines_used(engines: Iterable[str]) -> str:
 
 
 def _review_state(data: Mapping[str, Any]) -> tuple[GraphQL, bool]:
-    """Return a snapshot's last QA verdict, and whether a review round started after it."""
+    """Return a snapshot's last QA verdict, and whether a review round started after it.
+
+    An older truncated report has no `review`; its metrics' `passed_round` is then the round to compare.
+    """
     review = data.get("review") or {}
     phase = data.get("phase") or {}
     verdicts = review.get("verdicts") or []
-    last = verdicts[-1] if verdicts else {}
+    # A legacy pass that predates `passed_round` passed in the report's own round.
+    legacy = review.get("round", 0) if review.get("passed") else 0
+    truncated_round = (data.get("metrics") or {}).get("passed_round") if data.get("review") is None else None
+    last = (
+        verdicts[-1] if verdicts else {"round": review.get("passed_round") or legacy or truncated_round or 0}
+    )
     started = review.get("started_at") or (phase.get("since") if phase.get("kind") == "review" else None)
     later_round = max(review.get("round", 0), phase.get("round", 0)) > last.get("round", 0) or (
         started is not None and last.get("at") is not None and started > last["at"]
@@ -536,28 +550,42 @@ def run_passed(snapshot: Mapping[str, Any] | None) -> bool:
     """Return whether a run's report says it delivered, whatever became of its pull request since.
 
     A run passed when its last QA verdict was PASS with no newer review round, a legacy pass was
-    restored, or it was released. `desired()` maps a pass to In review or Done by its pull request;
-    this is the pass alone, so a merge that left the issue open is still a delivered run.
+    restored without a newer round, or it was released (a release only ever follows a pass). Older truncated
+    reports have no `review`, so their metrics supply the pass round, which a newer round also overrides.
+    Phase `done` alone is not a pass: a session that exits cleanly after `/stop` ends there too, unfinished.
+    `desired()` maps a pass to In review or Done by its pull request; this is the pass alone, so a merge that
+    left the issue open is still a delivered run.
     """
     data = snapshot or {}
     phase = data.get("phase") or {}
     last, later_round = _review_state(data)
-    review = data.get("review") or {}
+    review = data.get("review")
+    truncated_pass = (
+        review is None and (data.get("metrics") or {}).get("passed_round") is not None and not later_round
+    )
+    review = review or {}
     return bool(
-        phase.get("kind") in {"done", "released"}
+        phase.get("kind") == "released"
         or (last.get("verdict") == "PASS" and not later_round)
-        or (review.get("passed") and not review.get("verdicts"))
+        or (review.get("passed") and not review.get("verdicts") and not later_round)
+        or truncated_pass
     )
 
 
-def desired(live: bool, url: str, snapshot: Mapping[str, Any] | None) -> dict[str, str]:
+def desired(
+    live: bool, url: str, snapshot: Mapping[str, Any] | None, phase: str | None = None
+) -> dict[str, str]:
     """Return the board values an issue's newest run implies: its Status, and the text fields it knows.
 
-    `live` is whether the run is live in Flyte, `snapshot` its report's status (`_dashboard.from_report`).
+    `live` is whether the run is live in Flyte, `snapshot` its report's status (`_dashboard.from_report`),
+    and `phase` the Flyte run phase when known.
     A run whose last QA verdict was PASS with no newer review round, a restored legacy pass, or a
     released run is Done, unless it has a pull request: that still awaits its merge, so the card is In
-    review and the merge (or the issue closing) makes it Done;
-    a live run is In flight, or In review once it has a pull request or a later review round.
+    review and the merge (or the issue closing) makes it Done.
+    A session that ended cleanly (phase `done`) without a pass is Stopped while live or after Flyte
+    succeeds: it was stopped unfinished, and the owner moves it to Ready to resume it. A terminal
+    failure can retain an earlier `done` snapshot, which does not prove a clean exit.
+    Otherwise a live run is In flight, or In review once it has a pull request or a later review round.
     A run that failed or was aborted implies nothing,
     so the item stays where it is. Backlog and Ready are the owner's, and are never desired.
     """
@@ -566,6 +594,8 @@ def desired(live: bool, url: str, snapshot: Mapping[str, Any] | None) -> dict[st
     _, later_round = _review_state(data)
     if run_passed(data):
         status = "In review" if deliverables.get("pr") else "Done"
+    elif (data.get("phase") or {}).get("kind") == "done" and (live or phase is None or phase == "SUCCEEDED"):
+        status = "Stopped"
     elif live:
         status = "In review" if later_round or deliverables.get("pr") else "In flight"
     else:
@@ -576,6 +606,22 @@ def desired(live: bool, url: str, snapshot: Mapping[str, Any] | None) -> dict[st
             values["Branch"] = deliverables["branch"]
         values["Engine"] = engines_used((data.get("cost") or {}).get("by_engine") or {})
     return {field: value for field, value in values.items() if value}
+
+
+def find_run_event_time(snapshot: Mapping[str, Any] | None) -> float | None:
+    """Return when the run last did something the board reflects (epoch seconds), or None if unknown.
+
+    The newest of its phase change, its review round's start and its last verdict.
+    """
+    data = snapshot or {}
+    verdicts = (data.get("review") or {}).get("verdicts") or []
+    moments = [
+        (data.get("phase") or {}).get("since"),
+        (data.get("review") or {}).get("started_at"),
+        verdicts[-1].get("at") if verdicts and isinstance(verdicts[-1], Mapping) else None,
+    ]
+    found = [float(m) for m in moments if isinstance(m, (int, float))]
+    return max(found) if found else None
 
 
 #: Board Status options in the order a run moves through them.
@@ -629,6 +675,30 @@ def _forward_only(want: dict[str, str], item: BoardRow, url: str) -> dict[str, s
     if status == "Done" and item["status"] == "Upstream":
         return {field: value for field, value in want.items() if field != "Status"}
     if item.get("texts", {}).get("Flyte") != url or _rank(status) >= _rank(item["status"]):
+        return want
+    return {field: value for field, value in want.items() if field != "Status"}
+
+
+def _hand_set_since_run(
+    want: dict[str, str], item: BoardRow, snapshot: Mapping[str, Any] | None
+) -> dict[str, str]:
+    """`want` without its Status when a person set the card's Status after the run's last event.
+
+    The run then implies nothing newer than the move, so the move stands. The board PAT may be a person's
+    own, so the factory's writes look hand-set too; that is harmless, since a factory write follows the run
+    event it reflects and agrees with `desired()`. A `Bot` setter normally does not hold a status, but a
+    newer In review can reflect PR evidence that the stopped run does not know about. A closed issue's Done
+    is kept by `_write` regardless.
+    """
+    at, by = item.get("status_at", ""), item.get("status_by", "")
+    event = find_run_event_time(snapshot)
+    if "Status" not in want or not at or not by:
+        return want
+    # Drift can advance a stopped run using newer PR evidence even when its writer is a bot.
+    if by == "Bot" and not (want["Status"] == "Stopped" and item["status"] == "In review"):
+        return want
+    # An undated report implies nothing newer than the move, as in the drift pass (`_board_events._held`).
+    if event is not None and datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp() <= event:
         return want
     return {field: value for field, value in want.items() if field != "Status"}
 
@@ -712,8 +782,8 @@ class Reconciler:
     It recomputes every item's values from Flyte and writes the differences. For a run the item
     already shows, Status only moves forward (`_forward_only`).
 
-    `latest(ref)` is `(live, url, snapshot)` for the issue's newest project run when that run is live or
-    ended recently enough to still be the factory's to project (`_reconcile.latest_run`), else None.
+    `latest(ref)` is `(live, url, snapshot, phase)` for the issue's newest project run when that run is
+    live or ended recently enough to still be the factory's to project (`_reconcile.latest_run`), else None.
     Only this class bootstraps the board, and its ticks never overlap (the task's `max_runtime` is less
     than its rate), so a field is never created twice by the factory.
     """
@@ -781,7 +851,7 @@ class Reconciler:
                     found = self.latest(ref)
                     if not found:
                         continue
-                    want = _forward_only(desired(*found), item, found[1])
+                    want = _hand_set_since_run(_forward_only(desired(*found), item, found[1]), item, found[2])
                     current = {"Status": item["status"], **item.get("texts", {})}
                     if not {f: v for f, v in want.items() if current.get(f) != v}:
                         continue  # in sync per the listing: no reread, no write
@@ -789,7 +859,9 @@ class Reconciler:
                         # The listing may predate a completion written since (a merge closing the issue):
                         # decide again against the card as it is now, so a closed issue's Done is kept.
                         item = current_item(client, item) or item
-                        want = _forward_only(desired(*found), item, found[1])
+                        want = _hand_set_since_run(
+                            _forward_only(desired(*found), item, found[1]), item, found[2]
+                        )
                         current = {"Status": item["status"], **item.get("texts", {})}
                         _write(client, item, {f: v for f, v in want.items() if current.get(f) != v})
                 except REMOTE_ERRORS as exc:

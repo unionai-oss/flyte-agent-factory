@@ -112,6 +112,7 @@ try:
         _contract,
         _gates,
         _inbox,
+        _pins,
         _review,
         _reviewer,
         _session_config,
@@ -245,6 +246,19 @@ def _reset_workspace_env(monkeypatch):
     monkeypatch.delenv("AGENT_FACTORY_WORKSPACE", raising=False)
     # `child.write_context` exports the run context the same way.
     monkeypatch.delenv("AGENT_FACTORY_RUN_CONTEXT", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_author_pin(monkeypatch):
+    """Undo the run-wide pin state `agent.project` sets before every test.
+
+    `project` records its `engine` input in `_pins.engine_input` and its `hard_pin` in `_usage._hard_pins`,
+    and exports AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE, so without this a test that runs it pinned to codex
+    pins the next test on the same worker to codex too.
+    """
+    monkeypatch.setattr(_pins, "engine_input", "")
+    monkeypatch.setattr(_usage, "_hard_pins", False)
+    monkeypatch.delenv("AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE", raising=False)
 
 
 @pytest.fixture

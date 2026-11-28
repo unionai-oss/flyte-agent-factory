@@ -25,6 +25,7 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [setup.md](setup.md) | From nothing to a first project: workspace, profile, setup-token, deploy key, deploying |
 | [small-nodes.md](small-nodes.md) | Running on one 4 CPU / 16 GiB node: what each component requests, the arithmetic, BestEffort apps, raising it per component |
 | [READBACK.md](READBACK.md) | How #15 (small nodes) was re-applied on #12's sharded test lanes: the shard budget arithmetic and the tests adjusted where the two meet |
+| [REPORT.md](REPORT.md) | #48: why a project stopped before review passed no longer shows Done, the new Stopped column, and the answers to the issue's three open questions |
 | [../profiles/README.md](../profiles/README.md) | Every profile table and key |
 | [standards.md](standards.md) | Writing your own standards: the rule format, how each rule is enforced, mapping your rule IDs to the factory's built-in checks |
 | [chat-operator.md](chat-operator.md) | The default interface: why a chat agent sits between you and the factory, what each side can do, and setting it up |

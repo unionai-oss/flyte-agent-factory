@@ -33,7 +33,7 @@ class TruthBoard(Board):
 
     def __init__(self, items: dict[str, dict[str, Any]] | None = None):
         super().__init__({r: {"set_at": OLD, "set_by": "Bot", **item} for r, item in (items or {}).items()})
-        self.upstream: dict[str, tuple[str, bool]] = {}  # "o/r#N" -> (state, merged)
+        self.upstream: dict[str, tuple[str, bool] | tuple[str, bool, str]] = {}
         self.mutations: list[dict[str, Any]] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -42,6 +42,8 @@ class TruthBoard(Board):
             variables = body["variables"]
             state = self.upstream.get(f"{variables['owner']}/{variables['name']}#{variables['number']}")
             pull = {"state": state[0], "merged": state[1]} if state else None
+            if pull is not None and state is not None and len(state) > 2:
+                pull.update(createdAt=state[2], closedAt=state[2])
             return httpx.Response(200, json={"data": {"repository": {"pullRequest": pull}}})
         if "UpdateField" in body["query"]:
             self.mutations.append(body["variables"]["input"])
@@ -131,6 +133,11 @@ def pull(app, number, text=None):
         (Facts(upstream=(("o/r#1", "CLOSED"), ("o/r#2", "MERGED"))), "Ready", "Done"),
         # 9: Done but open, the run stopped undelivered
         (Facts(stopped=True), "Done", "Ready"),
+        (
+            Facts(stopped=True, clean_stop=True),
+            "Done",
+            "Stopped",
+        ),  # #48: Ready would have the planner relaunch
         (Facts(), "Done", None),
         (Facts(stopped=True, active_at=NOW), "In review", None),
         # 10: nothing alive for two days
@@ -191,8 +198,8 @@ def test_done_after_undelivered_stop_moves_to_ready(truth_world):  # #175
     card(board, 176, "Done")
     ended = NOW - timedelta(days=4)
     runs = {
-        ref(175): (False, ended, snapshot(phase="failed")),
-        ref(176): (False, ended, snapshot(phase="released")),  # delivered: stays Done
+        ref(175): (False, "FAILED", ended, snapshot(phase="failed")),
+        ref(176): (False, "SUCCEEDED", ended, snapshot(phase="released")),  # delivered: stays Done
     }
     rows = run_truth(truth_world, newest=runs.get)
     assert board.items[ref(175)]["status"] == "Ready"
@@ -200,11 +207,32 @@ def test_done_after_undelivered_stop_moves_to_ready(truth_world):  # #175
     assert rows == [f"{ref(175)}: Done -> Ready: run stopped without delivering"]
 
 
+@pytest.mark.parametrize(
+    "phase, expected", [("FAILED", "Ready"), ("ABORTED", "Ready"), ("SUCCEEDED", "Stopped")]
+)
+def test_done_snapshot_requires_a_successful_terminal_run(truth_world, flyte_world, phase, expected):
+    from flyte_agent_factory import _dashboard, _factory_base, _issues, _reconcile
+    from tests.test_reconcile import ended
+
+    _, board, _ = truth_world
+    card(board, 175, "Done")
+    labels = {_reconcile.LABEL_ISSUE: _issues.issue_label(ref(175))}
+    run = flyte_world.add("terminal", _factory_base.SLOTS[0], phase=phase, labels=labels)
+    run.report = _dashboard.status_script(snapshot(phase="done"))
+    ended(run, 1)
+    index = _reconcile.RunIndex([run])
+    run_truth(truth_world, newest=index.newest)
+    assert board.items[ref(175)]["status"] == expected
+
+
 def test_done_after_a_pass_whose_pr_merged_without_closing_the_issue_stays_done(truth_world):
     _, board, _ = truth_world
     card(board, 177, "Done")
-    passed = snapshot(phase="done", pr="https://github.com/o/r/pull/9")  # desired(): In review
-    rows = run_truth(truth_world, newest=lambda r: (False, NOW - timedelta(days=4), passed))
+    # A pass is its PASS verdict; phase `done` alone is also a clean stop (issue #48).
+    passed = snapshot(
+        phase="done", pr="https://github.com/o/r/pull/9", verdicts=[{"round": 1, "verdict": "PASS"}]
+    )
+    rows = run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", NOW - timedelta(days=4), passed))
     assert board.items[ref(177)]["status"] == "Done"
     assert rows == []
 
@@ -212,7 +240,7 @@ def test_done_after_a_pass_whose_pr_merged_without_closing_the_issue_stays_done(
 def test_done_with_an_unreadable_report_stays_done(truth_world):
     _, board, _ = truth_world
     card(board, 175, "Done")
-    run_truth(truth_world, newest=lambda r: (False, NOW - timedelta(days=4), None))
+    run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", NOW - timedelta(days=4), None))
     assert board.items[ref(175)]["status"] == "Done"
 
 
@@ -221,7 +249,9 @@ def test_stale_in_review_and_in_flight_move_to_ready(truth_world):  # #166/#82/#
     card(board, 166, "In review")
     card(board, 82, "In flight")
     card(board, 139, "In flight", set_at=(NOW - timedelta(days=1)).isoformat())  # moved a day ago
-    run_truth(truth_world, newest=lambda r: (False, NOW - timedelta(days=5), snapshot(phase="failed")))
+    run_truth(
+        truth_world, newest=lambda r: (False, "FAILED", NOW - timedelta(days=5), snapshot(phase="failed"))
+    )
     assert [board.items[ref(n)]["status"] for n in (166, 82, 139)] == ["Ready", "Ready", "In flight"]
 
 
@@ -237,7 +267,7 @@ def test_stale_cards_with_a_live_run_or_open_pr_are_left_alone(truth_world):
             "commit": {"committer": {"date": (NOW - timedelta(hours=3)).isoformat()}, "message": "wip"},
         }
     ]
-    live = {ref(1): (True, None, snapshot())}
+    live = {ref(1): (True, "RUNNING", None, snapshot())}
     assert run_truth(truth_world, newest=live.get) == []
     assert [board.items[ref(n)]["status"] for n in (1, 2, 3)] == ["In flight", "In review", "In flight"]
 
@@ -422,7 +452,7 @@ def test_backlog_and_ready_cards_are_read_for_upstream_links(truth_world, status
 
 
 @pytest.mark.parametrize(
-    "hours, by, moved", [(23, "User", False), (25, "User", True), (1, "Bot", True), (23, "", True)]
+    "hours, by, moved", [(23, "User", False), (25, "User", False), (1, "Bot", True), (23, "", True)]
 )
 def test_hand_set_guard(truth_world, caplog, hours, by, moved):
     _, board, app = truth_world
@@ -543,16 +573,21 @@ def test_bootstrap_inserts_upstream_after_in_review_and_keeps_every_option():
         "Parked",
         "In flight",
         "In review",
+        "Stopped",
         "Upstream",
         "Done",
     ]
-    assert [o for o in sent if o["name"] != "Upstream"] == options  # ids, colours, descriptions untouched
-    assert sent[5] == {"name": "Upstream", "color": "GRAY", "description": ""}
+    added = ("Stopped", "Upstream")
+    assert [o for o in sent if o["name"] not in added] == options  # ids, colours, descriptions untouched
+    assert sent[5] == {"name": "Stopped", "color": "GRAY", "description": ""}
+    assert sent[6] == {"name": "Upstream", "color": "GRAY", "description": ""}
     assert board.missing_fields() == []
 
 
 def test_bootstrap_leaves_a_board_that_has_upstream_alone():
-    options = [{"id": n, "name": n} for n in ("Done", "Upstream", *_board.STATUSES[:4])]  # any order
+    options = [
+        {"id": n, "name": n} for n in ("Done", "Upstream", "Stopped", *_board.STATUSES[:4])
+    ]  # any order
     board, updates = bootstrap_input(status_field(options))
     assert updates == []
 
@@ -674,7 +709,7 @@ def rounds(world, number, found, *, status, **item):
             "token",
             app,
             lambda r: None,
-            newest=lambda r: (False, NOW - timedelta(hours=1), found),
+            newest=lambda r: (False, "SUCCEEDED", NOW - timedelta(hours=1), found),
             now=NOW,
         )
         out.append(list(board.writes))
@@ -714,3 +749,313 @@ def test_the_supervisors_done_never_overwrites_upstream(truth_world):
     supervisor = _board.Supervisor(profile, "token", ref(9), lambda *a: None)
     supervisor.move("Done")
     assert board.items[ref(9)]["status"] == "Upstream"
+
+
+# --- a stopped card stays Stopped until there is new evidence (issue #48) ---------------------- #
+
+
+def test_done_after_a_clean_stop_before_review_moves_to_stopped(truth_world):
+    _, board, _ = truth_world
+    card(board, 178, "Done")
+    stopped = snapshot(phase="done")
+    rows = run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", NOW - timedelta(days=4), stopped))
+    assert board.items[ref(178)]["status"] == "Stopped"
+    assert rows == [f"{ref(178)}: Done -> Stopped: run stopped without delivering"]
+
+
+def test_stopped_card_is_left_alone_with_its_own_pull_request_or_after_stale(truth_world):
+    _, board, app = truth_world
+    card(board, 179, "Stopped")
+    card(board, 180, "Stopped")
+    pull(app, 179)
+    stopped = snapshot(phase="done", verdicts=[{"round": 1, "verdict": "FAIL"}])
+    rows = run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", NOW - timedelta(days=10), stopped))
+    assert board.items[ref(179)]["status"] == "Stopped"
+    assert board.items[ref(180)]["status"] == "Stopped"
+    assert rows == []
+
+
+def test_stopped_card_follows_a_resume_and_a_close(truth_world):
+    _, board, app = truth_world
+    card(board, 181, "Stopped")
+    card(board, 182, "Stopped")
+    app.issues[182] = "closed"
+    runs = {
+        ref(181): (True, "RUNNING", None, snapshot()),  # resumed: a live run
+        ref(182): (False, "SUCCEEDED", NOW - timedelta(days=4), snapshot(phase="done")),
+    }
+    run_truth(truth_world, newest=runs.get)
+    assert board.items[ref(181)]["status"] == "In flight"
+    assert board.items[ref(182)]["status"] == "Done"
+
+
+def test_derive_keeps_stopped_and_moves_a_live_resume():
+    stopped = Facts(stopped=True, open_pr=True, active_at=NOW - timedelta(days=10))
+    assert derive(stopped, "Stopped", NOW) == (None, "")
+    assert derive(Facts(live=True), "Stopped", NOW)[0] == "In flight"
+    assert derive(Facts(stopped=True, issue_open=False), "Stopped", NOW)[0] == "Done"
+    assert derive(Facts(stopped=True, upstream=(("u/r#1", "MERGED"),)), "Stopped", NOW)[0] == "Done"
+
+
+def test_stop_mid_build_never_reaches_done(truth_world, monkeypatch):
+    """Issue #48's acceptance on a test board: the end move, a reconcile tick and a drift pass."""
+    from flyte_agent_factory import _board as board_module
+
+    _, board, _ = truth_world
+    url = "https://console.example/runs/r1"
+    card(board, 183, "In flight", texts={"Flyte": url})
+    worker = board_module.supervisor(board_profile(), "token", ref(183), lambda *row: None)
+    assert worker is not None
+    worker.move("Stopped")  # what the session's end writes when it did not pass
+    assert board.items[ref(183)]["status"] == "Stopped"
+    stopped = snapshot(phase="done")
+    stopped["phase"]["since"] = (NOW - timedelta(minutes=1)).timestamp()
+    board_module.Reconciler(board_profile(), "token", lambda r: (False, url, stopped)).tick()
+    assert board.items[ref(183)]["status"] == "Stopped"
+    run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", NOW - timedelta(minutes=1), stopped))
+    assert board.items[ref(183)]["status"] == "Stopped"
+
+
+def test_old_hand_move_waits_for_a_new_run_event(truth_world):
+    _, board, app = truth_world
+    moved = NOW - timedelta(days=3)
+    card(board, 190, "Ready", set_at=moved.isoformat(), set_by="User")
+    pull(app, 190)
+    report = snapshot(phase="done")
+    report["phase"]["since"] = (moved - timedelta(days=1)).timestamp()
+    assert (
+        run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", moved - timedelta(days=1), report)) == []
+    )
+    assert board.items[ref(190)]["status"] == "Ready"
+    report["phase"]["since"] = (moved + timedelta(hours=1)).timestamp()
+    run_truth(truth_world, newest=lambda r: (True, "RUNNING", None, report))
+    assert board.items[ref(190)]["status"] == "In review"
+
+
+@pytest.mark.parametrize("phase", ["failed", "aborted"])
+def test_failed_or_aborted_undelivered_run_leaves_done_for_ready_not_stopped(truth_world, phase):
+    # #175 still holds: an undelivered run never stays Done. Only a clean stop goes to Stopped (#48).
+    _, board, _ = truth_world
+    card(board, 191, "Done")
+    rows = run_truth(truth_world, newest=lambda r: (False, phase.upper(), NOW, snapshot(phase=phase)))
+    assert rows == [f"{ref(191)}: Done -> Ready: run stopped without delivering"]
+    assert board.items[ref(191)]["status"] == "Ready"
+
+
+def _failed_run(days_ago: float | None):
+    """A failed run that ended `days_ago`, its report dated then (None: a report with no dated event)."""
+    data = snapshot(phase="failed")
+    if days_ago is not None:
+        data["phase"]["since"] = (NOW - timedelta(days=days_ago)).timestamp()
+    return (False, "FAILED", NOW - timedelta(days=6), data)
+
+
+@pytest.mark.parametrize("run_days", [6, None])
+def test_a_later_hand_move_survives_repeated_stale_passes(truth_world, run_days):
+    # Five days after the move, with the run's last event older than it (or undated), the card is stale by
+    # time alone; time is not an event, so every drift pass leaves the person's In flight.
+    _, board, _ = truth_world
+    card(board, 196, "In flight", set_at=(NOW - timedelta(days=5)).isoformat(), set_by="User")
+    for _ in range(3):
+        assert run_truth(truth_world, newest=lambda r: _failed_run(run_days)) == []
+        assert board.items[ref(196)]["status"] == "In flight"
+
+
+@pytest.mark.parametrize("set_by", ["User", "Bot", ""])
+def test_a_run_event_newer_than_the_hand_move_lets_a_stale_card_move(truth_world, set_by):
+    _, board, _ = truth_world
+    card(board, 197, "In flight", set_at=(NOW - timedelta(days=5)).isoformat(), set_by=set_by)
+    run_truth(truth_world, newest=lambda r: _failed_run(3))
+    assert board.items[ref(197)]["status"] == "Ready"
+
+
+def test_a_factory_write_through_a_persons_pat_holds_until_the_next_run_event(truth_world):
+    # The PAT can make the factory's own write read as a person's: held like one until the run moves on.
+    _, board, _ = truth_world
+    card(board, 198, "In flight", set_at=(NOW - timedelta(days=4)).isoformat(), set_by="User")
+    run_truth(truth_world, newest=lambda r: _failed_run(4))
+    assert board.items[ref(198)]["status"] == "In flight"
+    run_truth(truth_world, newest=lambda r: _failed_run(3))
+    assert board.items[ref(198)]["status"] == "Ready"
+
+
+def test_merged_upstream_overrides_hand_move(truth_world):
+    _, board, _ = truth_world
+    card(board, 192, "Ready", set_at=NOW.isoformat(), set_by="User", body="Upstream: o/r#1")
+    board.upstream["o/r#1"] = ("CLOSED", True)
+    run_truth(truth_world)
+    assert board.items[ref(192)]["status"] == "Done"
+
+
+@pytest.mark.parametrize(
+    "state, initial, expected", [("OPEN", "Ready", "Upstream"), ("CLOSED", "Upstream", "Ready")]
+)
+@pytest.mark.parametrize("newer", [False, True])
+def test_hand_move_compared_with_upstream_pr_event(truth_world, state, initial, expected, newer):
+    _, board, app = truth_world
+    moved = NOW - timedelta(days=3)
+    event = moved + timedelta(hours=1 if newer else -1)
+    card(board, 195, initial, set_at=moved.isoformat(), set_by="User", body="Upstream: acme/lib#7")
+    board.upstream["acme/lib#7"] = (state, False, event.isoformat())
+    run_truth(truth_world)
+    assert board.items[ref(195)]["status"] == (expected if newer else initial)
+    notes = [text for number, text in app.posted if number == 195]
+    assert len(notes) == (1 if newer and state == "CLOSED" else 0)
+    run_truth(truth_world)
+    assert len([text for number, text in app.posted if number == 195]) == len(notes)
+
+
+@pytest.mark.parametrize("newer", [False, True])
+def test_hand_move_compared_with_local_pr_event(truth_world, newer):
+    _, board, app = truth_world
+    moved = NOW - timedelta(days=3)
+    event = moved + timedelta(hours=1 if newer else -1)
+    card(board, 196, "Ready", set_at=moved.isoformat(), set_by="User")
+    app.pulls.append({"title": "Closes #196", "body": "", "created_at": event.isoformat()})
+    run_truth(truth_world)
+    assert board.items[ref(196)]["status"] == ("In review" if newer else "Ready")
+
+
+def test_new_local_pr_after_stop_moves_stopped_card(truth_world):
+    _, board, app = truth_world
+    stopped = NOW - timedelta(days=2)
+    card(board, 197, "Stopped", set_at=stopped.isoformat(), set_by="User")
+    app.pulls.append(
+        {"title": "Closes #197", "body": "", "created_at": (stopped + timedelta(hours=1)).isoformat()}
+    )
+    report = snapshot(phase="done")
+    report["phase"]["since"] = (stopped - timedelta(hours=1)).timestamp()
+    run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", stopped, report))
+    assert board.items[ref(197)]["status"] == "In review"
+
+
+def test_new_pr_survives_reconciler_ticks(truth_world):
+    _, board, app = truth_world
+    stopped = NOW - timedelta(days=2)
+    url = "https://console.example/runs/r1"
+    card(board, 201, "Stopped", texts={"Flyte": url}, set_at=stopped.isoformat())
+    app.pulls.append(
+        {"number": 301, "title": "Closes #201", "created_at": (stopped + timedelta(hours=1)).isoformat()}
+    )
+    report = snapshot(phase="done")
+    report["phase"]["since"] = stopped.timestamp()
+
+    def newest(r):
+        return False, "SUCCEEDED", stopped, report
+
+    run_truth(truth_world, newest=newest)
+    assert board.items[ref(201)]["status"] == "In review"
+    board.items[ref(201)]["set_at"] = (stopped + timedelta(hours=2)).isoformat()
+    for _ in range(2):
+        _board.Reconciler(board_profile(), "token", lambda r: (False, url, report)).tick()
+        assert board.items[ref(201)]["status"] == "In review"
+        run_truth(truth_world, newest=newest)
+        assert board.items[ref(201)]["status"] == "In review"
+
+
+def test_reopened_old_pr_after_stop_moves_card(truth_world):
+    _, board, app = truth_world
+    stopped = NOW - timedelta(days=2)
+    card(board, 202, "Stopped", set_at=stopped.isoformat(), set_by="User")
+    app.pulls.append(
+        {"number": 302, "title": "Closes #202", "created_at": (stopped - timedelta(days=1)).isoformat()}
+    )
+    app.events = [{"event": "reopened", "created_at": (stopped + timedelta(hours=1)).isoformat()}]
+    report = snapshot(phase="done")
+    report["phase"]["since"] = stopped.timestamp()
+    run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", stopped, report))
+    assert board.items[ref(202)]["status"] == "In review"
+
+
+def test_reopened_pr_event_survives_reconciler_tick(truth_world):
+    profile, board, app = truth_world
+    stopped = NOW - timedelta(days=2)
+    url = "https://console.example/runs/r1"
+    card(board, 203, "Stopped", texts={"Flyte": url}, set_at=stopped.isoformat())
+    report = snapshot(phase="done")
+    report["phase"]["since"] = stopped.timestamp()
+    payload = {
+        "repository": {"full_name": REPO},
+        "action": "reopened",
+        "pull_request": {"title": "Closes #203", "head": {"ref": ""}},
+    }
+    _board_events.process(profile, "token", app, "pull_request", payload)
+    app.pulls.append(
+        {"number": 303, "title": "Closes #203", "created_at": (stopped - timedelta(days=1)).isoformat()}
+    )
+    app.events = [{"event": "reopened", "created_at": (stopped + timedelta(hours=1)).isoformat()}]
+    run_truth(truth_world, newest=lambda r: (False, "SUCCEEDED", stopped, report))
+    assert board.items[ref(203)]["status"] == "In review"
+    board.items[ref(203)]["set_at"] = (stopped + timedelta(hours=1)).isoformat()
+    _board.Reconciler(board_profile(), "token", lambda r: (False, url, report)).tick()
+    assert board.items[ref(203)]["status"] == "In review"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdicts, pr, expected",
+    [
+        ([], "", "Stopped"),
+        ([{"round": 1, "verdict": "FAIL"}], "", "Stopped"),
+        ([{"round": 1, "verdict": "PASS"}], "", "Done"),
+        ([{"round": 1, "verdict": "PASS"}], "https://github.com/x/y/pull/3", "In review"),
+    ],
+)
+async def test_clean_session_end_reconciles_with_board(
+    truth_world, tmp_path, monkeypatch, verdicts, pr, expected
+):
+    """Exercise the session end through the fake board; this does not test a real external board."""
+    from flyte_agent_factory import _supervise_support
+    from tests.test_supervision import _run_project
+
+    profile, board, app = truth_world
+    url = "https://console.example/runs/r1"
+    card(board, 210, "In flight", texts={"Flyte": url})
+    worker = _board.supervisor(profile, "token", ref(210), lambda *row: None)
+    assert worker is not None
+    monkeypatch.setattr(_supervise_support, "_board_worker", None)
+
+    async def finish(timeline):
+        _supervise_support._board_worker = worker
+        timeline.verdicts = list(verdicts)
+        timeline.pr_url = pr
+
+    timeline, result, _ = await _run_project(tmp_path, monkeypatch, finish)
+    assert "session ended cleanly" in result
+    report = timeline.snapshot()
+    assert report["phase"]["kind"] == "done"
+    report["phase"]["since"] = (NOW - timedelta(minutes=1)).timestamp()
+    if pr:
+        pull(app, 210)
+
+    def reconcile(live, run_url, data):
+        _board.Reconciler(profile, "token", lambda r: (live, run_url, data) if r == ref(210) else None).tick()
+
+    def drift(live, data):
+        return run_truth(truth_world, newest=lambda r: (live, "RUNNING" if live else "SUCCEEDED", NOW, data))
+
+    assert board.items[ref(210)]["status"] == ("Stopped" if expected == "Stopped" else "In flight")
+    reconcile(False, url, report)
+    assert board.items[ref(210)]["status"] == expected
+    drift(False, report)
+    assert board.items[ref(210)]["status"] == expected
+
+    if expected == "Stopped":
+        board.items[ref(210)].update(status="Ready", set_at=NOW.isoformat(), set_by="User")
+        reconcile(False, url, report)
+        drift(False, report)
+        assert board.items[ref(210)]["status"] == "Ready"
+
+        resumed = snapshot()
+        resumed["phase"]["since"] = (NOW + timedelta(minutes=1)).timestamp()
+        resume_url = "https://console.example/runs/r2"
+        reconcile(True, resume_url, resumed)
+        assert board.items[ref(210)]["status"] == "In flight"
+        drift(True, resumed)
+        assert board.items[ref(210)]["status"] == "In flight"
+        resumed["review"]["round"] = 1
+        resumed["review"]["started_at"] = (NOW + timedelta(minutes=2)).timestamp()
+        reconcile(True, resume_url, resumed)
+        assert board.items[ref(210)]["status"] == "In review"
+        drift(True, resumed)
+        assert board.items[ref(210)]["status"] == "In review"
